@@ -1,2 +1,30 @@
 # No APK
 *.apk
+
+# workspace（构建中间产物 / 反编译输出 / 交付包）
+tmp
+work
+dist/*
+# 交付包里的说明文档值得入库，其余（APK、patcher、server 副本）不入库
+!dist/README.md
+
+# 历史遗留：误展开的变量目录（$t/ANDROID.RSA）
+/$t/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 签名密钥
+*.jks
+*.keystore
+
+# ── 运行期私有数据：绝不入库 ──────────────────────────────
+# 本地账号（含用户名 / 盐 / 口令哈希）、会话票据、设备槽
+server/data/accounts.json
+server/data/sessions.json
+server/data/devices.json
+# 玩家存档（真实进度，含金币 / 赛道纪录 / identifier）
+server/data/save/
+# 从设备抓下来的幽灵二进制（游戏数据）；ghosts/README.md 保留
+server/data/ghosts/**/*.bin

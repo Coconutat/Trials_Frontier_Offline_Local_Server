@@ -1,0 +1,174 @@
+{
+  "//": "响应规则。键 = '<METHOD> <路径前缀>'（取最长匹配）或 '<METHOD> *' / '*'。值 = {status, headers, body}。",
+  "//2": "每次请求都会重新读本文件，改完存盘即生效，不用重启服务器。",
+
+  "//3": "重要：兜底不要返回 {}。游戏端多处 JSON 解析器会无条件做 root->child->child 两级解引用，",
+  "//4": "空对象会让 root->child 为 NULL，直接 SIGSEGV（已确认：登录育碧账号 → 拉好友列表 → 崩溃）。",
+  "//5": "所以兜底返回 {\"data\": []}：root->child 非空，而它的 child 是空数组（NULL），解析器会安全跳过。",
+
+  "*": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": { "data": [] }
+  },
+
+  "GET /v1/applications/": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "configuration": {
+        "sandboxes": {
+          "triag_an_lnch61_a_ws": {
+            "name": "triag_an_lnch61_a_ws",
+            "friendlyName": "triag_an_lnch61_a_ws",
+            "url": "http://127.0.0.1:8000/"
+          }
+        },
+        "Anticheating_Enabled": false,
+        "setOnlineConfigured": true
+      }
+    }
+  },
+
+  "POST /v3/profiles/sessions": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "platformType": "ubimobile",
+      "ticket": "tf-local-ticket-0001",
+      "profileId": "11111111-1111-1111-1111-111111111111",
+      "userId": "11111111-1111-1111-1111-111111111111",
+      "nameOnPlatform": "LocalPlayer",
+      "idOnPlatform": "11111111-1111-1111-1111-111111111111",
+      "environment": "Prod",
+      "expiration": "2099-12-31T23:59:59.000Z",
+      "spaceId": "22222222-2222-2222-2222-222222222222",
+      "clientIp": "127.0.0.1",
+      "serverTime": "2026-01-01T00:00:00.000Z",
+      "sessionId": "33333333-3333-3333-3333-333333333333",
+      "sessionKey": "tf-local-session-key",
+      "rememberMe": false
+    }
+  },
+
+  "GET /v1/profiles/sessions": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "platformType": "ubimobile",
+      "ticket": "tf-local-ticket-0001",
+      "profileId": "11111111-1111-1111-1111-111111111111",
+      "userId": "11111111-1111-1111-1111-111111111111",
+      "nameOnPlatform": "LocalPlayer",
+      "idOnPlatform": "11111111-1111-1111-1111-111111111111",
+      "environment": "Prod",
+      "expiration": "2099-12-31T23:59:59.000Z",
+      "spaceId": "22222222-2222-2222-2222-222222222222",
+      "clientIp": "127.0.0.1",
+      "serverTime": "2026-01-01T00:00:00.000Z",
+      "sessionId": "33333333-3333-3333-3333-333333333333",
+      "sessionKey": "tf-local-session-key",
+      "rememberMe": false
+    }
+  },
+
+  "POST /v1/profiles/sessions": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "platformType": "ubimobile",
+      "ticket": "tf-local-ticket-0001",
+      "profileId": "11111111-1111-1111-1111-111111111111",
+      "userId": "11111111-1111-1111-1111-111111111111",
+      "nameOnPlatform": "LocalPlayer",
+      "idOnPlatform": "11111111-1111-1111-1111-111111111111",
+      "environment": "Prod",
+      "expiration": "2099-12-31T23:59:59.000Z",
+      "spaceId": "22222222-2222-2222-2222-222222222222",
+      "clientIp": "127.0.0.1",
+      "serverTime": "2026-01-01T00:00:00.000Z",
+      "sessionId": "33333333-3333-3333-3333-333333333333",
+      "sessionKey": "tf-local-session-key",
+      "rememberMe": false
+    }
+  },
+
+  "//friends": "tr::OnlineFriends::onFriendlistRecieved 遍历 root->child->child 再读每项的 pid / nameOnPlatform / state。",
+  "//friends2": "形状必须是 {\"<任意键>\": [ {..}, .. ]}；返回空数组最安全（不会触发头像/资料查询）。",
+  "GET /v2/profiles/me/friends": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "friends": [
+        {
+          "pid": "44444444-4444-4444-4444-444444444444",
+          "userId": "44444444-4444-4444-4444-444444444444",
+          "idOnPlatform": "44444444-4444-4444-4444-444444444444",
+          "nameOnPlatform": "GhostRider",
+          "platformType": "ubimobile",
+          "state": "Friend"
+        },
+        {
+          "pid": "55555555-5555-5555-5555-555555555555",
+          "userId": "55555555-5555-5555-5555-555555555555",
+          "idOnPlatform": "55555555-5555-5555-5555-555555555555",
+          "nameOnPlatform": "TangoPro",
+          "platformType": "ubimobile",
+          "state": "Friend"
+        }
+      ]
+    }
+  },
+
+  "//policies": "libubiservices 的 /v3/policies/<COUNTRY>，返回策略列表。",
+  "GET /v3/policies/": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": { "policies": [] }
+  },
+
+  "GET /v1/profiles/": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "profiles": [
+        {
+          "profileId": "11111111-1111-1111-1111-111111111111",
+          "userId": "11111111-1111-1111-1111-111111111111",
+          "platformType": "ubimobile",
+          "idOnPlatform": "11111111-1111-1111-1111-111111111111",
+          "nameOnPlatform": "LocalPlayer"
+        }
+      ]
+    }
+  },
+
+  "//profiles": "OnlineFriends::resolveOnlineIds 走 %s/v1/profiles?profileId=…（.rodata @0xb89064）。",
+  "GET /v1/profiles": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "profiles": [
+        {
+          "profileId": "11111111-1111-1111-1111-111111111111",
+          "userId": "11111111-1111-1111-1111-111111111111",
+          "platformType": "ubimobile",
+          "idOnPlatform": "11111111-1111-1111-1111-111111111111",
+          "nameOnPlatform": "LocalPlayer"
+        }
+      ]
+    }
+  },
+
+  "GET /v2/profiles/me": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "body": {
+      "profileId": "11111111-1111-1111-1111-111111111111",
+      "userId": "11111111-1111-1111-1111-111111111111",
+      "platformType": "ubimobile",
+      "idOnPlatform": "11111111-1111-1111-1111-111111111111",
+      "nameOnPlatform": "LocalPlayer"
+    }
+  }
+}
