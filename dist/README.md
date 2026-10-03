@@ -475,3 +475,52 @@ POST /public/playerprogress/v1/progress
 | 幽灵文件格式 / 回放数据下发 | ✅ 完成 |
 | 排行榜 / 好友成绩页 | ❌ 需要 `userstorage/v2` 协议 |
 | 商店/offer 图片 | ⚠️ 原始素材在原育碧 S3 上已永久丢失（`NoSuchBucket`），服务器改成发占位图 |
+
+---
+
+## 十、真钱内购（IAP）完整破解 —— 已实机验证
+
+### 10.1 为什么不能靠服务器
+反汇编 `libTrialsGo.so` 证明：`tr::StoreManager::onNetworkDataReceived` @`0x0057b0cc` 的
+`cmd == 0x17` 分支**只是再调一次 `mz::IAPManager::purchase()`**（代码在 `0x0057b1a4`，
+失败则 `MenuzStateMachine::popInstant(0)` + `OnlineError::showOnlineError(3)`）。
+所以要靠"我们自己的服务器回一个成功响应"来发奖是走不通的。
+另外 `StoreManager::purchase(listener, productId, viaServer)` @`0x00579508` 里
+`viaServer = strstr(productId, "goldenticket") != NULL`——只有黄金门票走服务器，
+其余真钱商品一律走 Google Play。
+
+### 10.2 为什么"改道本地货币路径"也不行
+`tryPurchaseItem` / `purchaseItem` 里的 `cbz x22, <本地路径>` 确实是个分岔，
+但真钱礼包的 `getPriceHard/getPriceSoft/getPriceChips` 全是 0（价格来自 Google Play 商品表），
+改道过去只会**静默返回**：不扣钱、不弹窗、什么都没有——用户看到的就是"点了没反应"。
+这两条补丁已废弃。
+
+### 10.3 正确的补丁（两条，各 8/12 字节）
+真正**无条件发奖**的是 `tr::StoreManager::onPurchaseComplete(IAPItemInfo*, IAPReceipt*)`
+@`0x00579940`（3296 字节）：全程不读收据、不发任何网络请求，直接
+`PlayerItems::setItemCount` + `StoreItemManager::handleItemPurchase` + `switchServer`。
+它是 `mz::IAPManagerListener` vtable 的**槽 0**；失败/取消路径分别走槽 `0x08` / `0x10`，
+即 `onPurchaseFailed(int, IAPItemInfo*)` @`0x0057a9a8` 与
+`onPurchaseCancel(IAPItemInfo*)` @`0x0057aa04`，这两个函数只做 UserTracker 打点并弹「购买失败。」。
+
+把它们改成尾调用 `onPurchaseComplete`：
+
+| 补丁 id | 符号 | 字节改动 |
+| --- | --- | --- |
+| `iap-failed-redirects-to-complete` | `_ZN2tr12StoreManager16onPurchaseFailedEiPN2mz11IAPItemInfoE` | `f3 0f 1e f8 fd 7b 01 a9 fd 43 00 91` → `e1 03 02 aa e2 03 1f aa e4 fb ff 17`（`mov x1,x2 ; mov x2,xzr ; b 0x579940`） |
+| `iap-cancel-redirects-to-complete` | `_ZN2tr12StoreManager16onPurchaseCancelEPN2mz11IAPItemInfoE` | `f3 0f 1e f8 fd 7b 01 a9` → `e2 03 1f aa ce fb ff 17`（`mov x2,xzr ; b 0x579940`） |
+
+`x2 = IAPReceipt*` 传 NULL 是安全的：`onPurchaseComplete` 内部 `0x00579ad0` 与 `0x00579e90`
+两处都是 `cbz x20, ...` 先判空再解引用。
+
+### 10.4 实机结果（小米 8 / LineageOS 22.2，无 Google Play 服务）
+- 商店 → 宝石 → 「宝石城堡 5 800 宝石 11.00 $」→ **弹出「谢谢你的购买！ 5 800 宝石」**，
+  HUD 宝石数当场 `27 475 → 33 275`（正好 +5 800）。
+- 全程**没有**任何购买相关的服务器请求（这条链路完全在客户端本地完成）。
+- 截图 `tmp\m13f.png`。
+
+### 10.5 交付物
+`TrialsFrontier-offline.apk` 已更新为含上述两条补丁的版本
+（SHA-256 `8077D174C0A47EC2AE4CCF9112AE1317D07C736FDE7BB717CF1C6676D063E93D`，
+26 906 224 字节）。旧的基线版备份在 `tmp\build\tf-m8-release-backup.apk`。
+`tools/patch_native.py` 的 `PATCHES` 已同步，`--dry-run` 自检 10 条全 `[OK]`。

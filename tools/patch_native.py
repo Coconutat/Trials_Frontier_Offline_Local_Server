@@ -101,6 +101,34 @@ PATCHES = [
                "于是 Tapjoy 广告墙、AdMob 插屏/激励视频、Flurry、AdColony 全部不加载，"
                "也不再产生 placements.tapjoy.com 等广告网络流量。",
     },
+    {
+        "id": "iap-failed-redirects-to-complete",
+        "symbol": "_ZN2tr12StoreManager16onPurchaseFailedEiPN2mz11IAPItemInfoE",
+        "offset": 0x0,
+        # 0x0057a9a8: str x19,[sp,#-0x20]! ; stp x29,x30,[sp,#0x10] ; add x29,sp,#0x10
+        "original": "f3 0f 1e f8 fd 7b 01 a9 fd 43 00 91",
+        # mov x1, x2 ; mov x2, xzr ; b #0x579940 (StoreManager::onPurchaseComplete)
+        "patched": "e1 03 02 aa e2 03 1f aa e4 fb ff 17",
+        "why": "真钱内购的完整破解。反汇编证明：StoreManager::onNetworkDataReceived(0x57b0cc) 的"
+               "cmd 0x17 分支只是再调一次 mz::IAPManager::purchase（仍走 Google Play），"
+               "所以「让服务器下发购买结果」这条路拿不到物品；真正无条件发奖的是"
+               " StoreManager::onPurchaseComplete(0x579940，3296 字节，全程不校验收据、不联网)。"
+               "它在 IAPManagerListener vtable 的槽 0，失败/取消则分别走槽 0x08/0x10，即"
+               " onPurchaseFailed(0x57a9a8) 与 onPurchaseCancel(0x57aa04)，这两个函数只做"
+               " UserTracker 打点并弹「购买失败。」。把这两个入口改成尾调用 onPurchaseComplete"
+               "（x2 = IAPReceipt* 传 NULL，函数内 0x579ad0/0x579e90 两处 `cbz x20` 有 NULL 保护），"
+               "Google Play 的失败回调就变成「谢谢你的购买！」并正常发奖。",
+    },
+    {
+        "id": "iap-cancel-redirects-to-complete",
+        "symbol": "_ZN2tr12StoreManager16onPurchaseCancelEPN2mz11IAPItemInfoE",
+        "offset": 0x0,
+        # 0x0057aa04: str x19,[sp,#-0x20]! ; stp x29,x30,[sp,#0x10]
+        "original": "f3 0f 1e f8 fd 7b 01 a9",
+        # mov x2, xzr ; b #0x579940 (StoreManager::onPurchaseComplete)
+        "patched": "e2 03 1f aa ce fb ff 17",
+        "why": "同上，覆盖取消路径（IAPManagerListener vtable 槽 0x10）。",
+    },
 ]
 
 # ---------------------------------------------------------------- ELF64 解析
