@@ -1088,9 +1088,10 @@ _PVP_TRACK = 1041                     # 幽灵库和真机都跑过，直接拿�
 _PVP_ROBOT_ID = "44444444-4444-4444-4444-444444444444"   # = FRIEND_NAMES 的 GhostRider
 _PVP_SEARCH_TTL = 1800                # 秒；超过就当没在搜索
 _pvp_search = {}                      # profileId -> 搜索开始时间（时间戳）
+_PVP_MATCH_RE = re.compile(r"^/public/pvp_matches/v1/matches/(\d+)$")
 
 
-def _pvp_match_json(profile_id):
+def _pvp_match_json(profile_id, match_id=1):
     """一条合成对局——根对象契约来自 `OnlinePVP::parseMatch` @0x4fd9d0。
 
     第一遍遍历根成员读 `id` @0xb86c8a / `server_time` @0xb8695c /
@@ -1104,7 +1105,7 @@ def _pvp_match_json(profile_id):
     """
     now = int(time.time())
     return {
-        "id": 1,
+        "id": match_id,
         "server_time": now,
         "total_time": 0,
         "player1": {"profile_id": profile_id or _PVP_ROBOT_ID},
@@ -1170,8 +1171,24 @@ def h_pvp_init(path, query, body, headers):
 
 
 def h_pvp_matches(path, query, body, headers):
-    """GET /public/pvp_matches/v1/matches —— 对局列表（cmd 0x2a）。"""
+    """GET /public/pvp_matches/v1/matches[/<id>] —— 对局列表 / 单条对局。
+
+    ⚠ 两条路径的响应**形状不同**，必须分开：
+      * `matches`（cmd 0x2a，@0x4fc2c8）→ `parseMatches` 要的是
+        `{"matches":[…],"waiting_requests":N}` 这个**列表包装**；
+      * `matches/<id>`（cmd 0x29，@0x4fc274）→
+        `PVPManager::getMatchById(id)` 拿到本地对局后直接
+        `parseMatch(json_root, query, match, 0)`，**不剥壳**，所以响应体必须与
+        列表里的那个元素**同构**（扁平的单个对局对象）。
+    以前只按前缀注册了 `matches`，`/matches/1` 被它吃掉后客户端拿到的是列表对象，
+    `parseMatch` 在根成员里找不到 `id`/`tracks` → 对局一条赛道都没有 →
+    开局立刻结束、点「结束」崩（真机 m02488 反馈，日志 21:15:50 那行）。
+    """
     pid = _ghost_caller(headers)
+    m = _PVP_MATCH_RE.match(path)
+    if m:
+        print("[pvp] match/%s pid=%s" % (m.group(1), pid), flush=True)
+        return 200, {"Content-Type": "application/json"}, _pvp_match_json(pid, int(m.group(1)))
     print("[pvp] matches pid=%s" % (pid,), flush=True)
     return 200, {"Content-Type": "application/json"}, _pvp_match_info(pid)
 
@@ -1756,6 +1773,11 @@ DYNAMIC = [
     ("GET", "/public/pvp_matches/v1/pvp_config", h_pvp_config),
     ("GET", "/public/pvp_matches/v1/season/", h_pvp_season_data),
     ("POST", "/public/pvp_matches/v1/close_season", h_pvp_close_season),
+    # 开赛（cmd 0x2c）：`OnlinePVP::startRace` @0x4fa22c 用 postJson 发
+    # {"match_id":%d,"golden_ticket":"True"|"False","track":%d}；响应侧
+    # @0x4fc358 一个字节的 JSON 都不解析（只据 `[query+0x62]` 决定要不要
+    # 顺带拉一条 PVP 幽灵），所以回个 200 就够。
+    ("POST", "/public/pvp_matches/v1/start_race", h_pvp_accept),
     ("POST", "/public/pvp_matches/v1/race", h_pvp_accept),
     ("POST", "/public/pvp_matches/v1/increase_rewards", h_pvp_accept),
     ("POST", "/public/pvp_matches/v1/chips", h_pvp_accept),
