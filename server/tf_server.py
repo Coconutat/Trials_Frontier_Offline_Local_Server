@@ -63,6 +63,16 @@ _TF_CONFIG_DEFAULTS = {
         "bot_name": "GhostRider",
         # 对局时长（秒）——PVPMatch+0x198，客户端用 start_time+该值 算剩余时间。
         "match_duration_seconds": 3600,
+        # 对局赛道里发给客户端的车种 ID（1 起始，见 UpgradeManager::getBikeIndexByID = id-1）。
+        # ★ 必须写进 tracks[].owner_change_time：PVPManager::onStartRaceSent @0x5e59ec 是
+        #   `ldr w9,[match+0x24]; str w9,[GameWorld+0x1efc]`，而 match+0x24 就是
+        #   第 0 条轨道 +0x20（= setOwner 写的那个字段）。填 0 → getBike(0)=NULL →
+        #   EffectManager::checkNeedForSpecialEffects 解引用 [x0+0x100] 崩。
+        "bike_id": 1,
+        # 局内票（免费票）：满 N 张，每 interval 秒回 1 张，用完才动黄金票。
+        "free_tickets_max": 3,
+        "free_tickets_initial": 3,
+        "free_tickets_interval_seconds": 3600,
     },
     "season": {
         "track_id": 1041,
@@ -1189,12 +1199,15 @@ def _pvp_season(banner_url=""):
     now = int(time.time())
     week_start, _wi = _week_index()
     days = cfg_int("season", "duration_days", default=30) or 30
+    ftk_max = cfg_int("matchmaking", "free_tickets_max", default=3)
+    ftk_init = cfg_int("matchmaking", "free_tickets_initial", default=ftk_max)
+    ftk_iv = cfg_int("matchmaking", "free_tickets_interval_seconds", default=3600)
     return {
         "pvp_match_settings": {
-            "free_tickets_interval": 3600,
+            "free_tickets_interval": ftk_iv if ftk_iv > 0 else 3600,
             "Pvp_skill_counter": 0,
-            "free_tickets_max": 5,
-            "free_tickets_initial": 5,
+            "free_tickets_max": ftk_max if ftk_max > 0 else 3,
+            "free_tickets_initial": ftk_init,
             "chip_equation_x": 1,
             "chip_equation_y": 1,
             "winner_chip_heritage": 100,
@@ -1243,6 +1256,76 @@ _pvp_search = {}                      # profileId -> {"at": 下单时刻, "match
 _pvp_matches = {}                     # match_id -> {"players":[pid, …], "at", "track", "bot"}
 _pvp_id_lock = threading.Lock()
 _pvp_next_id = [1]                    # 用列表包一层，方便就地自增
+_pvp_tickets = {}                     # profileId -> {"tickets": n, "ts": 回票基准时刻(0=已满)}
+
+
+# --- 局内票（免费票）--------------------------------------------------------
+# 用户 m02890 的规则：开局每人 3 张局内票，每 1h 回 1 张，回满 3 张为止；
+# 每次比赛/重试优先消耗局内票，用完才消耗黄金票。
+#
+# 客户端算法（`PVPMatch::getPlayerTickets` @0x5ed494 / `getTimeUntilNextFreeTicket`
+# @0x5ed37c / `updateCurrentPlayerTicketCount` @0x5ed298，三者同一套）：
+#     tickets = PVPMatch+0xa8 ; ticket_increased = PVPMatch+0x19c
+#     max      = [PVPManager+0xc4]  ← pvp_match_settings.free_tickets_max
+#     interval = [PVPManager+0xc0]  ← pvp_match_settings.free_tickets_interval
+#     if (ticket_increased == 0) return tickets          # 0 = 已满/无需回票
+#     if (tickets >= max) { ticket_increased = 0; return tickets }
+#     if (now - ticket_increased < interval) return tickets
+#     每满 interval 秒 tickets++ 并把 ticket_increased += interval（循环到 max）
+# 所以服务端只要给出「当前票数」和「最近一次回票/开始计时的时刻」即可。
+#
+# 黄金票判定在 `MenuzStatePVPMatch::onRaceButtonPressed` @0x72d7c8：
+#     if (getPlayerTickets() == 0) w3 = 1   # w3 = 使用黄金票
+#     → PVPManager::requestStartLevel(..., w3, ...)
+# 之前玩家槽只发 profile_id → PVPMatch+0xa8 = 0 → 每局都扣黄金票。
+def _pvp_ticket_limits():
+    maxn = cfg_int("matchmaking", "free_tickets_max", default=3)
+    if maxn <= 0:
+        maxn = 3
+    interval = cfg_int("matchmaking", "free_tickets_interval_seconds", default=3600)
+    if interval <= 0:
+        interval = 3600
+    return maxn, interval
+
+
+def _pvp_tickets_for(pid):
+    """返回 (tickets, ticket_increased)。ticket_increased == 0 表示已回满。"""
+    if not pid:
+        # 人机没有账号，永远给它「满票」——它也不该显示倒计时。
+        return _pvp_ticket_limits()[0], 0
+    maxn, interval = _pvp_ticket_limits()
+    now = int(time.time())
+    st = _pvp_tickets.get(pid)
+    if st is None:
+        init = cfg_int("matchmaking", "free_tickets_initial", default=maxn)
+        st = {"tickets": max(0, min(maxn, init)), "ts": 0}
+        _pvp_tickets[pid] = st
+    if st["tickets"] < maxn:
+        if not st["ts"]:
+            st["ts"] = now                      # 从不满的这一刻开始计时
+        else:
+            gained = (now - st["ts"]) // interval
+            if gained > 0:
+                st["tickets"] = min(maxn, st["tickets"] + gained)
+                st["ts"] = st["ts"] + gained * interval
+    if st["tickets"] >= maxn:
+        st["ts"] = 0                            # 满了就不再回
+    return st["tickets"], st["ts"]
+
+
+def _pvp_consume_ticket(pid):
+    """开一局就消耗一张局内票；返回扣完之后还剩几张。"""
+    if not pid:
+        return 0
+    tickets, _ts = _pvp_tickets_for(pid)
+    maxn, _iv = _pvp_ticket_limits()
+    st = _pvp_tickets.get(pid)
+    if st is None or st["tickets"] <= 0:
+        return 0
+    if st["tickets"] >= maxn:
+        st["ts"] = int(time.time())             # 从满票掉下来，回票从现在开始计
+    st["tickets"] -= 1
+    return st["tickets"]
 
 
 def _pvp_track():
@@ -1332,14 +1415,36 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     """
     now = int(time.time())
     dur = cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600
+    bike = cfg_int("matchmaking", "bike_id", default=1)
+    if not isinstance(bike, int) or bike < 1:
+        bike = 1
+    tickets, ticket_ts = _pvp_tickets_for(profile_id)
+    info = _pvp_player_info()
+    # 两个槽用同一套票数/筹码/段位：parseMatch 收尾把「最后处理的那个槽」当自己、
+    # 另一个当对手（见 server/tf_server.py 上方注释），两边都给才不会踩空。
+    # ★ tickets / ticket_increased 必须发：不发 → PVPMatch+0xa8 = 0 → 扣黄金票。
+    def _slot(pid):
+        return {
+            "profile_id": pid,
+            "tickets": tickets,
+            "ticket_increased": ticket_ts,
+            "chips": info["chips"],
+            "rank": info["rank"],
+            "elo_rank": info["elo_rank"],
+            "outfit": 0,
+            "reward_data": 0,
+        }
     return {
         "id": match_id,
         "server_time": now,
         "total_time": dur,
-        "player1": {"profile_id": profile_id or _pvp_bot_id()},
-        "player2": {"profile_id": opponent_id or _pvp_bot_id()},
+        "player1": _slot(profile_id or _pvp_bot_id()),
+        "player2": _slot(opponent_id or _pvp_bot_id()),
         "start_time": now,
-        "tracks": [{"track": track or _pvp_track(), "bike": 0, "owner_change_time": 0}],
+        # ★ `owner_change_time` 就是车种 ID：onStartRaceSent @0x5e59ec 读 PVPMatch+0x24
+        #   （= 第 0 条轨道的 +0x20，即 setOwner 的第二个参数）写进 GameWorld+0x1efc；
+        #   填 0 → UpgradeManager::getBike(0) 为 NULL → 加载关卡时崩。
+        "tracks": [{"track": track or _pvp_track(), "bike": bike, "owner_change_time": bike}],
     }
 
 
@@ -1352,6 +1457,10 @@ def _pvp_make_match(players, track=None, bot=False):
         "track": track or _pvp_track(),
         "bot": bool(bot),
     }
+    for p in players:
+        if p and p != _pvp_bot_id():
+            left = _pvp_consume_ticket(p)
+            print("[pvp] 消耗局内票 %s -> %d" % (p, left), flush=True)
     return mid
 
 
@@ -2500,6 +2609,10 @@ class Handler(BaseHTTPRequestHandler):
                             for mid, m in sorted(_pvp_matches.items())],
                 "active_players": [{"profileId": p, "seen_ago": now - ts}
                                    for p, ts in sorted(ACTIVE_PLAYERS.items()) if now - ts <= win],
+                "tickets": [{"profileId": p, "tickets": st.get("tickets"),
+                             "next_in": max(0, st.get("ts", 0) + (_pvp_ticket_limits()[1]) - now)
+                             if st.get("ts") else 0}
+                            for p, st in sorted(_pvp_tickets.items())],
                 "config_path": CONFIG_PATH,
             }
             return js({"config": tf_config(), "runtime": rt,
