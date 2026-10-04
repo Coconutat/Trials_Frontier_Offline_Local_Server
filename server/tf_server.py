@@ -61,8 +61,17 @@ _TF_CONFIG_DEFAULTS = {
         "track_id": 1041,
         "bot_profile_id": "44444444-4444-4444-4444-444444444444",
         "bot_name": "GhostRider",
-        # 对局时长（秒）——PVPMatch+0x198，客户端用 start_time+该值 算剩余时间。
-        "match_duration_seconds": 3600,
+        # 对局时长（秒）——PVPMatch+0x198，客户端用 start_time+该值 算剩余时间
+        # （`PVPMatch::getRemainingTime` @0x5ed1e4 = start_time + total_time - now）。
+        # 用户 m04404：一整轮是 **6 小时**，慢慢计时到 0。
+        # ★ 必须同时让 start_time 稳定（见 `_pvp_make_match` 的 `start`）：每轮都回
+        #   now 会让剩余时间永远是满值，症状就是「过几秒又跳回满值」。
+        "match_duration_seconds": 21600,
+        # 一局 3 条赛道（用户 m04404 引同服玩家 Assassins-Cry 实测：开一局 3 条赛道，
+        # 倒计时结束前赢下 2 条就赢这一局）。
+        # ★ `parseMatch` 的 tracks 循环没有边界检查（0x4fddc0 起 `madd x9,x28,#0x34,x21`），
+        #   >3 条会一路写穿到 PVPMatch+0xa4（chips）/ +0xa8（tickets）。**最多 3 条。**
+        "track_ids": [1041, 1024, 1068],
         # 对局赛道里发给客户端的车种 ID（1 起始，见 UpgradeManager::getBikeIndexByID = id-1）。
         # ★ 必须写进 tracks[].owner_change_time：PVPManager::onStartRaceSent @0x5e59ec 是
         #   `ldr w9,[match+0x24]; str w9,[GameWorld+0x1efc]`，而 match+0x24 就是
@@ -90,9 +99,12 @@ _TF_CONFIG_DEFAULTS = {
         #   `PVPManager+0x1ac + 4*(rank-1)`，也就是 **star_array[rank-1]**
         #   = 「从该 rank 升上去需要几颗星」。index 0 = rank 1（最高），
         #   index 24 = rank 25（最低）。不发/发空 → 客户端读未初始化内存。
-        "star_array": [20, 16, 16, 14, 14, 12, 12, 10, 10, 9,
-                       9, 8, 8, 7, 7, 6, 6, 5, 5, 4,
-                       4, 3, 3, 2, 2],
+        # 用户 m04404（引同服玩家 Assassins-Cry 2026-10-04 的实测）：
+        #   25→15 每级 2 星 / 15→10 每级 3 星 / 10→5 每级 4 星 / 5→传奇 每级 5 星。
+        # 即 rank 1..5 = 5 星、6..10 = 4 星、11..15 = 3 星、16..25 = 2 星。
+        "star_array": [5, 5, 5, 5, 5, 4, 4, 4, 4, 4,
+                       3, 3, 3, 3, 3, 2, 2, 2, 2, 2,
+                       2, 2, 2, 2, 2],
         # ★ `product_list` @0xb86bf3 —— `[{"product_id": "<商城 id>", "amount": int}]`，
         #   `parseSeason` @0x4fd230 处理；`chip_shop.goldentickets` @0xb86c00 是特例
         #   （给黄金参赛票 item id 0x87=135 重定价），其余 product_id 在
@@ -144,6 +156,15 @@ _TF_CONFIG_DEFAULTS = {
         # 上限（0 = 不限）。★ 别再用 200：筹码商店里最贵的一条赛道 63000 筹码，
         # 顶到 200 会让商店永久锁死。
         "max": 0,
+        # ── 局内筹码（用户 m04404 引同服玩家 Assassins-Cry 的实测规则）：
+        #   拿到这条赛道就开始累积，**前期快、后面越来越慢**；对手把赛道抢回去 →
+        #   累积速度重置，又从快开始变慢；整局跑完才结算成 `chips` 余额。
+        #   曲线取 sqrt：占着 t 秒产 `int(sqrt(t) / match_tick_sqrt)` 枚。
+        #   默认 2 → 4 秒 1 枚、9 秒 2 枚、16 秒 3 枚…（前 10 秒就有 3 枚，肉眼能看到
+        #   「每几秒生成一个」，之后明显变慢 —— 与用户的观感一致）。
+        "match_tick_sqrt": 2,
+        # 单条赛道在一局里最多产多少枚（别让挂机刷爆）。
+        "match_max_per_track": 12,
     },
     # 赛后奖励。比赛 JSON 的 `rewards` 是**数组**，parseMatch @0x4fd9d0 只读前 3 个整数
     # （`cmp w9,#2; b.gt`，见 0x4fdd78），然后拼成 PVPMatch+0x170 上的
@@ -1693,6 +1714,167 @@ def _pvp_track_result(time_ms, faults=0, bike_data=None, additional_score=0,
     return out
 
 
+def _pvp_time_of_score(score):
+    """`_pvp_score_int` 的逆：score → 用时(ms)。"""
+    score = int(score or 0)
+    return max(0, 3600000 - (score % 3600000))
+
+
+def _pvp_faults_of_score(score):
+    """`_pvp_score_int` 的逆：score → 失误数。"""
+    score = int(score or 0)
+    return max(0, min(99, 99 - score // 3600000))
+
+
+def _pvp_slower_than(opp_ms, ratio=1.06, pad_ms=500):
+    """合成一个「比对手慢一点」的用时 —— 本机还没交成绩时用。"""
+    my = min(3600000, int(opp_ms * ratio) + pad_ms)
+    if my <= opp_ms:
+        my = min(3600000, opp_ms + 500)
+    return my
+
+
+def _pvp_ghost_time(tid):
+    """幽灵库里这条赛道的 drive_time（ms）；没有就退到 30 s。"""
+    try:
+        rec = acct.ghost_any_for_track(tid)
+    except Exception:
+        rec = None
+    ms = int((rec or {}).get("drive_time") or 0)
+    if ms < 1000 or ms > 3600000:
+        ms = 30000
+    return ms
+
+
+def _pvp_tracks():
+    """本局要发的赛道清单（最多 3 条，理由见 matchmaking.track_ids 的注释）。"""
+    ids = cfg("matchmaking", "track_ids", default=None)
+    out = []
+    if isinstance(ids, (list, tuple)):
+        for v in list(ids)[:3]:
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                out.append(v)
+    if not out:
+        out = [_pvp_track()]
+    while len(out) < 3:
+        out.append(out[-1])
+    return out[:3]
+
+
+def _pvp_other_pid(m, who):
+    for p in (m.get("players") or []):
+        if p != who:
+            return p
+    return _pvp_bot_id()
+
+
+def _pvp_side_score(m, who, tid):
+    """这条赛道上 `who` 的 score（int）。
+
+    有客户端实报的成绩就用它；没有就按「幽灵代表先占着这条赛道的人」推一个默认值：
+    对手是人机时用幽灵自己的 score，本机则故意慢一点 —— 否则一上来赛道就归自己，
+    玩家没有可挑战的记录（真机 m04404 看到的就是「只有 AI 的记录被记住」）。
+    """
+    tid = int(tid)
+    rec = ((m.get("results") or {}).get(who) or {}).get(tid) or {}
+    sc = int(rec.get("score") or 0)
+    if sc:
+        return sc
+    # 幽灵代表谁：**对手**。所以要先看这一局里有没有人机，而不是看 who 的对面是不是人机
+    # （那是原来的 bug：对人机自己那一侧 `_pvp_other_pid` 返回的是真人，于是人机永远 0 分，
+    #  玩家一进局就白占三条赛道 —— 冒烟测试第一次就跑出来了）。
+    pids = [p for p in (m.get("players") or []) if p]
+    if _pvp_bot_id() not in pids:
+        return 0
+    ghost = _pvp_ghost_time(tid)
+    if who == _pvp_bot_id():
+        # 人机 = 幽灵本人的记录（也正是随后经 pvp_replaydata 下发的那条）。
+        return _pvp_score_int(ghost, 0)
+    # 真人还没跑过 → 合成一个略慢于幽灵的成绩，这条赛道先归人机（有记录可挑战）。
+    return _pvp_score_int(_pvp_slower_than(ghost), 0)
+
+
+def _pvp_owner_of(m, tid):
+    """这条赛道归谁；两边都还没成绩时返回 None。
+
+    ★ 与客户端同一套判定：`parseMatch` 0x4fe0dc 起拿两个 result 的 score 比大小后调
+      `PVPTrack::setOwner(...)`；score 越大越快（`_pvp_score_int`），谁快谁占。
+    """
+    pids = list(m.get("players") or [])
+    if len(pids) < 2:
+        pids = (pids + [_pvp_bot_id()])[:2]
+    best, bestsc = None, -1
+    for p in pids:
+        sc = _pvp_side_score(m, p, tid)
+        if sc > bestsc:
+            best, bestsc = p, sc
+    if bestsc <= 0:
+        return None
+    return best
+
+
+def _pvp_match_won(m, who):
+    """这局 `who` 赢了吗 —— 3 条赛道里占住 ≥2 条即赢（用户 m04404 引用的规则）。"""
+    owners = {}
+    for tid in (m.get("tracks") or []):
+        o = _pvp_owner_of(m, tid)
+        owners[o] = owners.get(o, 0) + 1
+    return owners.get(who, 0) >= 2
+
+
+def _pvp_match_chips(m, who, now=None):
+    """本局 `who` 从「自己占着的赛道」上产出的筹码；`m` 为空时返回 None。
+
+    用户 m04404（引同服玩家 Assassins-Cry 的实测规则）：
+      * 拿到这条赛道就开始累积，**前期快、后面越来越慢**；
+      * 对手把赛道抢回去 → 累积速度**重置**，又从快开始变慢；
+      * 整局跑完才结算成筹码余额（见 `_pvp_bank_match_chips`）。
+    曲线取 sqrt：占着 t 秒产 `int(sqrt(t)/k)` 枚 —— 几秒就出第一枚，之后越来越慢。
+    """
+    if not m or not who:
+        return None
+    now = int(now or time.time())
+    try:
+        k = int(cfg_int("chips", "match_tick_sqrt", default=2) or 2)
+    except (TypeError, ValueError):
+        k = 2
+    k = max(1, k)
+    cap = cfg_int("chips", "match_max_per_track", default=12) or 12
+    total = int((m.get("chip_base") or {}).get(who) or 0)
+    at_map = m.get("owner_at") or {}
+    start = int(m.get("start") or now)
+    for tid in (m.get("tracks") or []):
+        tid = int(tid)
+        if _pvp_owner_of(m, tid) != who:
+            continue
+        at = at_map.get(tid)
+        if at is None:
+            at = at_map.get(str(tid))
+        dt = max(0, now - int(at if at else start))
+        total += min(cap, int((dt ** 0.5) / float(k)))
+    return total
+
+
+def _pvp_bank_match_chips(m):
+    """整局跑完 → 把局内筹码结算进 `_pvp_chips`（幂等）。"""
+    if not m or m.get("_banked"):
+        return
+    m["_banked"] = True
+    now = int(time.time())
+    for p in (m.get("players") or []):
+        if not p or p == _pvp_bot_id():
+            continue
+        got = _pvp_match_chips(m, p, now)
+        if got and got > 0:
+            st = _pvp_chips_state(p)
+            st["chips"] += int(got)
+            print("[pvp] 结算筹码 %s +%d -> %d" % (p, got, st["chips"]), flush=True)
+
+
 def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     """一条合成对局——根对象契约来自 `OnlinePVP::parseMatch` @0x4fd9d0。
 
@@ -1713,40 +1895,89 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
       这就是「匹配上对手立马就结束」的另一半原因。
     """
     now = int(time.time())
-    dur = cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600
+    # 本局状态（`_pvp_make_match` 建的）。`.get` 也兼容「服务器重启后客户端手上那条
+    # 我们已经没有记录的对局」——那时 `_m` 为空，一切退回合成值。
+    _m = _pvp_matches.get(match_id) or {}
+    dur = int(_m.get("dur") or 0) or cfg_int("matchmaking", "match_duration_seconds",
+                                             default=21600) or 21600
+    # ★ start_time 必须**每条对局固定**：每轮都回 now 会让
+    #   `PVPMatch::getRemainingTime` @0x5ed1e4（= start_time + total_time - now）
+    #   永远等于满值 —— 真机症状就是「倒计时过几秒又跳回满值」（用户 m04404）。
+    start = int(_m.get("start") or 0) or now
     bike = cfg_int("matchmaking", "bike_id", default=1)
     if not isinstance(bike, int) or bike < 1:
         bike = 1
-    ttrack = track or _pvp_track()
-    # 对手幽灵的用时：库里那条幽灵（也就是随后会经 pvp_replaydata 下发的那条）的真实
-    # drive_time，让「对手用时」和真的播出来的幽灵对得上。没有就退到 30 s。
-    try:
-        _grec = acct.ghost_any_for_track(ttrack)
-    except Exception:
-        _grec = None
-    opp_ms = int((_grec or {}).get("drive_time") or 0)
-    if opp_ms < 1000 or opp_ms > 3600000:
-        opp_ms = 30000
-    # 我比对手慢一点 → 赛道归对手所有（owner=1，挑战对手记录），而不是我一上来就守着。
-    my_ms = min(3600000, int(opp_ms * 1.06) + 500)
-    if my_ms <= opp_ms:
-        my_ms = min(3600000, opp_ms + 500)
+    # 一局 3 条赛道；`track` 仍作兜底（服务器重启后补建的对局没有 tracks）。
+    tlist = _m.get("tracks")
+    if not isinstance(tlist, list) or not tlist:
+        tlist = _pvp_tracks() if track is None else [int(track)]
+    tlist = [int(t) for t in list(tlist)[:3] if int(t) > 0] or [_pvp_track()]
+    _mine = (_m.get("results") or {}).get(profile_id) or {}
     tickets, ticket_ts = _pvp_tickets_for(profile_id)
     info = _pvp_player_info()
-    # 赛后奖励：对局跑完（客户端 POST 过 /pvp_matches/v1/race）就用 win 那一档。
-    _m = _pvp_matches.get(match_id) or {}
-    _rw = cfg("rewards", "win", default=[]) if _m.get("finished") else []
+    # 赛后奖励：整局跑完（3 条赛道都交过成绩）才算，且只有占住 ≥2 条赛道才给「赢」那一档。
+    # 以前只要 POST 过一次 race 就算赢，跑一条也发 win 档（用户 m04404 的规则是 3 局 2 胜）。
+    _rw = []
+    if _m.get("finished") and (_pvp_match_won(_m, profile_id) or not _m.get("results")):
+        _rw = cfg("rewards", "win", default=[]) or []
     if not _rw:
         _rw = cfg("rewards", "default", default=[100, 0, 0])
-    # 两个槽用同一套票数/筹码/段位：parseMatch 收尾把「最后处理的那个槽」当自己、
+
+    def _track_json(tid):
+        """一条赛道。★ 关键：`result_p1` 用**客户端真报上来的成绩**。
+
+        `parseMatch` 0x4fe0dc 起就是拿两个 result 的 score 比大小后调
+        `PVPTrack::setOwner(...)` —— score 越大越快（`_pvp_score_int`），谁快谁占这条赛道。
+        这里以前恒定发 `对手用时 * 1.06`（永远比对手慢），所以玩家跑得再快，
+        下一轮 `matches` 回来还是同一组合成值、赛道永远不换主；真机症状就是
+        「我跑的记录不会被记录，超越他了也依然没法打败他」（用户 m04404）。
+        现在 `h_pvp_race` 把每条赛道的成绩存进 `match["results"]`，这里原样回放。
+        """
+        tid = int(tid)
+        opp_ms = _pvp_ghost_time(tid)
+        rec = _mine.get(tid) or {}
+        try:
+            my_score = int(rec.get("score") or 0)
+        except (TypeError, ValueError):
+            my_score = 0
+        if my_score > 0:
+            my = _pvp_track_result(_pvp_time_of_score(my_score),
+                                   _pvp_faults_of_score(my_score),
+                                   bike_data=(rec.get("bike_data") or bike))
+        else:
+            # 还没跑过 → 合成一个略慢于对手的成绩，让这条赛道一开始归对手
+            # （玩家一进来就有记录可挑战，而不是自己守着）。
+            my = _pvp_track_result(_pvp_slower_than(opp_ms), 0, bike_data=bike)
+        return {
+            "track": tid,
+            "bike": bike,
+            # ★ `owner_change_time` 就是车种 ID：onStartRaceSent @0x5e59ec 读
+            #   PVPMatch+0x24（= 第 0 条轨道的 +0x20，即 setOwner 的第二个参数）
+            #   写进 GameWorld+0x1efc；填 0 → UpgradeManager::getBike(0) 为 NULL →
+            #   加载关卡时崩。
+            "owner_change_time": bike,
+            # ★★ result_p1/result_p2 **必须发**：parseMatch 从 `score` 解出双方用时写进
+            #   PVPTrack+0x08（对手）+0x0C（自己），而 startRace @0x4fa22c 只按
+            #   `PVPTrack+0x0C != 0` 决定要不要下对手幽灵：不发 → /start_race 回来后
+            #   cmd 0x2c 分支直接 cbz 跳过 → 比赛里没有幽灵（m05071 根因）。
+            "result_p1": my,
+            "result_p2": _pvp_track_result(opp_ms, 0, bike_data=bike),
+        }
+
+    # 两个槽用同一套票数/段位：parseMatch 收尾把「最后处理的那个槽」当自己、
     # 另一个当对手（见 server/tf_server.py 上方注释），两边都给才不会踩空。
     # ★ tickets / ticket_increased 必须发：不发 → PVPMatch+0xa8 = 0 → 扣黄金票。
     def _slot(pid, me=False):
+        # 筹码：局内按「自己占着的赛道」随时间产（用户 m04404 的规则），
+        # 没有对局（服务器重启后的补建）才退回账号总额。
+        chips = _pvp_match_chips(_m, pid, now) if _m else None
+        if chips is None:
+            chips = _pvp_chips_for(pid)
         return {
             "profile_id": pid,
             "tickets": tickets,
             "ticket_increased": ticket_ts,
-            "chips": _pvp_chips_for(pid),
+            "chips": chips,
             "rank": info["rank"],
             "elo_rank": info["elo_rank"],
             "outfit": 0,
@@ -1765,25 +1996,11 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
         # ★ 本机必须正好出现在一个槽里：parseMatch 只用 `strcmp(本地名, player2.profile_id)`
         #   决定本地是 p1 还是 p2（不相等 → 本地 = player1），错了就会读错 chips /
         #   tickets / reward_data / 对手 profile_id（strcpy 到 match+0x131 的那个）。
+        #   同理 result_pN 也是按槽位归属：本机是 player1 时，result_p1 = 本机成绩。
         "player1": _slot(profile_id or _pvp_bot_id(), me=True),
         "player2": _slot(opponent_id or _pvp_bot_id()),
-        "start_time": now,
-        # ★ `owner_change_time` 就是车种 ID：onStartRaceSent @0x5e59ec 读 PVPMatch+0x24
-        #   （= 第 0 条轨道的 +0x20，即 setOwner 的第二个参数）写进 GameWorld+0x1efc；
-        #   填 0 → UpgradeManager::getBike(0) 为 NULL → 加载关卡时崩。
-        # ★★ result_p1/result_p2 **必须发**：parseMatch 从 `score` 解出双方用时写进
-        #   PVPTrack+0x08/+0x0C，而 startRace @0x4fa22c 只按
-        #   `PVPTrack+0x0C != 0`（对手在这条赛道上有成绩）决定要不要下对手幽灵：
-        #   不发 → /start_race 回来后 cmd 0x2c 分支直接 cbz 跳过，
-        #   getPVPGhost() 从不调用 → 比赛里没有幽灵（m05071 根因）。
-        #   顺带 owner 也由这两个 score 的比较算出来（score 越大越快）。
-        "tracks": [{
-            "track": ttrack,
-            "bike": bike,
-            "owner_change_time": bike,
-            "result_p1": _pvp_track_result(my_ms, 0, bike_data=bike),
-            "result_p2": _pvp_track_result(opp_ms, 0, bike_data=bike),
-        }],
+        "start_time": start,
+        "tracks": [_track_json(t) for t in tlist],
         # ★ 赛后奖励 = [金币, 钻石, 特殊奖励等级]；parseMatch 拼成
         #   {(1,coins),(2,gems),(145,special)} 塞进 PVPMatch+0x170，
         #   赛后界面 setupComponents @0x7308f0 直接把它搬过去显示。
@@ -1793,12 +2010,36 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
 
 
 def _pvp_make_match(players, track=None, bot=False):
-    """建一条对局并登记，返回 match id。"""
+    """建一条对局并登记，返回 match id。
+
+    ★ 对局状态里必须**固定** `start` / `dur` / `tracks`：`_pvp_match_json` 每轮
+      （`matches`、`new_ranked`…）都会被调用，如果每次都拿 `now` 当 start_time，客户端算
+      `PVPMatch::getRemainingTime` @0x5ed1e4（= start_time + total_time - now）就永远是
+      满值 —— 真机症状正是「倒计时过几秒又跳回满值」（用户 m04404）。
+    `results` 存每条赛道双方真报上来的成绩；`owner_at` 记每条赛道「当前归属者是什么时候
+    拿到它的」，供 `_pvp_match_chips` 算筹码（换主即重置累积速度，同样来自 m04404）。
+    """
+    now = int(time.time())
     mid = _pvp_new_id()
+    tracks = _pvp_tracks() if track is None else [int(track)]
+    tracks = [int(t) for t in list(tracks)[:3] if int(t) > 0] or [_pvp_track()]
+    dur = cfg_int("matchmaking", "match_duration_seconds", default=21600) or 21600
     _pvp_matches[mid] = {
         "players": list(players),
-        "at": int(time.time()),
-        "track": track or _pvp_track(),
+        "at": now,
+        "start": now,
+        "dur": int(dur),
+        "tracks": tracks,
+        "track": tracks[0],
+        # {profile_id: {track_id: {"score": int, "additional_score": int,
+        #                          "bike_data": int, "at": unix}}}
+        "results": {},
+        # {track_id: profile_id} 当前归属（真值仍由 `_pvp_owner_of` 按 score 算）
+        "owner": {},
+        # {track_id: 归属者拿到它的 unix 时间} —— 换主时重置，筹码累积速度随之重置
+        "owner_at": {},
+        # {profile_id: 进这局时已有的筹码（结算基线，本实现恒 0）}
+        "chip_base": {},
         "bot": bool(bot),
     }
     for p in players:
@@ -1964,9 +2205,24 @@ def h_pvp_matches(path, query, body, headers):
         view = _pvp_view(pid, mid)
         if view:
             return 200, {"Content-Type": "application/json"}, view
-        # 服务器重启过 / 队列过期：客户端手上那条对局我们没记录，就按同 id 补一条
-        _pvp_matches[mid] = {"players": [pid, _pvp_bot_id()], "at": int(time.time()),
-                             "track": _pvp_track(), "bot": True}
+        # 服务器重启过 / 队列过期：客户端手上那条对局我们没记录，就按同 id 补一条。
+        # ⚠ 必须带上同样的 start/dur/tracks —— 缺了 start 会让 `_pvp_match_json`
+        #   退回 `now`，倒计时又从满值开始（用户 m04404 看到的「几秒后跳回」）。
+        _now = int(time.time())
+        _tracks = _pvp_tracks()
+        _pvp_matches[mid] = {
+            "players": [pid, _pvp_bot_id()],
+            "at": _now,
+            "start": _now,
+            "dur": cfg_int("matchmaking", "match_duration_seconds", default=21600) or 21600,
+            "tracks": _tracks,
+            "track": _tracks[0],
+            "results": {},
+            "owner": {},
+            "owner_at": {},
+            "chip_base": {},
+            "bot": True,
+        }
         return 200, {"Content-Type": "application/json"}, _pvp_view(pid, mid)
     print("[pvp] matches pid=%s" % (pid,), flush=True)
     return 200, {"Content-Type": "application/json"}, _pvp_match_info(pid, allow_create=True)
@@ -2050,8 +2306,40 @@ def h_pvp_race(path, query, body, headers):
         mid = int(mid)
     except (TypeError, ValueError):
         mid = None
+    pid = _ghost_caller(headers)
     m = _pvp_matches.get(mid) if mid is not None else None
     if m is not None:
+        # ★ 把这条赛道**真的**记下来。`parseMatch` 0x4fe0dc 起就是拿双方 result 的
+        #   score 比大小决定赛道归属（score 越大越快，`_pvp_score_int`），所以只要这里
+        #   存了玩家的真成绩，下一轮 `matches` 就会把它原样发回 result_p1 → 赛道真的易主。
+        #   以前不存，每轮都拿 `对手用时*1.06` 合成 → 玩家跑多快都打不过对手，
+        #   真机症状就是「我的成绩不被记录、超越他了也依然没法打败他」（用户 m04404）。
+        tid = data.get("track")
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            tid = None
+        if tid is not None and pid:
+            try:
+                score = int(data.get("score") or 0)
+            except (TypeError, ValueError):
+                score = 0
+            by = m.setdefault("results", {}).setdefault(pid, {})
+            old = by.get(tid) or {}
+            if not old or score > int(old.get("score") or 0):
+                by[tid] = {
+                    "score": score,
+                    "additional_score": data.get("additional_score"),
+                    "bike_data": data.get("bike_data"),
+                    "at": int(time.time()),
+                }
+            # 归属变了 → 重置这条赛道的筹码累积起点
+            # （用户 m04404：对手拿回赛道后，筹码累积速度重置，又从快开始变慢）。
+            _who = _pvp_owner_of(m, tid)
+            if (m.setdefault("owner", {}).get(tid)) != _who:
+                m["owner"][tid] = _who
+                m.setdefault("owner_at", {})[tid] = int(time.time())
+                print("[pvp] 赛道 %s 易主 -> %s" % (tid, _who), flush=True)
         m["finished"] = True
         m["result"] = {
             "track": data.get("track"),
@@ -2060,6 +2348,15 @@ def h_pvp_race(path, query, body, headers):
             "bike_data": data.get("bike_data"),
             "timestamp": data.get("timestamp"),
         }
+        # 3 条赛道都交过成绩 → 整局结束，结算筹码（幂等，见 `_pvp_bank_match_chips`）。
+        _tracks = [int(t) for t in (m.get("tracks") or [])]
+        _res = m.get("results") or {}
+        if _tracks and all(any(int(t) in (v or {}) for v in _res.values())
+                           for t in _tracks):
+            m["won"] = _pvp_match_won(m, pid)
+            print("[pvp] 整局跑完 match=%s tracks=%s won=%s"
+                  % (mid, _tracks, m.get("won")), flush=True)
+            _pvp_bank_match_chips(m)
     # ownership_changed=1 → 客户端认为赛道易主 → 允许弹转盘 + 发特殊奖励。
     _own = cfg("rewards", "ownership_changed", default=True)
     print("[pvp] race match=%s <- %s" % (mid, data), flush=True)
