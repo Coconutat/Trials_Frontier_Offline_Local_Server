@@ -49,10 +49,16 @@ except ImportError:
     print("需要 keystone-engine: python -m pip install keystone-engine", file=sys.stderr)
     sys.exit(2)
 
-# 与 tools/patch_urls.py 保持一致的目标筛选规则
+# 与 patch_urls.py 保持一致的目标筛选规则
 HOST_SUFFIXES = (".ubi.com",)
-HOST_EXACT = ("s3.amazonaws.com",)
-HOST_SKIP = ("legal.ubi.com", "forums.ubi.com", "ubisoft-avatars.akamaized.net")
+# graph.facebook.com / ubisoft-avatars.akamaized.net 是 A.N.B.A（Robotman）支线的
+# 对手头像来源：OnlineFacebookClient::getUserPicture -> "https://graph.facebook.com/<name>/picture"
+# 失败后回退 OnlineUbiservices::getUserPicture -> "https://ubisoft-avatars.akamaized.net/<name>/default_146_146.png"。
+# 这两步必须在本地成功返回（否则 OnlineRobotMission::onPictureReceived 遇到 err!=0 会直接
+# return，状态机永远停在"检索对手中"），所以它们也要改写成本地地址。
+HOST_EXACT = ("s3.amazonaws.com", "graph.facebook.com",
+              "ubisoft-avatars.akamaized.net")
+HOST_SKIP = ("legal.ubi.com", "forums.ubi.com")
 LIT_RE = re.compile(rb"https?://([A-Za-z0-9_{}.\-]+)((?:/[^\x00]*)?)")
 
 CONF_PATH = ("/sdcard/Android/data/com.ubisoft.redlynx.trialsfrontier.ggp"

@@ -29,9 +29,12 @@ except ImportError:
 
 # 目标域名后缀 / 精确主机名
 HOST_SUFFIXES = (".ubi.com",)
-HOST_EXACT = ("s3.amazonaws.com",)
+# 后两个是 A.N.B.A（Robotman）支线的对手头像来源，必须本地化，
+# 否则 OnlineRobotMission::onPictureReceived 会因 err!=0 直接返回、卡在"检索对手中"。
+HOST_EXACT = ("s3.amazonaws.com", "graph.facebook.com",
+              "ubisoft-avatars.akamaized.net")
 # 明确不动的主机
-HOST_SKIP = ("legal.ubi.com", "forums.ubi.com", "ubisoft-avatars.akamaized.net")
+HOST_SKIP = ("legal.ubi.com", "forums.ubi.com")
 
 LIT_RE = re.compile(rb"https?://([A-Za-z0-9_{}.\-]+)((?:/[^\x00]*)?)")
 

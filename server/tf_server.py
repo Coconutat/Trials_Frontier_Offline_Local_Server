@@ -42,6 +42,15 @@ ROOT = os.path.dirname(HERE)
 LOG_PATH = os.path.join(ROOT, "work", "trials-frontier", "notes", "server-log.jsonl")
 RULES_PATH = os.path.join(HERE, "rules.json")
 
+# ★ Windows 控制台默认是 GBK，而二进制上传（幽灵 payload）被解码成含 U+FFFD 的
+# 字符串后 print 会抛 UnicodeEncodeError —— 虽然响应已经发出去了，但那条日志会
+# 丢掉，控制台还会刷一堆 Traceback。统一把标准流改成 UTF-8 + errors="replace"。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # 记录最近 N 条请求，便于 /__log 查看
 RECENT = []
 RECENT_MAX = 400
@@ -577,6 +586,116 @@ def h_ghost(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
 
+# ---------------------------------------------------------------------------
+# A.N.B.A（Robotman）支线的假机器人对手
+# ---------------------------------------------------------------------------
+# 客户端链路（`tmp/libcmp/orig-libTrialsGo.so` 逐指令反汇编确认）：
+#   tr::OnlineRobotMission::findOpponent(track, range, flag)          @0x501fcc
+#     -> tr::MatchMaking::getRobot(listener, track, range, offset)    @0x4f8fdc
+#        URL @0xb86327 = "%s/%s/match/v1/robot?track_name=track%d&range=%d&offset=%d"
+#        cmd = 0x47
+#     -> tr::MatchMaking::parseJsonResponse(cmd=0x47) 分支：
+#        parseMatchMakingResult()，把 result[0] 置 3，err 恒 0
+#     -> tr::OnlineRobotMission::onMatchMakingComplete(err, res)      @0x5021fc
+#          res[0] 必须 == 3
+#          strcpy(this+0xad, res+0x85)   <- 对手显示名
+#          this+0xec = res+0xc8          <- drivetime
+#        -> tr::OnlineGhostManager::getRobotGhost(this+8, track, name, drivetime)
+#           URL @0xb87a48 = ".../resultservice/v1/robot_replaydata?track_id=%d&time=%d&player=%s"
+#        -> onGhostReceived(...) 落盘 robot_ghost-<hash(name)>-<track>.robot
+#        -> OnlineUbiservices::getPlayerProfile(this+0x10, name)      @0x517448
+#           URL @0xb89137 = "<ubi>/v1/profiles/%s"
+#        -> onProfilesQueryCompleted: strcpy(this+0x2c, ProfileQueryData+0x48)
+#           （ProfileQueryData+0x48 == profile+0x40 == nameOnPlatform）
+#        -> OnlineFacebookClient::getUserPicture(name, 73, 73)        @0x50ef8c
+#           URL @0xb887cc = "<graph.facebook.com>/%s/picture?width=%d&height=%d"
+#           失败回退 OnlineUbiservices::getUserPicture(name, 0)       @0x517c10
+#           URL @0xb89267 = "<akamaized>/%s/default_146_146.png"
+#        -> tr::OnlineRobotMission::onPictureReceived                 @0x5027f4
+#           ★ if (err != 0) return;  —— 不清 [+0x120]、不回 state 2，界面永远停在
+#              「检索对手中」。所以 graph.facebook.com / ubisoft-avatars.akamaized.net
+#              这两个域名必须由打补丁时重写到本地服务器（见 dist/patcher/patch_dynaddr.py
+#              的 HOST_EXACT）。
+#
+# 响应形状：tr::MatchMaking::parseMatchMakingResult @0x4f94a8 **只认根对象的扁平
+# 成员键**，而且**不做任何 JSON 类型检查**（值一律按 32 位字从 [node+0x28] 读：
+# 字符串就是指针，数字就是整数）：
+#   "player"      -> strcpy(res+0x85)                            对手名，必须非空
+#   "drivetime"   -> *(int*)(res+0xc8)                           幽灵请求里的 time=
+#   "upgrades"    -> LeaderBoardData::parseUpgrades(res+0xb4)     车辆升级位域
+#   "data"        -> LeaderBoardData::parseData(res+0xb4)         外观/数据位域
+#   "score_value" -> *(int*)(res+0xcc)
+#   "replay_id"   -> *(int*)(res+0xe4)
+# 所以 data/upgrades 必须是 JSON **整数**：之前的兜底 `{"data": []}` 会让
+# parseData 把数组节点的指针当位域用。
+_ROBOT_NAMES = (
+    "Robotman", "IronGear", "BrakeLess", "SandStorm", "GhostRider", "TangoPro",
+    "HiVoltage", "RustBucket", "NitroNina", "WheelieKing", "CliffHanger",
+    "TwoStroke", "BackflipBob", "MudSlinger", "AxleRose", "SpokeSlinger",
+)
+
+
+def _robot_opponent(track):
+    """给一条赛道挑一个稳定的假对手 -> (名字, 用时ms, 幽灵记录或 None)。
+
+    名字必须对同一条赛道保持稳定：客户端拿到名字后会立刻用
+    `.../robot_replaydata?...&player=<名字>` 和 `GET /v1/profiles/<名字>` 回查，
+    每次换名字会让对手资料/幽灵文件名对不上号。
+    """
+    rec = acct.ghost_any_for_track(track) if track else None
+    seed = (track or 0) & 0xFFFFFFFF
+    if rec:
+        seed = (seed * 31 + int(rec.get("contentId") or 0)) & 0xFFFFFFFF
+    name = _ROBOT_NAMES[seed % len(_ROBOT_NAMES)]
+    drive = int((rec or {}).get("drive_time") or 0)
+    if drive <= 0:
+        # 这条赛道还没有真幽灵时编一个像样的成绩，避免 time=0
+        # （客户端会用 time 去请求幽灵，0 容易被当异常成绩丢掉）。
+        drive = 45000 + (seed % 60000)
+    return name, drive, rec
+
+
+def h_match_robot(path, query, body, headers):
+    """GET /public/match/v1/robot —— A.N.B.A（Robotman）支线的对手查询。
+
+    见上面 `_ROBOT_NAMES` 处的长注释：这是「检索对手中」卡死链路的**第一环**。
+    空响应会让对手名变成空串，后续头像 URL 退化成 `//...`，`onPictureReceived`
+    拿到 err != 0 直接 return，状态机永远停在「检索对手中」。
+    """
+    q = dict(parse_qsl(query, keep_blank_values=True))
+    raw = (q.get("track_name") or "").strip()
+    if raw.startswith("track"):
+        raw = raw[5:]
+    try:
+        track = int(raw)
+    except Exception:
+        track = None
+    if track is None:
+        try:
+            track = int(q.get("track_id") or "")
+        except Exception:
+            track = None
+
+    name, drive, rec = _robot_opponent(track)
+    print("[robot] %s 赛道 %s range=%s offset=%s -> 对手 %s (%d ms%s)"
+          % (path, track, q.get("range"), q.get("offset"), name, drive,
+             ", 幽灵 contentId=%s" % rec.get("contentId") if rec else ", 无幽灵"),
+          flush=True)
+    return 200, {"Content-Type": "application/json"}, {
+        # ★ player 必须非空：它决定对手名、robot_ghost-<hash(name)>-<track>.robot
+        #   的文件名，以及头像 URL 里的路径段。
+        "player": name,
+        "drivetime": drive,
+        # upgrades/data 是 LeaderBoardData 的位域整数，0 = 默认车。
+        "upgrades": 0,
+        "data": 0,
+        # score_value 用 1：parseJsonResponse 在调用 parseMatchMakingResult 之前
+        # 就把 res+0xcc 预置成 1，说明这是客户端认的「有效」值。
+        "score_value": 1,
+        "replay_id": 0,
+    }
+
+
 def h_ghost_upload(path, query, body, headers):
     """PUT .../payload 之外落单的二进制上传（老路径），落盘到 inbox 备用。"""
     q = dict(parse_qsl(query, keep_blank_values=True))
@@ -1063,6 +1182,9 @@ DYNAMIC = [
     #   /public/playerstats/v1/stats/{...}?players=
     ("GET", "/public/playerstats/v1/ranking/", h_playerstats_ranking),
     ("GET", "/public/playerstats/v1/stats/", h_playerstats_stats),
+    # A.N.B.A（Robotman）支线的对手查询。前缀匹配顺带兜住 robot_v2
+    # （"%s/%s/match/v1/robot_v2?track_name=%s&score=%lu&range=%d" @0xb86362）。
+    ("GET", "/public/match/v1/robot", h_match_robot),
 ]
 
 
@@ -1070,8 +1192,12 @@ def pick_dynamic(method, path):
     # 图片与好友头像：<base>/<pid>/picture?width=..&height=..（见 .rodata @0xb887cc）
     if method == "GET" and (path.lower().endswith(_IMAGE_EXT) or path.endswith("/picture")):
         return h_placeholder_image, "dyn:placeholder-image"
+    # 结尾斜杠容错：真机确实会发 `GET /v1/profiles/`（OnlineRobotMissionProfileQuery
+    # 查对手资料那条链），而 rules.json 里的静态桩只认 `/v1/profiles/` 之外的形式，
+    # 不归一化就会回匿名档 11111111-1111-1111-1111-111111111111。
+    stripped = path.rstrip("/") or path
     for m, p, fn in DYNAMIC_EXACT:
-        if m == method and path == p:
+        if m == method and (path == p or (path != stripped and stripped == p)):
             return fn, "dyn:%s %s" % (m, p)
     if method == "POST" and path.startswith("/public/resultservice/v1/enhancestats/"):
         return h_result_stats, "dyn:result-stats"
