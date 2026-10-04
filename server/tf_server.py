@@ -987,15 +987,82 @@ def _pvp_season():
     }
 
 
-def _pvp_match_info():
+# --- 匹配（new_ranked → matches）-------------------------------------------
+# `PVPManager::startNewRankedMatch(bool)` @0x5e1880 的调用顺序是
+#   OnlinePVP::startRankedMatch(listener, outfit, …)         cmd 0x28 = new_ranked
+#   → Time::getTimeOfDay()
+#   → OnlinePVP::queryMatches(listener, vector<PVPMatch>*)   cmd 0x2a = matches
+# 也就是说 new_ranked 只负责「下单」，客户端真正拿来当对手的是紧随其后的
+# matches。所以两边都实现：new_ranked 记一次「搜索中」，matches 在搜索有效期内
+# 回一条合成对局。
+_PVP_TRACK = 1041                     # 幽灵库和真机都跑过，直接拿它当对手赛道
+_PVP_ROBOT_ID = "44444444-4444-4444-4444-444444444444"   # = FRIEND_NAMES 的 GhostRider
+_PVP_SEARCH_TTL = 1800                # 秒；超过就当没在搜索
+_pvp_search = {}                      # profileId -> 搜索开始时间（时间戳）
+
+
+def _pvp_match_json(profile_id):
+    """一条合成对局——根对象契约来自 `OnlinePVP::parseMatch` @0x4fd9d0。
+
+    第一遍遍历根成员读 `id` @0xb86c8a / `server_time` @0xb8695c /
+    `total_time` @0xb86979 / `player1` @0xb86984 / `player2` @0xb8698c；
+    第二遍读 `start_time` @0xb8d564 / `rewards` @0xb8d6de / `tracks` @0xb49d2b
+    （子键 `track`/`bike`/`owner_change_time`）。
+    玩家子对象只发 `profile_id` @0xb86951 —— 收尾时 `strcpy(match+0x131, …)`
+    拷的就是「对手」那个槽的 profile_id，`rank`/`chips` 那些一旦类型发错就会
+    被当位域用，所以宁可不发。
+    ⚠ `PVPMatch+0x00` 就是 match id，`parseMatches` 用它查重，所以 id 要稳定。
+    """
+    now = int(time.time())
+    return {
+        "id": 1,
+        "server_time": now,
+        "total_time": 0,
+        "player1": {"profile_id": profile_id or _PVP_ROBOT_ID},
+        "player2": {"profile_id": _PVP_ROBOT_ID},
+        "start_time": now,
+        "tracks": [{"track": _PVP_TRACK, "bike": 0, "owner_change_time": 0}],
+    }
+
+
+def _pvp_match_info(profile_id=None):
     """`parseMatches` @0x4fcad0 的响应契约。
 
     根对象两个键（已反汇编确认）：`waiting_requests` @0xb8695c（int）、
     `matches` @0xb86562（**JSON 数组**，每个元素交给 `parseMatch` @0x4fd9d0，
     元素结构体 `PVPMatch` 大小 0x1d8）。
-    没有真实对局时回空数组即可——`parseMatches` 对空数组走的是纯清理分支。
+    没有对局时回**空数组**——`parseMatches` 对空数组走的是纯清理分支。
+    搜索有效期内给一条合成对局：`PVPManager::validateMatches()` @0x5e3e20 会把
+    每条对局的 `+0x1ac` 置 1（`parseMatch` 恒置 0），置 1 之后
+    `isAllMatchesValid()` 才认它对局有效。
     """
+    now = int(time.time())
+    for pid in [p for p, ts in _pvp_search.items() if now - ts > _PVP_SEARCH_TTL]:
+        _pvp_search.pop(pid, None)
+    if profile_id and profile_id in _pvp_search:
+        return {"matches": [_pvp_match_json(profile_id)], "waiting_requests": 0}
     return {"matches": [], "waiting_requests": 0}
+
+
+def h_pvp_new_ranked(path, query, body, headers):
+    """GET /public/pvp_matches/v1/new_ranked?outfit=&ticket=&param= —— 下单（cmd 0x28）。
+
+    响应契约来自 `OnlinePVP::parseRankedOpponent` @0x4fd8fc：根对象成员键只有
+    `self` @0xb8694c 和 `opponent` @0xb871fe，两个成员**自己就是 player_info
+    对象**（`parseRankingData(x1=成员节点, x2=…+0x18)` 直接吃它；内层那个
+    `profile_id` 比较没有分支，是编译器产物）。
+    ⚠ cmd 0x28 解析完 `b 0x4fc864` **不回调 listener**，所以「匹配到人」这件事
+    必须在随后的 matches 里体现——这里只记一次搜索状态。
+    """
+    pid = _ghost_caller(headers)
+    print("[pvp] new_ranked pid=%s q=%s" % (pid, query), flush=True)
+    if pid:
+        _pvp_search[pid] = int(time.time())
+    info = _pvp_player_info()
+    return 200, {"Content-Type": "application/json"}, {
+        "self": dict(info),
+        "opponent": dict(info),
+    }
 
 
 def h_pvp_init(path, query, body, headers):
@@ -1008,14 +1075,16 @@ def h_pvp_init(path, query, body, headers):
     print("[pvp] pvp_init <- %s" % (b,), flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "player_info": _pvp_player_info(),
-        "match_info": _pvp_match_info(),
+        "match_info": _pvp_match_info(_ghost_caller(headers)),
         "pvp_config": _pvp_season(),
     }
 
 
 def h_pvp_matches(path, query, body, headers):
     """GET /public/pvp_matches/v1/matches —— 对局列表（cmd 0x2a）。"""
-    return 200, {"Content-Type": "application/json"}, _pvp_match_info()
+    pid = _ghost_caller(headers)
+    print("[pvp] matches pid=%s" % (pid,), flush=True)
+    return 200, {"Content-Type": "application/json"}, _pvp_match_info(pid)
 
 
 def h_pvp_player(path, query, body, headers):
@@ -1587,6 +1656,8 @@ DYNAMIC = [
     ("POST", "/public/pvp_matches/v1/pvp_init", h_pvp_init),
     ("POST", "/public/pvp_matches/v1/tracks", h_pvp_accept),
     ("GET", "/public/pvp_matches/v1/matches", h_pvp_matches),
+    # 匹配下单（cmd 0x28）——见 h_pvp_new_ranked 上方注释：真正出对手的是 matches。
+    ("GET", "/public/pvp_matches/v1/new_ranked", h_pvp_new_ranked),
     # ⚠ 顺序有讲究：`players?profiles=` 的 path 是 /…/players，
     # 它是 /…/player/ 的前缀，必须排在前面，否则会被 h_pvp_player 抢走。
     ("GET", "/public/pvp_matches/v1/players", h_pvp_accept),
