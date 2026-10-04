@@ -691,7 +691,7 @@ def _aggregate_global_entries():
     return [dict(row, rank=rank) for rank, row in enumerate(rows, 1)]
 
 
-def _stored_entries(board, requested_players=None):
+def _stored_entries(board, requested_players=None, keep_total=False):
     if board in GLOBAL_LEADERBOARDS:
         rows = _aggregate_global_entries()
     else:
@@ -699,10 +699,12 @@ def _stored_entries(board, requested_players=None):
             rows = list((_load_leaderboards().get(board) or {}).values())
         rows.sort(key=lambda r: (int(r.get("drivetime", 0)), str(r.get("player", ""))))
         rows = [dict(row, rank=rank) for rank, row in enumerate(rows, 1)]
+    total = len(rows)
     wanted = set(requested_players or [])
     if wanted:
+        # 注意：过滤掉的只是**要展示给客户端的行**，rank 保持在全榜中的真实名次。
         rows = [r for r in rows if r.get("player") in wanted]
-    return rows
+    return (rows, total) if keep_total else rows
 
 
 def _rank_entry(row):
@@ -719,9 +721,11 @@ def h_playerstats_ranking(path, query, body, headers):
     board = path.rstrip("/").rsplit("/", 1)[-1] or "unknown"
     q = dict(parse_qsl(query, keep_blank_values=True))
     players = [x for x in (q.get("players") or "").split(",") if x]
-    rows = _stored_entries(board, players)
+    rows, total = _stored_entries(board, players, keep_total=True)
+    # ★ playerCount 必须是**全榜人数**，不是过滤后给这个客户端看的行数：
+    #   客户端拿它算「你超过了前 X%」，回过滤后的 1 会让百分位永远显示 100%。
     return 200, {"Content-Type": "application/json"}, {
-        "leaderboard": board, "playerCount": len(rows), "httpCode": 200,
+        "leaderboard": board, "playerCount": total, "httpCode": 200,
         "results": [_rank_entry(r) for r in rows],
     }
 
@@ -746,6 +750,14 @@ DYNAMIC_EXACT = [
     ("GET", "/public/playerprogress/v1/progress/status", h_progress_status),
     ("POST", "/public/playerprogress/v1/swap", h_progress_swap),
     ("GET", "/v2/profiles/me", h_profile_me),
+    # ★ 会话端点必须注册为动态处理，否则会落到 rules.json 里那条写死的匿名桩：
+    #   返回固定 profileId 11111111-… 且**没有 rememberMeTicket**，
+    #   症状就是「每次重启都要重新登录」「登录了也没有分数记录和在线服务」。
+    #   v1 = 用户名密码登录（真校验），v3 = 设备静默登录；GET 是会话续期。
+    ("POST", "/v1/profiles/sessions", h_session),
+    ("POST", "/v2/profiles/sessions", h_session),
+    ("POST", "/v3/profiles/sessions", h_session),
+    ("GET", "/v1/profiles/sessions", h_session),
     ("GET", "/v1/profiles", h_profiles_query),
     ("GET", "/public/receiptvalidation/v1/product/configuration", h_iap_products),
     ("GET", "/public/receiptvalidation/v1/verify_android", h_iap_verify),
