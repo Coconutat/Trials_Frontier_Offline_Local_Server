@@ -21,28 +21,125 @@
     "title_text": "Trials Frontier",
     "banner_path": "/pvp_banner/season.png",
     "duration_days": 30,
-    "star_array": [20, 16, 16, 14, 14, 12, 12, 10, 10, 9, 9, 8, 8, 7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2],
+    "star_array": [
+      20,
+      16,
+      16,
+      14,
+      14,
+      12,
+      12,
+      10,
+      10,
+      9,
+      9,
+      8,
+      8,
+      7,
+      7,
+      6,
+      6,
+      5,
+      5,
+      4,
+      4,
+      3,
+      3,
+      2,
+      2
+    ],
     "product_list": [
-      {"product_id": "chip_shop.goldentickets", "amount": 3}
+      {
+        "product_id": "chip_shop.goldentickets",
+        "amount": 3
+      }
     ],
     "rewards": [
-      {"rank": 1, "item_id": 1, "amount": 500},
-      {"rank": 1, "item_id": 2, "amount": 5},
-      {"rank": 1, "item_id": 459, "amount": 1},
-      {"rank": 2, "item_id": 1, "amount": 400},
-      {"rank": 2, "item_id": 2, "amount": 4},
-      {"rank": 3, "item_id": 1, "amount": 300},
-      {"rank": 3, "item_id": 2, "amount": 3},
-      {"rank": 5, "item_id": 1, "amount": 250},
-      {"rank": 5, "item_id": 49, "amount": 2},
-      {"rank": 10, "item_id": 1, "amount": 200},
-      {"rank": 10, "item_id": 44, "amount": 2},
-      {"rank": 15, "item_id": 1, "amount": 150},
-      {"rank": 15, "item_id": 39, "amount": 2},
-      {"rank": 20, "item_id": 1, "amount": 100},
-      {"rank": 20, "item_id": 34, "amount": 2},
-      {"rank": 25, "item_id": 1, "amount": 50},
-      {"rank": 25, "item_id": 29, "amount": 2}
+      {
+        "rank": 1,
+        "item_id": 1,
+        "amount": 500
+      },
+      {
+        "rank": 1,
+        "item_id": 2,
+        "amount": 5
+      },
+      {
+        "rank": 1,
+        "item_id": 459,
+        "amount": 1
+      },
+      {
+        "rank": 2,
+        "item_id": 1,
+        "amount": 400
+      },
+      {
+        "rank": 2,
+        "item_id": 2,
+        "amount": 4
+      },
+      {
+        "rank": 3,
+        "item_id": 1,
+        "amount": 300
+      },
+      {
+        "rank": 3,
+        "item_id": 2,
+        "amount": 3
+      },
+      {
+        "rank": 5,
+        "item_id": 1,
+        "amount": 250
+      },
+      {
+        "rank": 5,
+        "item_id": 49,
+        "amount": 2
+      },
+      {
+        "rank": 10,
+        "item_id": 1,
+        "amount": 200
+      },
+      {
+        "rank": 10,
+        "item_id": 44,
+        "amount": 2
+      },
+      {
+        "rank": 15,
+        "item_id": 1,
+        "amount": 150
+      },
+      {
+        "rank": 15,
+        "item_id": 39,
+        "amount": 2
+      },
+      {
+        "rank": 20,
+        "item_id": 1,
+        "amount": 100
+      },
+      {
+        "rank": 20,
+        "item_id": 34,
+        "amount": 2
+      },
+      {
+        "rank": 25,
+        "item_id": 1,
+        "amount": 50
+      },
+      {
+        "rank": 25,
+        "item_id": 29,
+        "amount": 2
+      }
     ]
   },
   "weekly": {
@@ -53,8 +150,16 @@
   },
   "rewards": {
     "_note": "赛后奖励，对应比赛 JSON 的 rewards 数组 = [金币, 钻石, 特殊奖励等级]。客户端 parseMatch 把它变成 PVPMatch+0x170 的 {(1,金币),(2,钻石),(145,特殊奖励等级)}，赛后界面直接显示。不发这个键 → 打完一局金币/钻石留空、特殊奖励空。",
-    "default": [150, 1, 0],
-    "win": [300, 2, 0]
+    "default": [
+      150,
+      1,
+      0
+    ],
+    "win": [
+      300,
+      2,
+      0
+    ]
   },
   "chips": {
     "_note": "筹码。客户端自己的产币公式（chip_equation_x/y）已被服务器发 0 关掉，产币完全由服务端记账：每条已解锁赛道 per_track_seconds 秒产 1 枚。max=0 表示不限（筹码商店最贵的赛道 63000）。",

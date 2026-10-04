@@ -160,6 +160,12 @@ _TF_CONFIG_DEFAULTS = {
         "default": [150, 1, 0],
         # 对局已结束（客户端 POST 过 /pvp_matches/v1/race）时改用它；留空则一直用 default。
         "win": [300, 2, 0],
+        # ★ `/race`（cmd 0x2d）响应的 `ownership_changed`，必须是**字符串** "True"/"False"。
+        #   客户端 `PVPManager::onRankedResultSubmitted` @0x5e5b90 会算
+        #   `PVPMatch+0x1b4 = (~ownership_changed) & 1`，而 `+0x1b4 == 0` 才是
+        #   「允许弹转盘」；发 False → 1 → `MenuzStatePVPMatch::onTimerFinished`
+        #   的 case 2 直接跳过，转盘永远不出现。
+        "ownership_changed": True,
     },
     "weekly": {
         "track_id": 1041,
@@ -893,6 +899,18 @@ def h_ghost(path, query, body, headers):
     track = q.get("track_id") or (seg if seg.isdigit() else "")
     tracking = int(track) if str(track).isdigit() else None
 
+    # ★ 客户端会在赛道 ID 上叠高位标志位，幽灵库里存的却是裸 ID：
+    #     | 0x800000 (8388608)  PVP 对手幽灵 —— OnlinePVP::parseJsonResponse cmd 0x2c
+    #                          分支 `orr w2,w8,#0x800000` → getPVPGhost() →
+    #                          resultservice/v1/pvp_replaydata?track_id=8389649&player=…&pvp_id=…
+    #     | 0x10000  (65536)    排行榜（周赛）变体，如 track66633 = 65536 + 1097
+    #     | 0x100000 (1048576)  排行榜（另一套）变体，如 track1049609 = 1048576 + 1033
+    #   不掩掉就永远精确匹配不上（ghost_search 用的是 `rec["track_id"] != track_id`），
+    #   于是 PVP 局里下不到对手幽灵、排行榜也拿不到幽灵。
+    #   赛道真实 ID 目前最大 1438，掩到 0xFFFF 足够安全。
+    if tracking:
+        tracking &= 0xFFFF
+
     if "/replaydata" in path and not seg.isdigit() and q.get("track_id"):
         return 200, {"Content-Type": "application/json"}, {"data": []}
 
@@ -1412,6 +1430,7 @@ _pvp_id_lock = threading.Lock()
 _pvp_next_id = [1]                    # 用列表包一层，方便就地自增
 _pvp_tickets = {}                     # profileId -> {"tickets": n, "ts": 回票基准时刻(0=已满)}
 _pvp_chips = {}                       # profileId -> {"chips": n, "ts": 上次结算时刻, "acc": 余数, "tracks": [赛道 id]}
+_pvp_reward_data = {}                 # profileId -> 客户端最近一次 increase_rewards 上报的 reward_data
 
 
 # --- 局内票（免费票）--------------------------------------------------------
@@ -1632,6 +1651,48 @@ def _pvp_rewards(values):
     return out
 
 
+def _pvp_score_int(time_ms, faults=0):
+    """把「用时 + 失误数」打包成客户端要的 int score。
+
+    编码来自 `ScoreCalculator::calculateOnlineScoreInt(int,int,int)` @0x5f5edc：
+        score = (99 - faults) * 3600000 + (3600000 - time_ms)
+    反向（`getTimeFromIntScore` @0x5f5f2c / `getFaultsFromIntScore` @0x5f5f50）：
+        time_ms = 3600000 - (score % 3600000)
+        faults  = 99 - score / 3600000
+    实测真机跑一局的 `score`=359974879 → 99*3600000 起，即 0 失误、25121 ms ✓。
+    """
+    t = max(1, min(3600000, int(time_ms or 0) or 1))
+    f = max(0, min(99, int(faults or 0)))
+    return (99 - f) * 3600000 + (3600000 - t)
+
+
+def _pvp_track_result(time_ms, faults=0, bike_data=None, additional_score=0,
+                      outfit=0, opp_attempts=0):
+    """`tracks[i].result_pN` 子对象的契约（`parseMatch` @0x4fd9d0 内层循环）。
+
+    键都靠 `json_strcmp` 比：`score`@0xb88169 → 存进按 result_p1/p2 分槽的数组，
+    收尾时 `getTimeFromIntScore`/`getFaultsFromIntScore` 解出时间与失误数，写进
+    `PVPTrack+0x08`（对手用时）与 `PVPTrack+0x0C`（自己用时）；`bike_data`@0xb869e0
+    → `PVPTrack+0x2C`（**按字节读** `ldrb`）；`additional_score`@0xb869ea、
+    `outfit`@0xb8afa0、`opp_attempts`@0xb869fb 各有各的槽。
+
+    ★ 这两个对象是**对手幽灵能不能下下来的唯一开关**：
+      `OnlinePVP::startRace` @0x4fa22c 在 `/start_race` 之前先算
+          req+0x62 = (*(u32*)(match + trackIndex*0x34 + 0x10) != 0)   // = PVPTrack+0x0C
+      然后 cmd 0x2c 分支 @0x4fc358：`cbz` 就整段跳过，
+      `OnlineGhostManager::getPVPGhost()` 根本不会被调用。
+      不发 result_pN → +0x08/+0x0C 都是 0 → 比赛里没有对手幽灵（m05071 的根因）。
+    """
+    out = {"score": _pvp_score_int(time_ms, faults), "additional_score": int(additional_score or 0)}
+    if bike_data is not None:
+        out["bike_data"] = int(bike_data) & 0xFF
+    if outfit:
+        out["outfit"] = int(outfit) & 0xFFFFFF
+    if opp_attempts:
+        out["opp_attempts"] = int(opp_attempts)
+    return out
+
+
 def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     """一条合成对局——根对象契约来自 `OnlinePVP::parseMatch` @0x4fd9d0。
 
@@ -1656,6 +1717,20 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     bike = cfg_int("matchmaking", "bike_id", default=1)
     if not isinstance(bike, int) or bike < 1:
         bike = 1
+    ttrack = track or _pvp_track()
+    # 对手幽灵的用时：库里那条幽灵（也就是随后会经 pvp_replaydata 下发的那条）的真实
+    # drive_time，让「对手用时」和真的播出来的幽灵对得上。没有就退到 30 s。
+    try:
+        _grec = acct.ghost_any_for_track(ttrack)
+    except Exception:
+        _grec = None
+    opp_ms = int((_grec or {}).get("drive_time") or 0)
+    if opp_ms < 1000 or opp_ms > 3600000:
+        opp_ms = 30000
+    # 我比对手慢一点 → 赛道归对手所有（owner=1，挑战对手记录），而不是我一上来就守着。
+    my_ms = min(3600000, int(opp_ms * 1.06) + 500)
+    if my_ms <= opp_ms:
+        my_ms = min(3600000, opp_ms + 500)
     tickets, ticket_ts = _pvp_tickets_for(profile_id)
     info = _pvp_player_info()
     # 赛后奖励：对局跑完（客户端 POST 过 /pvp_matches/v1/race）就用 win 那一档。
@@ -1666,7 +1741,7 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     # 两个槽用同一套票数/筹码/段位：parseMatch 收尾把「最后处理的那个槽」当自己、
     # 另一个当对手（见 server/tf_server.py 上方注释），两边都给才不会踩空。
     # ★ tickets / ticket_increased 必须发：不发 → PVPMatch+0xa8 = 0 → 扣黄金票。
-    def _slot(pid):
+    def _slot(pid, me=False):
         return {
             "profile_id": pid,
             "tickets": tickets,
@@ -1675,19 +1750,40 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
             "rank": info["rank"],
             "elo_rank": info["elo_rank"],
             "outfit": 0,
-            "reward_data": 0,
+            # ★ reward_data → parseMatch 的 `str w8,[x21,#0x1b8]` @0x4fe354，只写本机那个槽。
+            #   它是「本局特殊奖励（PVPTrack 里那一对 {145,level}）要不要真的发下去」的闸门：
+            #   onMatchEndSent @0x5e7b98 要求 `PVPMatch+0x1b8 >= 1` 才调
+            #   ItemManager::giveSpecialReward。发 0 等于把客户端自己攒的进度清零，
+            #   所以这里回显客户端经 increase_rewards 上报的 reward_data，缺省 1。
+            #   对手槽留 0，免得万一 parseMatch 是「后写的赢」而把对手的值盖到本机。
+            "reward_data": (int(_pvp_reward_data.get(pid) or 1) if me else 0),
         }
     return {
         "id": match_id,
         "server_time": now,
         "total_time": dur,
-        "player1": _slot(profile_id or _pvp_bot_id()),
+        # ★ 本机必须正好出现在一个槽里：parseMatch 只用 `strcmp(本地名, player2.profile_id)`
+        #   决定本地是 p1 还是 p2（不相等 → 本地 = player1），错了就会读错 chips /
+        #   tickets / reward_data / 对手 profile_id（strcpy 到 match+0x131 的那个）。
+        "player1": _slot(profile_id or _pvp_bot_id(), me=True),
         "player2": _slot(opponent_id or _pvp_bot_id()),
         "start_time": now,
         # ★ `owner_change_time` 就是车种 ID：onStartRaceSent @0x5e59ec 读 PVPMatch+0x24
         #   （= 第 0 条轨道的 +0x20，即 setOwner 的第二个参数）写进 GameWorld+0x1efc；
         #   填 0 → UpgradeManager::getBike(0) 为 NULL → 加载关卡时崩。
-        "tracks": [{"track": track or _pvp_track(), "bike": bike, "owner_change_time": bike}],
+        # ★★ result_p1/result_p2 **必须发**：parseMatch 从 `score` 解出双方用时写进
+        #   PVPTrack+0x08/+0x0C，而 startRace @0x4fa22c 只按
+        #   `PVPTrack+0x0C != 0`（对手在这条赛道上有成绩）决定要不要下对手幽灵：
+        #   不发 → /start_race 回来后 cmd 0x2c 分支直接 cbz 跳过，
+        #   getPVPGhost() 从不调用 → 比赛里没有幽灵（m05071 根因）。
+        #   顺带 owner 也由这两个 score 的比较算出来（score 越大越快）。
+        "tracks": [{
+            "track": ttrack,
+            "bike": bike,
+            "owner_change_time": bike,
+            "result_p1": _pvp_track_result(my_ms, 0, bike_data=bike),
+            "result_p2": _pvp_track_result(opp_ms, 0, bike_data=bike),
+        }],
         # ★ 赛后奖励 = [金币, 钻石, 特殊奖励等级]；parseMatch 拼成
         #   {(1,coins),(2,gems),(145,special)} 塞进 PVPMatch+0x170，
         #   赛后界面 setupComponents @0x7308f0 直接把它搬过去显示。
@@ -1925,12 +2021,24 @@ def h_pvp_close_season(path, query, body, headers):
 def h_pvp_race(path, query, body, headers):
     """POST /public/pvp_matches/v1/race —— 客户端交成绩（cmd 0x2d）。
 
-    响应体在 `OnlinePVP::parseJsonResponse` 的 0x2d 分支 @0x4fc3a0 里**一个字节都
-    不解析**（它只置 `[x19+0x60]=1` 然后去拉 PVP 幽灵），所以回什么无所谓。
+    ★ 响应体**必须**是 `{"ownership_changed":"True","race_id":<int>}`，不能是
+      `{"data": []}` —— 这是「打完一局不弹转盘」的根因。依据
+      `OnlinePVP::parseJsonResponse` 的 0x2d 分支 @0x4fc3a0 → `parseRace`：
 
-    真正要做的事是**记下这局已经跑完**：客户端紧接着就会 `GET matches/<id>` 回到
-    赛后界面（`MenuzStatePVPPostMatch`），那时 `_pvp_match_json` 才会把
-    `rewards` 换成「赢」那一档 —— 这就是「打完一局没奖励」的修复点。
+        "ownership_changed" @0xb86c73 : `json_strcmp(val, "True")` @0x4fc450
+                                        → `strb w8,[req+0x63]`
+          ★ 值必须**是 JSON 字符串** "True"；发布尔 true 会被当指针比较而恒为 0。
+        "race_id"          @0xb86c85 : `[req+0x30]`（缺省 −1）
+        json_parse 失败 → 监听器**根本不回调**，客户端永远卡在等待态。
+
+      解析成功后 `PVPManager::onRankedResultSubmitted` @0x5e5b90 会：
+        `PVPMatch+0x1b4 = (~ownership_changed) & 1`   ← 0 才允许弹转盘（!=0 跳过）
+        `PVPMatch+0x1bc = track`
+        `PVPMatch+0x1c0 = race_id`（唯一 writer，之后作为 w5 回传给 increase_rewards）
+
+    另一件要做的事：**记下这局已经跑完**。客户端紧接着就会 `GET matches/<id>` 回到
+    赛后界面（`MenuzStatePVPPostMatch`），那时 `_pvp_match_json` 才会把 `rewards`
+    换成「赢」那一档 —— 这是「打完一局没奖励」的修复点。
 
     真机 body 样例：
       {"match_id": 1,"track": "1041","timestamp": 1791121562,"score": 359974879,
@@ -1952,8 +2060,13 @@ def h_pvp_race(path, query, body, headers):
             "bike_data": data.get("bike_data"),
             "timestamp": data.get("timestamp"),
         }
+    # ownership_changed=1 → 客户端认为赛道易主 → 允许弹转盘 + 发特殊奖励。
+    _own = cfg("rewards", "ownership_changed", default=True)
     print("[pvp] race match=%s <- %s" % (mid, data), flush=True)
-    return 200, {"Content-Type": "application/json"}, {"data": []}
+    return 200, {"Content-Type": "application/json"}, {
+        "ownership_changed": "True" if _own else "False",
+        "race_id": (mid if mid is not None else 0),
+    }
 
 
 def h_pvp_accept(path, query, body, headers):
@@ -1962,7 +2075,22 @@ def h_pvp_accept(path, query, body, headers):
     `tracks`（cmd 0x2e）在跳转表里直接指向函数出口 0x4fc864，一个字节都不解析；
     `race`（0x2d）走 `h_pvp_race`；`increase_rewards`（0x33）@0x4fc574 只回调
     清 `PVPMatch+0x1c8`、`chips`（0x34）走 `h_pvp_chips`。
+
+    ★ `increase_rewards` 的 body 客户端**不解析**，但 body 本身含金量很高：它是
+      `PVPManager::checkMatchSpecialReward` @0x5e3f5c 发现「本局特殊奖励变了」时
+      主动上报的下一份特殊奖励，形如
+        {"race_id":0,"match_id":1,"coin":0,"gem":0,"special":0,
+         "reward_data":20008,"checksum":"…","timestamp":…}
+      这里把它记下来，下次 `_pvp_match_json` 会回显到本机槽的 `reward_data`
+      （见那条 `PVPMatch+0x1b8` 注释），免得服务器把客户端自己的进度写回 0。
     """
+    b = _json_body(body) or {}
+    if isinstance(b, dict) and path.rstrip("/").endswith("increase_rewards"):
+        pid = _ghost_caller(headers)
+        rd = b.get("reward_data")
+        if isinstance(rd, int):
+            _pvp_reward_data[pid] = rd
+            print("[pvp] reward_data pid=%s -> %d" % (pid, rd), flush=True)
     print("[pvp] %s <- %s -> data:[]" % (path, _json_body(body)), flush=True)
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
