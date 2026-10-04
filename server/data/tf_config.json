@@ -29,6 +29,11 @@
     "window_hours": 24,
     "task": []
   },
+  "rewards": {
+    "_note": "赛后奖励，对应比赛 JSON 的 rewards 数组 = [金币, 钻石, 特殊奖励等级]。客户端 parseMatch 把它变成 PVPMatch+0x170 的 {(1,金币),(2,钻石),(145,特殊奖励等级)}，赛后界面直接显示。不发这个键 → 打完一局金币/钻石留空、特殊奖励空。",
+    "default": [150, 1, 0],
+    "win": [300, 2, 0]
+  },
   "chips": {
     "_note": "筹码。客户端自己的产币公式（chip_equation_x/y）已被服务器发 0 关掉，产币完全由服务端记账：每条已解锁赛道 per_track_seconds 秒产 1 枚。",
     "start": 0,

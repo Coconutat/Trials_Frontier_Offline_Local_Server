@@ -102,6 +102,22 @@ _TF_CONFIG_DEFAULTS = {
         # 上限（0 = 不限）。
         "max": 200,
     },
+    # 赛后奖励。比赛 JSON 的 `rewards` 是**数组**，parseMatch @0x4fd9d0 只读前 3 个整数
+    # （`cmp w9,#2; b.gt`，见 0x4fdd78），然后拼成 PVPMatch+0x170 上的
+    # `std::vector<mz::Pair<int,int>> = {(1,r0), (2,r1), (145,r2)}`（0x4fe1d4 起）。
+    #   MenuzStatePVPPostMatch::setupComponents @0x7308f0 把这个 vector 整个搬到
+    #   赛后界面对象 +0x340，setupRewards @0x73129c 再按 pair.first 分发：
+    #     first == 1     → 金币（PVPReward::getCoins @0x5de03c → Item::getItemAmountString(1, n, 0)）
+    #     first == 2     → 钻石（PVPReward::getGems  @0x5de078 → getItemAmountString(2, n, 0)）
+    #     first == 0x91  → 特殊奖励等级（getSpecialLevel @0x5de2a0 → getSpecialRewardById）
+    # ★ 不发这个键 → 那个 vector 是空的 → 赛后界面金币/钻石文本留空、特殊奖励走
+    #   setAsEmpty，也就是用户报的「我打完一局比赛我的奖励呢」。
+    "rewards": {
+        # [金币, 钻石, 特殊奖励等级]
+        "default": [150, 1, 0],
+        # 对局已结束（客户端 POST 过 /pvp_matches/v1/race）时改用它；留空则一直用 default。
+        "win": [300, 2, 0],
+    },
     "weekly": {
         "track_id": 1041,
         "left_retry_times": 3,
@@ -1482,6 +1498,24 @@ def _pvp_view(pid, mid):
     return _pvp_match_json(pid, mid, opp or _pvp_bot_id(), m.get("track"))
 
 
+def _pvp_rewards(values):
+    """把配置里的 `[金币, 钻石, 特殊奖励等级]` 规范化成 3 个整数。
+
+    `OnlinePVP::parseMatch` @0x4fdd78 最多读 3 个元素且**不做类型检查**：
+    `w10 = [node+0x28]` 直接当 int 用，所以给字符串/float 会把指针当数字。
+    少给的补 0（parseMatch 会 `str wzr,[sp,#0xc0]` 预清零，等价）。
+    """
+    out = []
+    for v in list(values or [])[:3]:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            out.append(0)
+    while len(out) < 3:
+        out.append(0)
+    return out
+
+
 def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     """一条合成对局——根对象契约来自 `OnlinePVP::parseMatch` @0x4fd9d0。
 
@@ -1508,6 +1542,11 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
         bike = 1
     tickets, ticket_ts = _pvp_tickets_for(profile_id)
     info = _pvp_player_info()
+    # 赛后奖励：对局跑完（客户端 POST 过 /pvp_matches/v1/race）就用 win 那一档。
+    _m = _pvp_matches.get(match_id) or {}
+    _rw = cfg("rewards", "win", default=[]) if _m.get("finished") else []
+    if not _rw:
+        _rw = cfg("rewards", "default", default=[100, 0, 0])
     # 两个槽用同一套票数/筹码/段位：parseMatch 收尾把「最后处理的那个槽」当自己、
     # 另一个当对手（见 server/tf_server.py 上方注释），两边都给才不会踩空。
     # ★ tickets / ticket_increased 必须发：不发 → PVPMatch+0xa8 = 0 → 扣黄金票。
@@ -1533,6 +1572,11 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
         #   （= 第 0 条轨道的 +0x20，即 setOwner 的第二个参数）写进 GameWorld+0x1efc；
         #   填 0 → UpgradeManager::getBike(0) 为 NULL → 加载关卡时崩。
         "tracks": [{"track": track or _pvp_track(), "bike": bike, "owner_change_time": bike}],
+        # ★ 赛后奖励 = [金币, 钻石, 特殊奖励等级]；parseMatch 拼成
+        #   {(1,coins),(2,gems),(145,special)} 塞进 PVPMatch+0x170，
+        #   赛后界面 setupComponents @0x7308f0 直接把它搬过去显示。
+        #   不发 → 打完一局金币/钻石留空、特殊奖励 setAsEmpty。
+        "rewards": _pvp_rewards(_rw),
     }
 
 
@@ -1762,12 +1806,46 @@ def h_pvp_close_season(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"rank": 0, "star": 0}
 
 
+def h_pvp_race(path, query, body, headers):
+    """POST /public/pvp_matches/v1/race —— 客户端交成绩（cmd 0x2d）。
+
+    响应体在 `OnlinePVP::parseJsonResponse` 的 0x2d 分支 @0x4fc3a0 里**一个字节都
+    不解析**（它只置 `[x19+0x60]=1` 然后去拉 PVP 幽灵），所以回什么无所谓。
+
+    真正要做的事是**记下这局已经跑完**：客户端紧接着就会 `GET matches/<id>` 回到
+    赛后界面（`MenuzStatePVPPostMatch`），那时 `_pvp_match_json` 才会把
+    `rewards` 换成「赢」那一档 —— 这就是「打完一局没奖励」的修复点。
+
+    真机 body 样例：
+      {"match_id": 1,"track": "1041","timestamp": 1791121562,"score": 359974879,
+       "additional_score":0,"outfit": 3092271,"bike_data": 5,"checksum":"F3473A87…"}
+    """
+    data = _json_body(body) or {}
+    mid = data.get("match_id") if isinstance(data, dict) else None
+    try:
+        mid = int(mid)
+    except (TypeError, ValueError):
+        mid = None
+    m = _pvp_matches.get(mid) if mid is not None else None
+    if m is not None:
+        m["finished"] = True
+        m["result"] = {
+            "track": data.get("track"),
+            "score": data.get("score"),
+            "additional_score": data.get("additional_score"),
+            "bike_data": data.get("bike_data"),
+            "timestamp": data.get("timestamp"),
+        }
+    print("[pvp] race match=%s <- %s" % (mid, data), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"data": []}
+
+
 def h_pvp_accept(path, query, body, headers):
     """PVP 里那些「客户端拿到响应也不解析」的 POST 的宽容接收端。
 
     `tracks`（cmd 0x2e）在跳转表里直接指向函数出口 0x4fc864，一个字节都不解析；
-    `race`（0x2d）/`increase_rewards`（0x33）/`chips`（0x34）需要真实对局状态，
-    现在还没有对局系统，先原样接收。
+    `race`（0x2d）走 `h_pvp_race`；`increase_rewards`（0x33）@0x4fc574 只回调
+    清 `PVPMatch+0x1c8`、`chips`（0x34）走 `h_pvp_chips`。
     """
     print("[pvp] %s <- %s -> data:[]" % (path, _json_body(body)), flush=True)
     return 200, {"Content-Type": "application/json"}, {"data": []}
@@ -2339,7 +2417,7 @@ DYNAMIC = [
     # @0x4fc358 一个字节的 JSON 都不解析（只据 `[query+0x62]` 决定要不要
     # 顺带拉一条 PVP 幽灵），所以回个 200 就够。
     ("POST", "/public/pvp_matches/v1/start_race", h_pvp_accept),
-    ("POST", "/public/pvp_matches/v1/race", h_pvp_accept),
+    ("POST", "/public/pvp_matches/v1/race", h_pvp_race),
     ("POST", "/public/pvp_matches/v1/increase_rewards", h_pvp_accept),
     ("POST", "/public/pvp_matches/v1/chips", h_pvp_chips),
 ]
