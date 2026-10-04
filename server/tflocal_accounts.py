@@ -71,6 +71,16 @@ def _store(path, obj):
     os.replace(tmp, path)
 
 
+def _iso(ts):
+    """unix 秒 -> 本地可读时间串；空值返回 None。"""
+    if not ts:
+        return None
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts)))
+    except Exception:
+        return None
+
+
 def _hash_pw(username, password, salt):
     h = hashlib.sha256()
     h.update(salt.encode("utf-8"))
@@ -151,48 +161,133 @@ def _ticket_to_user(headers):
 
 
 # ------------------------------------------------------------------ 账号
-def ensure_account(username, password=None, name_on_platform=None):
-    """校验或注册账号，返回账号 dict。"""
+def register_account(username, password, name_on_platform=None):
+    """注册一个**全新**账号。
+
+    ROADMAP 第 2 条：登录和注册必须分开 —— 登录只查库，绝不隐式建号。
+    返回 (acc, err)，err ∈ {None, "bad-request", "exists"}。
+    """
     username = (username or "").strip()
-    if not username:
-        return None
+    if not username or not password:
+        return None, "bad-request"
+    key = username.lower()
     with _LOCK:
         db = _load(ACCOUNTS, {})
         users = db.setdefault("users", {})
-        key = username.lower()
-        acc = users.get(key)
+        if key in users:
+            print("[acct] 注册被拒：%s 已存在" % username, flush=True)
+            return None, "exists"
+        salt = binascii.hexlify(os.urandom(8)).decode("ascii")
+        pid = _det_id(key)
         now = int(time.time())
-        if acc is None:
-            salt = binascii.hexlify(os.urandom(8)).decode("ascii")
-            pid = _det_id(key)
-            acc = {
-                "username": username,
-                "nameOnPlatform": name_on_platform or username,
-                "profileId": pid,
-                "userId": pid,
-                "spaceId": ANON_SPACE_ID,
-                "salt": salt,
-                "created": now,
-                "logins": 0,
-            }
-            acc["pw"] = _hash_pw(key, password or "", salt)
-            acc["has_password"] = password is not None
-            users[key] = acc
-            print("[acct] 注册新账号 %s (profileId=%s)" % (username, pid), flush=True)
-        else:
-            if password is not None:
-                if acc.get("has_password") and acc["pw"] != _hash_pw(key, password, acc["salt"]):
-                    print("[acct] 账号 %s 密码不匹配" % username, flush=True)
-                    return None
-                if not acc.get("has_password"):
-                    acc["pw"] = _hash_pw(key, password, acc["salt"])
-                    acc["has_password"] = True
-        acc["logins"] = acc.get("logins", 0) + 1
-        acc["last_login"] = now
-        if name_on_platform:
-            acc["nameOnPlatform"] = name_on_platform
+        acc = {
+            "username": username,
+            "nameOnPlatform": name_on_platform or username,
+            "profileId": pid,
+            "userId": pid,
+            "spaceId": ANON_SPACE_ID,
+            "salt": salt,
+            "pw": _hash_pw(key, password, salt),
+            "has_password": True,
+            "created": now,
+            "logins": 0,
+        }
+        users[key] = acc
         _store(ACCOUNTS, db)
-        return dict(acc)
+    print("[acct] 注册新账号 %s (profileId=%s)" % (username, pid), flush=True)
+    return dict(acc), None
+
+
+def login_account(username, password):
+    """只查私服数据库，不建号。
+
+    返回 (acc, err)，err ∈ {None, "bad-request", "not-found", "invalid-credentials"}。
+    """
+    username = (username or "").strip()
+    if not username or not password:
+        return None, "bad-request"
+    key = username.lower()
+    with _LOCK:
+        db = _load(ACCOUNTS, {})
+        users = db.get("users", {})
+        acc = users.get(key)
+        if acc is None:
+            print("[acct] 登录失败：%s 未注册（先在网页上注册）" % username, flush=True)
+            return None, "not-found"
+        if acc.get("has_password") and acc["pw"] != _hash_pw(key, password, acc["salt"]):
+            print("[acct] 登录失败：%s 密码不匹配" % username, flush=True)
+            return None, "invalid-credentials"
+        if not acc.get("has_password"):
+            # 历史遗留账号（早期自动注册且没记口令）：补上这次的口令
+            acc["pw"] = _hash_pw(key, password, acc["salt"])
+            acc["has_password"] = True
+        acc["logins"] = acc.get("logins", 0) + 1
+        acc["last_login"] = int(time.time())
+        _store(ACCOUNTS, db)
+        return dict(acc), None
+
+
+def ensure_account(username, password=None, name_on_platform=None):
+    """兼容旧调用：先按登录查库，查不到**不建号**。仅供内部/测试使用。"""
+    if password is None:
+        return lookup_account(username)
+    acc, err = login_account(username, password)
+    if acc is None and err == "not-found":
+        return None
+    return acc
+
+
+def set_password(username, password):
+    """管理员改口令。返回 (acc, err)。"""
+    username = (username or "").strip()
+    if not username or not password:
+        return None, "bad-request"
+    key = username.lower()
+    with _LOCK:
+        db = _load(ACCOUNTS, {})
+        acc = db.get("users", {}).get(key)
+        if acc is None:
+            return None, "not-found"
+        acc["salt"] = binascii.hexlify(os.urandom(8)).decode("ascii")
+        acc["pw"] = _hash_pw(key, password, acc["salt"])
+        acc["has_password"] = True
+        _store(ACCOUNTS, db)
+        return dict(acc), None
+
+
+def delete_account(username):
+    """删除账号（不动它的存档目录）。返回 (username, err)。"""
+    username = (username or "").strip()
+    if not username:
+        return None, "bad-request"
+    key = username.lower()
+    with _LOCK:
+        db = _load(ACCOUNTS, {})
+        if key not in db.get("users", {}):
+            return None, "not-found"
+        db["users"].pop(key, None)
+        _store(ACCOUNTS, db)
+    print("[acct] 删除账号 %s" % username, flush=True)
+    return username, None
+
+
+def list_accounts_public():
+    """给网页/内省用：去掉口令与盐。"""
+    db = _load(ACCOUNTS, {})
+    out = []
+    for key, acc in sorted(db.get("users", {}).items()):
+        out.append({
+            "username": acc.get("username", key),
+            "nameOnPlatform": acc.get("nameOnPlatform"),
+            "profileId": acc.get("profileId"),
+            "created": acc.get("created"),
+            "created_iso": _iso(acc.get("created")),
+            "last_login": acc.get("last_login"),
+            "last_login_iso": _iso(acc.get("last_login")),
+            "logins": acc.get("logins", 0),
+            "banned": bool(acc.get("banned")),
+        })
+    return out
 
 
 def issue_session(acc):

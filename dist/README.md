@@ -127,7 +127,7 @@ python dist\patcher\tfpatcher.py --apk 你的原版.apk --out 改好.apk
 
 ## 五、到底改了什么
 
-### libTrialsGo.so —— 7 处定点字节补丁（合计 45 字节）
+### libTrialsGo.so —— 17 处定点字节补丁（合计 237 字节）
 
 | 函数 | 改动 | 效果 |
 |---|---|---|
@@ -138,6 +138,14 @@ python dist\patcher\tfpatcher.py --apk 你的原版.apk --out 改好.apk
 | `tr::DLContentManager::isDLReady()` | `mov w0,#1; ret` | 内容包视为就绪，不弹「下载暂停」 |
 | `tr::MenuzStateMain::isUserBlackListed()` | `mov w0,#0; ret` | 不弹「警报！逮到你了，呆子！」 |
 | `tr::AdInterface::initAndroid()` | `cbz` → `b`（直接跳到函数尾提前返回） | 原生侧广告永不初始化 |
+| `tr::StoreManager::onPurchaseFailed(int,mz::IAPItemInfo*)` | 头部改成 `mov x1,x2; mov x2,xzr; b onPurchaseComplete` | **真钱内购失败即当成功**（见 §10） |
+| `tr::StoreManager::onPurchaseCancel(mz::IAPItemInfo*)` | 头部改成 `mov x2,xzr; b onPurchaseComplete` | 同上，覆盖取消路径 |
+| `tr::VIPManager::getPlayerMembership()` ×5 | 把两处 `ldr w8,[x0]` 前移成 `cbz x0` 守卫 | **修掉联网闪退，并让真实会员状态可被读取**（见 §11、§12.2） |
+| `tr::OfferManager::findVIPOffers(...)` + 代码洞 | 那条 `bl IAPManager::getProductInfoEnabled` 改跳进 `0x0096d85c` 的代码洞，洞里 `adrp/add/ret` 返回一个伪造的 `IAPItemInfo` | **离线也让 `isVIPStoreOfferAvailable()` 为真 → 骑士俱乐部档位出现并可购买 → 触发 VIP 下发**（见 §12.2） |
+
+最后两条配合起来才完整：`getPlayerMembership` 的守卫负责「读得到会员状态」，
+`findVIPOffers` 的代码洞负责「离线也能买到会员」。只修前者时，骑士俱乐部两档
+都显示「剩余时间：未知（离线）」且没有购买按钮。
 
 最后一条很关键：全库**唯一**调用 `mz::TapjoyManager::init` / `mz::AdMobRewardedVideoManager::init` /
 `mz::AdMobManager::init` 的地方就是 `AdInterface::initAndroid()`，掐掉这里，
@@ -520,7 +528,189 @@ POST /public/playerprogress/v1/progress
 - 截图 `tmp\m13f.png`。
 
 ### 10.5 交付物
-`TrialsFrontier-offline.apk` 已更新为含上述两条补丁的版本
-（SHA-256 `8077D174C0A47EC2AE4CCF9112AE1317D07C736FDE7BB717CF1C6676D063E93D`，
-26 906 224 字节）。旧的基线版备份在 `tmp\build\tf-m8-release-backup.apk`。
-`tools/patch_native.py` 的 `PATCHES` 已同步，`--dry-run` 自检 10 条全 `[OK]`。
+`TrialsFrontier-offline.apk` 含上述两条补丁，并已随第十一章的闪退修复与第十二章的账号/VIP 更新
+一起升到 **m16**（SHA-256 `EA77B0B420BF790BB626189F74A3BC64BB384607C2A273F36ADBF558FD8EAB53`，
+26 906 224 字节）。历史备份：`tmp\build\tf-m15-release-backup.apk`（只有 VIP 空指针守卫、
+没有骑士俱乐部购买入口的那版）、`tmp\build\tf-m14-release-backup.apk`（会员守卫的旧版）、
+`tmp\build\tf-m13-release-backup.apk`（仅有 IAP 修复）、
+`tmp\build\tf-m8-release-backup.apk`（只修了「下载暂停」的老基线）。
+`tools/patch_native.py` 的 `PATCHES` 已同步到 **17 条**，`--dry-run` 自检全 `[OK]`；
+用它从原版 `libTrialsGo.so` 重新生成的产物与 `tmp\m16\libTrialsGo.so`
+**逐字节一致**（除了另行施加的服务器地址/URL 重写那几段）。
+
+---
+
+## 十一、联网闪退（ROADMAP 第 1 条）—— 已修复并实机验证
+
+### 11.1 症状与用户观察
+> 经过测试，如果联网就会闪退，关闭 wlan 等启动就能进入，再开启网络即可。
+> 可能是连接谷歌服务，我们要劫持这一部分网络，让它来到我们服务器。
+
+### 11.2 根因（tombstone 实证，跟谷歌服务无关）
+闪退是 `tr::VIPManager::getPlayerMembership()` 里的**空指针解引用**：
+
+```
+#00 tr::VIPManager::getPlayerMembership()+120   ← 读 0x0，崩溃点
+#01 tr::UserTracker::getMembershipDate()+88
+#02 tr::UserTracker::updateCommonAttributes()+44
+#03 mz::DNAManager::sendDnaEvent(...)+168
+#04 tr::UserTracker::sessionStart()+1492
+#05 tr::UserTracker::init()+320
+#06 tr::GlobalData::init(mz::InputPointerState*)+1236
+#07 tr::MainApp::init()+112
+#08 resize+420
+#09 art_jni_trampoline+112
+#11 com.ubisoft.redlynx.trialsgo.GL2View$Renderer.onSurfaceChanged+10
+#13 android.opengl.GLSurfaceView$GLThread.guardedRun+994
+```
+
+`getPlayerMembership()` @`0x0062e5c4` 的关键片段：
+
+```
+0x62e5f0  bl NetworkChecker::getNetworkType ; cbz w0     -> 空返回   ← 断网就跳过，故只有联网才崩
+0x62e60c  bl AntiCheating::isValid          ; tbz w0,#0   -> 空返回
+0x62e630  bl PlayerItems::getItemCount      ; tbz w0,#0   -> 空返回   ← 存档里有会员道具才继续
+0x62e638  ldr x0, [x21]        ; x0 = this->[0]  ← slot0 会员计时器
+0x62e63c  ldr w8, [x0]         ; ★ 崩在这（x0 == NULL）
+0x62e6b4  ldr x0, [x21, #8]    ; slot1 同一模式
+0x62e6b8  ldr w8, [x0]         ; ★ 同样会崩
+```
+
+会员计时器由 `VIPManager::activateMembership()` 创建，**正常由服务器下发触发**；
+离线私服从不激活会员，但存档里存在会员道具（item 0x80），于是 `[this]` / `[this+8]`
+两个计时器指针恒为 NULL，联网时一读即 SIGSEGV。
+
+### 11.3 修复（5 × 4 字节，m15 起）
+
+早期 m14 用的是「把结果涂成常量空列表」的粗暴办法（`ldr w8,[x0]` → `mov w8,#0`，2 × 4 字节）。
+它能止崩，但副作用是**会员状态永远读不出来**，VIP 下发就无从谈起。m15 换成等价语义的空指针守卫：
+
+| 补丁 id | 文件偏移 | 原始 → 补丁 | 含义 |
+| --- | --- | --- | --- |
+| `vip-membership-null-guard-slot0-a` | `0x0062e63c` | `08 00 40 b9` → `a0 01 00 b4` | `ldr w8,[x0]` → `cbz x0, #0x62e670` |
+| `vip-membership-null-guard-slot0-b` | `0x0062e640` | `88 01 00 34` → `08 00 40 b9` | `cbz w8,#0x62e670` → `ldr w8,[x0]` |
+| `vip-membership-null-guard-slot0-c` | `0x0062e644` | `f4 03 1f aa` → `68 01 00 34` | 冗余的 `mov x20,xzr` → `cbz w8, #0x62e670` |
+| `vip-membership-null-guard-slot1-a` | `0x0062e6b8` | `08 00 40 b9` → `40 05 00 b4` | `ldr w8,[x0]` → `cbz x0, #0x62e760` |
+| `vip-membership-null-guard-slot1-b` | `0x0062e6bc` | `28 05 00 34` → `08 00 40 b9` | `cbz w8,#0x62e760` → `ldr w8,[x0]` |
+
+改完 slot0 的指令序列是
+`ldr x0,[x21]` → `cbz x0,空返回` → `ldr w8,[x0]` → `cbz w8,空返回` → `bl getRemainingTime` → `cbz w0,空返回`，
+与原始逻辑完全一致，只是不再解引用 NULL。slot1 没有空指令槽可借，`cbz w8` 被丢掉，
+但未启动的 `TimedAction` 前 16 字节全 0，`getRemainingTime()` 必返回 0，紧随的 `cbz w0` 已能兜住。
+
+**效果**：`VIPManager::init()` 跑过之后（它给 4 个计时器指针赋值），
+`getPlayerMembership()` 会**如实返回真实会员状态** —— 这正是 VIP 下发能生效的前提。
+
+### 11.4 实机验证（联网状态，`192.168.1.100:8000`）
+- 进程存活 135 秒以上，`am_crash` / `am_proc_died` **零条**。
+- 服务器收到完整启动序列：`GET /` → `/dlcontent_frontier_android/794/info.json`
+  → `/v1/applications/<appid>/configuration` → `POST /v3/profiles/sessions`
+  → `/frontieronlinecontent/loc.json` → News。**以前到 `GET /` 就崩。**
+- 游戏正常进村庄，截图 `tmp\m14a.png`。
+
+### 11.5 走过的弯路（别再重复）
+- **不是** `tf_server.txt` 地址串太长溢出（`patch_dynaddr.py` 的例程有 63 字节读上限与容量检查）。
+- **不是**局域网路由/防火墙问题（设备 `curl http://192.168.1.100:8000/__ping` → `pong`）。
+- **不是**内购补丁引起（装不含 IAP 补丁的 `tf-m8-release-backup.apk` 照样崩）。
+- **不是** Google / 阿里 DoT 流量引起（`iptables` 把 wlan0 出网全封只放行本机服务器，**仍然崩**）。
+- ⇒ 真正起作用的只是「Android 是否报告有可用网络」这一个事实 —— 因为
+  `NetworkChecker::getNetworkType()` 是那道最外层的闸。
+
+### 11.6 取证技巧（可复用）
+`debuggerd` 一开始不为游戏落 tombstone（只能看到无关的指纹 HAL SIGABRT）。先执行
+```
+adb shell "cmd package compile -m speed -f com.ubisoft.redlynx.trialsfrontier.ggp"
+```
+强制 AOT 重编译，之后 `adb logcat -d` 里的 `F DEBUG` 行就是游戏的完整 native 栈。
+
+---
+
+## 十二、账号系统重构 + VIP 下发（ROADMAP 第 2 条）
+
+### 12.1 注册与登录彻底分开
+
+以前「登录一个没见过的用户名」= 直接给你建号，于是永远打错密码也不会被拒。
+现在（`server/tflocal_accounts.py`）：
+
+| 函数 | 语义 |
+| --- | --- |
+| `register_account(user, pw, name?)` | 只注册。用户名或口令为空 → `bad-request`；已存在 → `exists` |
+| `login_account(user, pw)` | **只查库，绝不建号**。查不到 → `not-found`；口令不符 → `invalid-credentials` |
+| `set_password(user, pw)` | 换新 salt 重算哈希 |
+| `delete_account(user)` | 删账号，**不动它的存档目录** |
+| `list_accounts_public()` | 去掉 `pw`/`salt`，附 `created_iso`/`last_login_iso` |
+
+`POST /v3/profiles/sessions` 带 `Authorization: Basic <b64(user:pw)>` 时走 `login_account`，
+失败一律 **401** 并给出可读原因：
+
+```json
+{"error":"not-found","errorCode":"NOT_REGISTERED",
+ "message":"此账号尚未在本地服务器注册，请先打开 http://<服务器IP>:8000/__register 注册"}
+```
+
+### 12.2 VIP 下发：链路本来就在，缺的是「能买到」+「能读到」
+
+- 买下商店里的骑士俱乐部档位 → `StoreManager::onPurchaseComplete`
+  → `StoreManager::pushItemPurchasedPopup` → **`VIPManager::activateMembership(type)`**
+  （`activateMembership` 全库只有这两个调用点，都在 `pushItemPurchasedPopup` 里封着）。
+- `activateMembership` 会 `PlayerItems::setItemCount(0x80, 0, ... | (1<<type))` 并
+  `timers[type]->start(now, dur, 0, 0)` —— **道具 id 0x80（=128）就是会员位掩码**，
+  bit0 / bit1 分别对应「未来的会员」/「道路队长」；时长取自
+  `GlobalSettings::getSetting(<hash>, 0x278d00)`（=2592000 秒 = 30 天）。
+- `getPlayerMembership()` 只认这个位掩码 + 计时器剩余时间。
+  所以 §11.3 把「涂成常量」换成**空指针守卫**之后，会员状态才第一次可能被如实读出来。
+- 但只修 `getPlayerMembership` 还不够：离线商店里「骑士俱乐部」两档显示
+  **「剩余时间：未知（离线）」**、**没有购买按钮**。根因在
+  `VIPManager::isVIPStoreOfferAvailable()` @`0x0062edd4`，它返回
+  `(StoreItem != NULL) && (IAPItemInfo != NULL)`：
+  - `StoreItem` 来自本地数据包（`/conf/store_offers.txt` 那一套），离线是有的；
+  - `IAPItemInfo` 来自 `OfferManager::findVIPOffers` @`0x00601920` 里的
+    `mz::IAPManager::getProductInfoEnabled(item+4)`；
+  - 离线没有 Google Play，`mz::IAPManagerAndroid::LoadStore` 一个产品都没往
+    `mt::Array<IAPItemInfo>`（`this+0x10` count / `this+0x18` data，stride `0x88`）
+    里插过，于是它永远走 `0x0088a22c  mov x19,xzr` 返回 **NULL**。
+    （顺带查清：`addProduct` 置的是 flag 的 **bit1**，而 `getProductInfoEnabled`
+    查的是 **bit0**，所以「先 addProduct 再查表」这条路根本走不通。）
+- **m16 的修法**：只把 `findVIPOffers` 里那一条 `bl getProductInfoEnabled`
+  （`0x006019e0`）改跳进代码洞 `0x0096d85c`，洞里 3 条指令
+  `adrp x0,#0x96d000 ; add x0,x0,#0x86c ; ret` 直接返回 `0x0096d86c` 处一个
+  伪造的 `IAPItemInfo`（`+0x00` 内联 id、`+0x40` int −1、`+0x84` **bit0 = 1**）。
+  其它任何 IAP 调用点都不受影响（尤其 `0x0088a3e4` 那处购买校验仍走原生逻辑）。
+- **实机结果（2026-10-04 11:32，小米 8 / LineageOS 22.2）**：
+  - 骑士俱乐部两档都从「未知（离线）」变成 **「剩余时间：29天」**；
+  - 进村庄弹出 **「每日登录奖励」65💎 + 65000🪙，剩余时间 29 天**；
+  - 服务器日志在同一秒收到客户端主动发出的
+    `POST /public/targeting/v1/vip_registration`、
+    `POST /private/targeting/v1/direct_vip_registration`、
+    `GET /public/targeting/v1/vip_validation`、
+    `GET|POST /public/targeting/v1/vip_badge_option` ——
+    而 `registerMembership()` 在整库中**只有 `VIPManager::activateMembership` 一个调用者**，
+    这就证明**两档会员都被真正激活了**（`activateMembership(0)` 与 `(1)` 各一次；
+    两次走了不同端点，是因为第一次调用时配置还没加载完，`Anticheating_Enabled` 仍是默认值 1）。
+- 服务器侧对应实现（`server/tf_server.py`）：`h_vip_registration`、`h_vip_validation`、
+  `h_vip_badge_option` 三个动态处理器，注册在 `DYNAMIC_EXACT` 里共 5 条
+  （两个 registration 的 POST、validation 的 GET、badge_option 的 GET + POST）。
+  唯一会被客户端解析的是 `vip_validation`（`onNetworkDataReceived` @`0x0051b0ac`
+  里只有 `cmp w3,#0x73` 一个分支），响应必须含顶层键 `player` 与 `badge_display`，
+  否则 `parseJsonData` 静默 return、不回调 listener。
+
+### 12.3 内置 WebUI（ROADMAP 第 4 条起了个头）
+
+浏览器打开 `http://<服务器IP>:8000/__ui`（或 `/__register`）即可注册账号、查看已注册账号。
+
+> 注意：`GET /` 被游戏自己的 gamecfg 端点占用（`/?product=101&portal=Google&version=7.9.4`），
+> 所以网页只能挂在 `/__ui`、`/__register` 这类路径上。
+
+API：`POST /__api/register`、`POST /__api/login`、`POST /__api/password`、`POST /__api/delete`。
+账号/存档/幽灵的管理端点：`/__accounts`、`/__devices`、`/__sessions`、`/__saves`、
+`/__save?profile=`、`/__history?profile=`、`/__restore?profile=&ts=`、`/__ghosts`、`/__help`。
+
+### 12.4 还没做完
+
+- VIP **激活后本地存档的上传**：`activateMembership` 是本地生效的，
+  服务端存档里目前还看不到 item 128（等客户端下一次上报会把会员位与计时器带上来）。
+- 服务端主动**免费发放会员**的管理接口（`/__api/grant` 之类）尚未做 ——
+  目前 `activateMembership` 只能由客户端自己的购买/恢复流程触发。
+- ROADMAP 第 3 条在线功能（幽灵 `userstorage/v2/*` 链、排行榜、限时活动、碉堡/午夜杯）。
+- ROADMAP 第 5 条：一键开服打包成 exe。
+

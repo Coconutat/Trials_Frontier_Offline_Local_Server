@@ -163,10 +163,18 @@ def h_session(path, query, body, headers):
     remember = bool(js.get("rememberMe"))
 
     if info.get("kind") == "basic" and username:
-        acc = acct.ensure_account(username, password,
-                                  name_on_platform=js.get("nameOnPlatform"))
+        # ROADMAP 第 2 条：登录只查库，**不再自动注册**。
+        # 账号必须先在 http://<服务器>:8000/__register 上注册。
+        acc, err = acct.login_account(username, password)
         if acc is None:
-            return 401, {"Content-Type": "application/json"}, {"error": "invalid credentials"}
+            print("[acct] 会话请求被拒：%s（%s）" % (username, err), flush=True)
+            return 401, {"Content-Type": "application/json"}, {
+                "error": err or "invalid-credentials",
+                "errorCode": "NOT_REGISTERED" if err == "not-found" else "INVALID_CREDENTIALS",
+                "message": ("此账号尚未在本地服务器注册，请先打开 "
+                            "http://<服务器IP>:8000/__register 注册" if err == "not-found"
+                            else "用户名或密码不正确"),
+            }
         ticket = acct.issue_session(acc)
         return 200, {"Content-Type": "application/json"}, acct.session_body(acc, ticket, remember)
 
@@ -441,6 +449,82 @@ def h_iap_products(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"limited_purchases": []}
 
 
+def h_vip_registration(path, query, body, headers):
+    """VIP 排行榜徽章注册。
+
+    反汇编依据（libTrialsGo.so `tr::VIPLeaderboardBadgeService::registerMembership`
+    @0x51ab68，360 字节，尾部 0x51ac70..0x51accc）：
+      if (GlobalSettings::getSetting(hash("Anticheating_Enabled"), 1) != 0) {
+          ts = AntiCheating::getSystemTime();
+          snprintf(buf1, 0x100, "%s%uvip%s", <base>, ts,
+                   "18e3548c59ad40dd03907b7aeee71d67");      // 盐 @0xb86ca1
+          OnlineChecksum::calculateMD5(md5, buf1);
+          OnlineChecksum::formatToJson(json, md5, ts);
+          snprintf(body, 0x400, "{\\"badge_display\\":true,%s}", json);   // fmt @0xb8961f
+      } else {
+          snprintf(body, 0x400, "{\\"badge_display\\":true}");           // @0xb8965f
+      }
+      snprintf(url, 0x400, "%s%s", <serverAddr>, "/public/targeting/v1/vip_registration"); // @0xb89639
+      DebugOut::add("%s\\n%s", url, body);                                // @0xb89555
+      OnlineCore::postJson(listener, url, body, /*cmd=*/0x72, /*needAuth=*/1);  // PLT 0x352770
+
+    响应由同一个类的 `onNetworkDataReceived` @0x51b0ac 处理，它只认 **cmd 0x73**
+    （`cmp w3,#0x73`），所以本端点的响应其实不会被解析 —— 但按 `parseJsonData`
+    认识的形状回一个 `badge_display` 最稳妥。
+    """
+    print("[vip] vip_registration body=%s"
+          % body[:200].decode("utf-8", "replace"), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"badge_display": True}
+
+
+def h_vip_validation(path, query, body, headers):
+    """VIP 成员查询 —— 这是唯一会被 `parseJsonData` 解析响应的端点。
+
+    `tr::VIPLeaderboardBadgeService::sendMembershipQuery` @0x51ad70（340 字节）：
+    URL 以 `%s%s` 拼 `<serverAddr>` + `/public/targeting/v1/vip_validation?profiles=`
+    （@0xb896a4），然后把 `char const** profiles` 里每个字符串用 `strcat` 依次追加
+    （0x51ae38），最后
+      OnlineCore::getRequest(listener, listener, url, /*cmd=*/0x73, 0, /*needAuth=*/1, 0)
+    （0x51ae54 `mov w3,#0x73`、0x51ae6c PLT 0x33f1d0）。
+
+    `parseJsonData(unsigned char* text, uint len)` @0x51b0fc（972 字节）只认两个顶层键：
+      "player"        @0xb882f8  字符串值 → 追加进一个 std::string 缓冲
+      "badge_display" @0xb89738  **只看键是否存在**（0x51b1d8 `cset w8,eq` /
+                                 0x51b1dc `orr w26,w26,w8`），值本身没读
+    之后每个 profile 组装成 `VIPLeaderboardBadgeService::ProfileData`（16 字节，
+    badgeDisplay 在 +8）插进 `mt::Array<ProfileData>`（`this+0x10` 计数、`this+0x18` 数据）。
+    不返回 "player" 就只是不插任何 ProfileData，是安全的。
+    """
+    q = dict(parse_qsl(query, keep_blank_values=True))
+    profiles = q.get("profiles") or ""
+    print("[vip] vip_validation profiles=%s" % profiles, flush=True)
+    # 两个键都是根对象的直接成员。不返回任何键的话 parseJsonData 会静默 return、
+    # 不回调 listener，界面会一直等；所以至少把这两个键给出去。
+    return 200, {"Content-Type": "application/json"}, {
+        "player": profiles,
+        "badge_display": True,
+    }
+
+
+def h_vip_badge_option(path, query, body, headers):
+    """VIP 徽章显示开关。
+
+    `tr::VIPLeaderboardBadgeService::sendBadgeOption(bool)` @0x51afe8（184 字节）：
+      body = on ? "{\\"badge_display\\":true}"  (@0xb8965f)
+                : "{\\"badge_display\\":false}" (@0xb896f8)
+      url  = <serverAddr> + "/public/targeting/v1/vip_badge_option" (@0xb896d2)
+      OnlineCore::postJson(listener, url, body, /*cmd=*/0x74, /*needAuth=*/1)  // 0x51b068
+    这里把客户端请求里的 badge_display 原样回显（解析失败就回 true）。
+    """
+    try:
+        req = json.loads(body.decode("utf-8", "replace") or "{}")
+        val = bool(req.get("badge_display", True))
+    except Exception:
+        val = True
+    print("[vip] vip_badge_option badge_display=%s" % val, flush=True)
+    return 200, {"Content-Type": "application/json"}, {"badge_display": val}
+
+
 DYNAMIC_EXACT = [
     ("POST", "/v1/profiles/sessions", h_session),
     ("POST", "/v3/profiles/sessions", h_session),
@@ -454,6 +538,15 @@ DYNAMIC_EXACT = [
     ("GET", "/public/receiptvalidation/v1/product/configuration", h_iap_products),
     ("GET", "/public/receiptvalidation/v1/verify_android", h_iap_verify),
     ("POST", "/public/receiptvalidation/v1/verify_android", h_iap_verify),
+    # VIP 排行榜徽章（tr::VIPLeaderboardBadgeService，见三个处理器的 docstring）：
+    #   registerMembership 走 /public/...；反作弊关闭时改走 /private/...direct_...
+    ("POST", "/public/targeting/v1/vip_registration", h_vip_registration),
+    ("POST", "/private/targeting/v1/direct_vip_registration", h_vip_registration),
+    ("GET", "/public/targeting/v1/vip_validation", h_vip_validation),
+    # sendBadgeOption 是 POST、getBadgeOption 是 GET，两者 URL 相同（ELF 里查不到
+    # 调用点，是虚表调用），所以两种方法都要支持。
+    ("GET", "/public/targeting/v1/vip_badge_option", h_vip_badge_option),
+    ("POST", "/public/targeting/v1/vip_badge_option", h_vip_badge_option),
 ]
 
 DYNAMIC = [
@@ -529,6 +622,67 @@ def render(rule):
     return status, headers, raw
 
 
+_WEBUI_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trials Frontier 本地私服</title>
+<style>
+ body{font-family:system-ui,"Microsoft YaHei",sans-serif;background:#1d1712;color:#eee;margin:0;padding:24px}
+ h1{font-size:20px;margin:0 0 4px} .sub{color:#a99;font-size:13px;margin-bottom:20px}
+ .card{background:#2a221b;border:1px solid #463829;border-radius:10px;padding:18px;max-width:760px;margin-bottom:18px}
+ label{display:block;margin:10px 0 4px;font-size:13px;color:#cbb}
+ input{width:100%;box-sizing:border-box;padding:9px;border-radius:6px;border:1px solid #54432f;background:#181310;color:#eee;font-size:14px}
+ button{margin-top:14px;padding:10px 18px;border:0;border-radius:6px;background:#c8892b;color:#241a0c;font-weight:700;font-size:14px;cursor:pointer}
+ button:hover{background:#e0a040}
+ table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px}
+ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #3a2e22}
+ #msg{margin-top:12px;font-size:14px;min-height:20px}
+ .ok{color:#6ad06a} .bad{color:#e86a6a}
+ code{background:#181310;padding:2px 5px;border-radius:4px}
+</style></head><body>
+<h1>特技摩托：前线 · 本地私服</h1>
+<div class="sub">ROADMAP 第 2 条 —— 账号注册与登录已分离：<b>必须先在这里注册，游戏里才能登录。</b></div>
+
+<div class="card">
+  <h2 style="font-size:16px;margin:0">注册账号</h2>
+  <label>账号（游戏里登录用，建议邮箱格式）</label><input id="u" autocomplete="off" placeholder="you@example.com">
+  <label>密码</label><input id="p" type="password" placeholder="至少 6 位">
+  <label>游戏内显示名（可留空）</label><input id="n" autocomplete="off" placeholder="留空则与账号相同">
+  <button onclick="reg()">注册</button>
+  <div id="msg"></div>
+</div>
+
+<div class="card">
+  <h2 style="font-size:16px;margin:0">已注册账号</h2>
+  <div id="list">载入中…</div>
+  <button onclick="load()">刷新</button>
+</div>
+
+<script>
+function say(t, ok){var m=document.getElementById('msg');m.textContent=t;m.className=ok?'ok':'bad';}
+async function reg(){
+  var u=document.getElementById('u').value.trim(), p=document.getElementById('p').value,
+      n=document.getElementById('n').value.trim();
+  if(!u||!p){say('账号和密码都要填。',false);return;}
+  var r=await fetch('/__api/register',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({username:u,password:p,nameOnPlatform:n||u})});
+  var j=await r.json();
+  say(j.message||j.error||('HTTP '+r.status), !!j.ok);
+  if(j.ok){document.getElementById('p').value='';load();}
+}
+async function load(){
+  var r=await fetch('/__accounts'); var j=await r.json();
+  var h='<table><tr><th>账号</th><th>显示名</th><th>profileId</th><th>注册时间</th></tr>';
+  (j.accounts||[]).forEach(function(a){
+    h+='<tr><td>'+a.username+'</td><td>'+(a.nameOnPlatform||'')+'</td><td><code>'+(a.profileId||'').slice(0,8)+'…</code></td><td>'+(a.created_iso||'')+'</td></tr>';
+  });
+  document.getElementById('list').innerHTML=h+'</table>';
+}
+load();
+</script></body></html>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "TFLocal/0.1"
@@ -578,7 +732,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"Content-Type": "text/plain"}, b"pong\n")
             return
         if path.startswith("/__"):
-            if self._introspect(path, query):
+            if self._introspect(path, query, body):
                 return
 
         dyn, which = pick_dynamic(method, path)
@@ -635,8 +789,8 @@ class Handler(BaseHTTPRequestHandler):
         elif which == "dyn:placeholder-image":
             print("        RESP <占位 PNG %d bytes>" % len(raw), flush=True)
 
-    def _introspect(self, path, query):
-        """本地管理端点：/__accounts /__saves /__save /__sessions /__ghosts"""
+    def _introspect(self, path, query, body=b""):
+        """本地管理端点：/__accounts /__saves /__save /__sessions /__ghosts …"""
         q = dict(parse_qsl(query, keep_blank_values=True))
         if path == "/__ping":
             self._send(200, {"Content-Type": "text/plain"}, b"pong\n")
@@ -648,9 +802,46 @@ class Handler(BaseHTTPRequestHandler):
             return True
 
         if path == "/__accounts":
-            db = acct._load(acct.ACCOUNTS, {}).get("users", {})
-            return js({"count": len(db), "accounts": [
-                {k: v for k, v in a.items() if k not in ("pw", "salt")} for a in db.values()]})
+            return js({"count": len(acct.list_accounts_public()),
+                       "accounts": acct.list_accounts_public()})
+        if path in ("/__register", "/__ui"):
+            self._send(200, {"Content-Type": "text/html; charset=utf-8"},
+                       _WEBUI_HTML.encode("utf-8"))
+            return True
+        if path == "/__api/register":
+            form = {}
+            ctype = (self.headers.get("Content-Type") or "").lower()
+            if "json" in ctype:
+                form = _json_body(body) or {}
+            else:
+                form = dict(parse_qsl(body.decode("utf-8", "replace"), keep_blank_values=True))
+            acc, err = acct.register_account(form.get("username"), form.get("password"),
+                                            form.get("nameOnPlatform"))
+            if acc is None:
+                msg = {"bad-request": "用户名和密码都不能为空",
+                       "exists": "这个账号名已经被注册了，换一个",
+                       }.get(err, err or "注册失败")
+                return js({"ok": False, "error": err, "message": msg}, 400)
+            return js({"ok": True, "username": acc["username"],
+                       "profileId": acc["profileId"], "message": "注册成功，可以在游戏里登录了"})
+        if path == "/__api/login":
+            form = _json_body(body) or {}
+            acc, err = acct.login_account(form.get("username"), form.get("password"))
+            if acc is None:
+                return js({"ok": False, "error": err}, 401)
+            return js({"ok": True, "username": acc["username"], "profileId": acc["profileId"]})
+        if path == "/__api/password":
+            form = _json_body(body) or {}
+            acc, err = acct.set_password(form.get("username"), form.get("password"))
+            if acc is None:
+                return js({"ok": False, "error": err}, 400)
+            return js({"ok": True, "username": acc["username"], "message": "口令已更新"})
+        if path == "/__api/delete":
+            form = _json_body(body) or {}
+            who, err = acct.delete_account(form.get("username"))
+            if who is None:
+                return js({"ok": False, "error": err}, 400)
+            return js({"ok": True, "username": who, "message": "账号已删除（存档目录保留）"})
         if path == "/__devices":
             devs = acct.list_devices()
             return js({"count": len(devs), "devices": devs})
@@ -687,7 +878,11 @@ class Handler(BaseHTTPRequestHandler):
                                      "/__sessions", "/__saves", "/__save?profile=<pid>",
                                      "/__history?profile=<pid>",
                                      "/__restore?profile=<pid>&ts=<时间戳|latest>",
-                                     "/__ghosts"]})
+                                     "/__ghosts",
+                                     "/__register（注册网页，也可用 /__ui）",
+                                     "POST /__api/register {username,password,nameOnPlatform}",
+                                     "POST /__api/login {username,password}",
+                                     "POST /__api/password {username,password}"]})
         return False
 
     def _send(self, status, headers, raw):

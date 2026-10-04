@@ -129,6 +129,152 @@ PATCHES = [
         "patched": "e2 03 1f aa ce fb ff 17",
         "why": "同上，覆盖取消路径（IAPManagerListener vtable 槽 0x10）。",
     },
+    {
+        "id": "vip-membership-null-guard-slot0-a",
+        "symbol": "_ZN2tr10VIPManager19getPlayerMembershipEv",
+        "offset": 0x78,
+        # 0x0062e63c 原是 `ldr w8, [x0]` —— 空指针解引用点，挪到 +0x7C 处的空槽
+        "original": "08 00 40 b9",
+        # cbz x0, #0x62e670（空会员列表出口）
+        "patched": "a0 01 00 b4",
+        "why": "ROADMAP 第 1 条「联网闪退」的真凶 + VIP 下发的正确修法。tombstone 指向 "
+               "tr::VIPManager::getPlayerMembership()+120，栈为 "
+               "GlobalData::init -> UserTracker::init -> sessionStart -> DNAManager::sendDnaEvent "
+               "-> updateCommonAttributes -> getMembershipDate -> getPlayerMembership。"
+               "反汇编显示该函数开头有三道闸：NetworkChecker::getNetworkType() 必须非 0 且非 -1"
+               "（所以断网启动不崩）、AntiCheating::isValid() 必须为真、"
+               "PlayerItems::getItemCount(0x80,0) 必须为真；过了三道闸后执行"
+               "`ldr x0,[x21]` / `ldr w8,[x0]` —— 会员计时器指针由 VIPManager::activateMembership()"
+               " 创建（正常由服务器下发触发）。启动早期 GlobalData::init 先调 UserTracker::init"
+               "（崩溃帧）再调 VIPManager::init（晚约 0x1D4 字节），所以那一刻指针必然是 NULL。"
+               "本补丁把 `ldr w8,[x0]` 前移成开头的 `cbz x0`，既躲开空指针、"
+               "又保留「VIPManager::init 跑过之后如实上报真实会员状态」的能力"
+               "（不同于早期 m14 把整个函数结果涂成常量空列表的做法）。",
+    },
+    {
+        "id": "vip-membership-null-guard-slot0-b",
+        "symbol": "_ZN2tr10VIPManager19getPlayerMembershipEv",
+        "offset": 0x7C,
+        # 0x0062e640 原是 `cbz w8, #0x62e670`
+        "original": "88 01 00 34",
+        # ldr w8, [x0]
+        "patched": "08 00 40 b9",
+        "why": "上一条的配对：把原先紧跟的 cbz 位置让给 load。",
+    },
+    {
+        "id": "vip-membership-null-guard-slot0-c",
+        "symbol": "_ZN2tr10VIPManager19getPlayerMembershipEv",
+        "offset": 0x80,
+        # 0x0062e644 原是 `mov x20, xzr`（冗余槽，x20 在 0x62e62c 刚被置 0）
+        "original": "f4 03 1f aa",
+        # cbz w8, #0x62e670
+        "patched": "68 01 00 34",
+        "why": "占用冗余槽补回 `cbz w8, #0x62e670`，于是改成 "
+               "`ldr x0,[x21]` -> `cbz x0` -> `ldr w8,[x0]` -> `cbz w8` -> `bl getRemainingTime` -> `cbz w0`，"
+               "与原始语义完全一致且不再解引用 NULL。",
+    },
+    {
+        "id": "vip-membership-null-guard-slot1-a",
+        "symbol": "_ZN2tr10VIPManager19getPlayerMembershipEv",
+        "offset": 0xF4,
+        # 0x0062e6b8 原是 `ldr w8, [x0]`
+        "original": "08 00 40 b9",
+        # cbz x0, #0x62e760（第二个空会员列表出口）
+        "patched": "40 05 00 b4",
+        "why": "第二个会员槽位（0x0062e6b4 `ldr x0,[x21,#8]`）的同一空指针解引用。",
+    },
+    {
+        "id": "vip-membership-null-guard-slot1-b",
+        "symbol": "_ZN2tr10VIPManager19getPlayerMembershipEv",
+        "offset": 0xF8,
+        # 0x0062e6bc 原是 `cbz w8, #0x62e760`（此处没有空槽可用，该 cbz 被丢弃）
+        "original": "28 05 00 34",
+        # ldr w8, [x0]
+        "patched": "08 00 40 b9",
+        "why": "把 load 移到 cbz 原来的位置；slot1 的 `cbz w8` 无处安放被丢弃，"
+               "但未启动的 TimedAction 偏移 0/8 全为 0，紧随其后的 `bl getRemainingTime` + `cbz w0` 已能兜住。",
+    },
+    # ------------------------------------------------------------------
+    # m16：让离线商店也出现 VIP（骑士俱乐部）档位，从而触发 VIP 下发
+    #
+    #   tr::VIPManager::isVIPStoreOfferAvailable() @0x0062edd4
+    #       -> OfferManager::findVIPOffers(StoreItem*&, mz::IAPItemInfo*&, u16) @0x00601920
+    #              ... found: x0 = IAPManager* ; x1 = item+4 (productIdentifier)
+    #              0x006019e0  bl IAPManager::getProductInfoEnabled
+    #              0x006019e4  str x0,[x19]        ; *outIap = 返回值（不判 NULL）
+    #       return (si != NULL) && (iap != NULL);
+    #
+    #   离线没有 Google Play，mz::IAPManagerAndroid::LoadStore 一个产品都没往
+    #   mt::Array<mz::IAPItemInfo>（基类 this+0x10 count / this+0x18 data，stride 0x88）
+    #   里插过，所以 getProductInfoEnabled 永远走 0x0088a22c `mov x19,xzr` 返回 NULL
+    #   => *outIap == NULL => isVIPStoreOfferAvailable() 恒 false => 骑士俱乐部两档
+    #   只有「剩余时间：未知（离线）」。
+    #
+    #   取法：只改 findVIPOffers 里那一条 bl，让它跳进代码洞；洞里直接返回一个
+    #   伪造的 IAPItemInfo（+0x84 = 1 即 getProductInfoEnabled 认可的 bit0）。
+    #   其它 IAP 调用点（尤其 0x0088a3e4 那处购买校验）完全不动。
+    # ------------------------------------------------------------------
+    {
+        "id": "vip-shop-offer-iap-stub-call",
+        "symbol": "_ZN2tr12OfferManager13findVIPOffersERPNS_9StoreItemERPN2mz11IAPItemInfoEt",
+        "offset": 0xC0,
+        # 0x006019e0 原为 `bl 0x00365950`（PLT: mz::IAPManager::getProductInfoEnabled）
+        "original": "dc 8f f5 97",
+        # bl 0x0096d85c（下面的代码洞 stub）
+        "patched": "9f af 0d 94",
+        "why": "把 VIP offer 的 IAP 查询改到代码洞 stub，直接返回伪造的 IAPItemInfo，"
+               "使 isVIPStoreOfferAvailable() 离线也能为真。",
+    },
+    {
+        "id": "vip-shop-offer-iap-stub",
+        "addr": 0x0096D85C,
+        # caves.py 报出的 4084 字节空闲区（0x96d85c..0x96e850），原内容全 0
+        "original": "00 00 00 00 00 00 00 00 00 00 00 00",
+        # adrp x0, #0x96d000 ; add x0, x0, #0x86c ; ret
+        "patched": "00 00 00 90 00 b0 21 91 c0 03 5f d6",
+        "why": "返回 0x0096d86c 处伪造结构的指针。",
+    },
+    {
+        "id": "vip-shop-offer-iap-fakeinfo",
+        "addr": 0x0096D86C,
+        "original": "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00 "
+                    "00 00 00 00 00 00 00 00",
+        # +0x00 "tfr.vip.member"  +0x40 int -1  +0x84 u32 1
+        "patched": "74 66 72 2e 76 69 70 2e "
+                   "6d 65 6d 62 65 72 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "ff ff ff ff 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 00 00 00 00 "
+                   "00 00 00 00 01 00 00 00",
+        "why": "mz::IAPItemInfo（0x88 字节）：+0x00 内联 productIdentifier、"
+               "+0x40 int（原生初值 -1）、+0x84 flags 的 bit0 = enabled。",
+    },
 ]
 
 # ---------------------------------------------------------------- ELF64 解析
@@ -254,15 +400,24 @@ def main():
         if len(want) != len(new):
             problems.append("%s: 原始/补丁字节长度不一致" % p["id"])
             continue
-        if p["symbol"] not in symmap:
-            problems.append("%s: 符号 %s 不存在（可能是被 strip 过或版本不符）"
-                            % (p["id"], p["symbol"]))
-            continue
-        # 注意：symtab 里记录的函数长度有时偏小，所以不拿 size 做硬校验，
-        # 只靠"原始字节必须逐字节吻合"来保证打在对的位置。
-        value, _size = symmap[p["symbol"]]
+        # 两种定位方式：symbol+offset（函数体内），或 addr（绝对虚拟地址，
+        # 用于落在代码洞里的补丁 —— 那里没有任何符号可以挂靠）。
+        if "addr" in p:
+            value = p["addr"]
+            off = 0
+            label = "(code cave)"
+        else:
+            if p["symbol"] not in symmap:
+                problems.append("%s: 符号 %s 不存在（可能是被 strip 过或版本不符）"
+                                % (p["id"], p["symbol"]))
+                continue
+            # 注意：symtab 里记录的函数长度有时偏小，所以不拿 size 做硬校验，
+            # 只靠"原始字节必须逐字节吻合"来保证打在对的位置。
+            value, _size = symmap[p["symbol"]]
+            label = p["symbol"]
+        off = p.get("offset", 0)
         try:
-            foff = elf.vaddr_to_offset(value + p["offset"])
+            foff = elf.vaddr_to_offset(value + off)
         except ValueError as e:
             problems.append("%s: %s" % (p["id"], e))
             continue
@@ -270,12 +425,12 @@ def main():
         ok = (got == want)
         if not ok:
             problems.append("%s: 0x%08x 处原始字节 %s != 期望 %s"
-                            % (p["id"], value + p["offset"],
+                            % (p["id"], value + off,
                                got.hex(" "), want.hex(" ")))
             continue
         results.append({
-            "id": p["id"], "symbol": p["symbol"],
-            "vaddr": "0x%08x" % (value + p["offset"]),
+            "id": p["id"], "symbol": label,
+            "vaddr": "0x%08x" % (value + off),
             "file_offset": foff,
             "original": want.hex(" "), "patched": new.hex(" "),
             "why": p["why"],
