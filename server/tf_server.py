@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import threading
@@ -71,7 +72,15 @@ _TF_CONFIG_DEFAULTS = {
         # 倒计时结束前赢下 2 条就赢这一局）。
         # ★ `parseMatch` 的 tracks 循环没有边界检查（0x4fddc0 起 `madd x9,x28,#0x34,x21`），
         #   >3 条会一路写穿到 PVPMatch+0xa4（chips）/ +0xa8（tickets）。**最多 3 条。**
-        "track_ids": [1041, 1024, 1068],
+        # 用户 m04586：PVP 一局是**随机地图** —— 所以这里默认留空，让 `_pvp_tracks()`
+        # 每局从 `candidate_tracks` 里随机抽 3 条。填了就固定用填的那三条。
+        "track_ids": [],
+        # 可以出现在 PVP 对局里的赛道池。★ 必须是幽灵库里真有幽灵的赛道，否则
+        # `_pvp_ghost_time` 会退到 30 s 的兜底值（人机成绩会显得很假）。
+        "candidate_tracks": [
+            1023, 1024, 1032, 1033, 1036, 1037, 1041, 1051, 1062, 1068, 1069, 1070,
+            1075, 1087, 1088, 1090, 1097, 1099, 1106, 1123, 1133, 1221, 1241, 1291,
+        ],
         # 对局赛道里发给客户端的车种 ID（1 起始，见 UpgradeManager::getBikeIndexByID = id-1）。
         # ★ 必须写进 tracks[].owner_change_time：PVPManager::onStartRaceSent @0x5e59ec 是
         #   `ldr w9,[match+0x24]; str w9,[GameWorld+0x1efc]`，而 match+0x24 就是
@@ -1726,14 +1735,6 @@ def _pvp_faults_of_score(score):
     return max(0, min(99, 99 - score // 3600000))
 
 
-def _pvp_slower_than(opp_ms, ratio=1.06, pad_ms=500):
-    """合成一个「比对手慢一点」的用时 —— 本机还没交成绩时用。"""
-    my = min(3600000, int(opp_ms * ratio) + pad_ms)
-    if my <= opp_ms:
-        my = min(3600000, opp_ms + 500)
-    return my
-
-
 def _pvp_ghost_time(tid):
     """幽灵库里这条赛道的 drive_time（ms）；没有就退到 30 s。"""
     try:
@@ -1747,17 +1748,28 @@ def _pvp_ghost_time(tid):
 
 
 def _pvp_tracks():
-    """本局要发的赛道清单（最多 3 条，理由见 matchmaking.track_ids 的注释）。"""
-    ids = cfg("matchmaking", "track_ids", default=None)
-    out = []
-    if isinstance(ids, (list, tuple)):
-        for v in list(ids)[:3]:
-            try:
-                v = int(v)
-            except (TypeError, ValueError):
-                continue
-            if v > 0:
-                out.append(v)
+    """本局要发的赛道清单（最多 3 条，理由见 matchmaking.track_ids 的注释）。
+
+    用户 m04586：PVP 一局是**随机地图、随机车辆**。所以 `track_ids` 留空时从
+    `candidate_tracks` 里随机抽 3 条；填了就固定用填的。
+    """
+    def _ints(seq):
+        out = []
+        if isinstance(seq, (list, tuple)):
+            for v in seq:
+                try:
+                    v = int(v)
+                except (TypeError, ValueError):
+                    continue
+                if v > 0:
+                    out.append(v)
+        return out
+
+    out = _ints(cfg("matchmaking", "track_ids", default=None))
+    if not out:
+        cand = _ints(cfg("matchmaking", "candidate_tracks", default=None))
+        if cand:
+            out = random.sample(cand, min(3, len(cand)))
     if not out:
         out = [_pvp_track()]
     while len(out) < 3:
@@ -1765,37 +1777,54 @@ def _pvp_tracks():
     return out[:3]
 
 
-def _pvp_other_pid(m, who):
-    for p in (m.get("players") or []):
-        if p != who:
-            return p
-    return _pvp_bot_id()
-
-
 def _pvp_side_score(m, who, tid):
-    """这条赛道上 `who` 的 score（int）。
+    """这条赛道上 `who` 的 score（int）；没跑过就是 0。
 
-    有客户端实报的成绩就用它；没有就按「幽灵代表先占着这条赛道的人」推一个默认值：
-    对手是人机时用幽灵自己的 score，本机则故意慢一点 —— 否则一上来赛道就归自己，
-    玩家没有可挑战的记录（真机 m04404 看到的就是「只有 AI 的记录被记住」）。
+    ★ 用户 m04586 纠正了这里的模型：「PVP 数据是一局随机地图、随机车辆，
+      **谁跑了谁有数据**，不是直接读本地幽灵」。所以这里**只认客户端真报上来的成绩**，
+      绝对不要拿幽灵/合成值预先占位 —— 那会让玩家一进局就看见对手有自己没有的成绩
+      （「他甚至直接有比我快的记录，可我压根没跑」）。
+      人机那一侧由 `_pvp_bot_runs()` 在玩家交完成绩后补一条自己的成绩。
     """
-    tid = int(tid)
-    rec = ((m.get("results") or {}).get(who) or {}).get(tid) or {}
-    sc = int(rec.get("score") or 0)
-    if sc:
-        return sc
-    # 幽灵代表谁：**对手**。所以要先看这一局里有没有人机，而不是看 who 的对面是不是人机
-    # （那是原来的 bug：对人机自己那一侧 `_pvp_other_pid` 返回的是真人，于是人机永远 0 分，
-    #  玩家一进局就白占三条赛道 —— 冒烟测试第一次就跑出来了）。
-    pids = [p for p in (m.get("players") or []) if p]
-    if _pvp_bot_id() not in pids:
+    rec = ((m.get("results") or {}).get(who) or {}).get(int(tid)) or {}
+    try:
+        return int(rec.get("score") or 0)
+    except (TypeError, ValueError):
         return 0
-    ghost = _pvp_ghost_time(tid)
-    if who == _pvp_bot_id():
-        # 人机 = 幽灵本人的记录（也正是随后经 pvp_replaydata 下发的那条）。
-        return _pvp_score_int(ghost, 0)
-    # 真人还没跑过 → 合成一个略慢于幽灵的成绩，这条赛道先归人机（有记录可挑战）。
-    return _pvp_score_int(_pvp_slower_than(ghost), 0)
+
+
+def _pvp_bot_time(m, tid):
+    """人机在这条赛道上的用时（ms）。
+
+    就是这条赛道幽灵库那条幽灵的真实 `drive_time` —— 因为紧接着经
+    `/pvp_replaydata` 下发给玩家「对手幽灵」的正是同一条，两边必须一致，
+    否则玩家会看到「显示的时间」和「跑出来的幽灵」对不上。
+    """
+    return _pvp_ghost_time(tid)
+
+
+def _pvp_bot_runs(m, tid, now=None):
+    """让这一局的人机「跑一次」这条赛道（玩家交完成绩后由 `h_pvp_race` 调用）。
+
+    用户 m04586 描述的机制就是这样：谁跑了谁才有数据。玩家先跑 → 人机再跑 →
+    两条成绩一比自己算归属（`parseMatch` 0x4fe0dc 的 score 比较），
+    玩家想再抢回来时才会去下对手幽灵（`/start_race` 的 PVPTrack+0x0C 闸门）。
+    """
+    if not m or not tid:
+        return
+    if _pvp_bot_id() not in (m.get("players") or []):
+        return
+    by = m.setdefault("results", {}).setdefault(_pvp_bot_id(), {})
+    tid = int(tid)
+    if tid in by:
+        return
+    by[tid] = {
+        "score": _pvp_score_int(_pvp_bot_time(m, tid), 0),
+        "additional_score": 0,
+        "bike_data": cfg_int("matchmaking", "bike_id", default=1) or 1,
+        "at": int(now or time.time()),
+    }
+    print("[pvp] 人机跑了赛道 %s -> %s ms" % (tid, _pvp_bot_time(m, tid)), flush=True)
 
 
 def _pvp_owner_of(m, tid):
@@ -1912,7 +1941,6 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     if not isinstance(tlist, list) or not tlist:
         tlist = _pvp_tracks() if track is None else [int(track)]
     tlist = [int(t) for t in list(tlist)[:3] if int(t) > 0] or [_pvp_track()]
-    _mine = (_m.get("results") or {}).get(profile_id) or {}
     tickets, ticket_ts = _pvp_tickets_for(profile_id)
     info = _pvp_player_info()
     # 赛后奖励：整局跑完（3 条赛道都交过成绩）才算，且只有占住 ≥2 条赛道才给「赢」那一档。
@@ -1924,31 +1952,24 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
         _rw = cfg("rewards", "default", default=[100, 0, 0])
 
     def _track_json(tid):
-        """一条赛道。★ 关键：`result_p1` 用**客户端真报上来的成绩**。
+        """一条赛道。★ 只发**双方真跑过的成绩**，绝不预先占位。
 
         `parseMatch` 0x4fe0dc 起就是拿两个 result 的 score 比大小后调
         `PVPTrack::setOwner(...)` —— score 越大越快（`_pvp_score_int`），谁快谁占这条赛道。
-        这里以前恒定发 `对手用时 * 1.06`（永远比对手慢），所以玩家跑得再快，
-        下一轮 `matches` 回来还是同一组合成值、赛道永远不换主；真机症状就是
-        「我跑的记录不会被记录，超越他了也依然没法打败他」（用户 m04404）。
-        现在 `h_pvp_race` 把每条赛道的成绩存进 `match["results"]`，这里原样回放。
+        这里以前恒定发 `对手用时 * 1.06`（永远比对手慢）：一是玩家跑得再快，
+        下一轮 `matches` 回来还是同一组合成值、赛道永远不换主（「我跑的记录不会被记录，
+        超越他了也依然没法打败他」m04404）；二是**玩家还没跑就先看见对手有成绩**
+        （「他甚至直接有比我快的记录，可我压根没跑」m04586）。
+
+        ★ 用户 m04586 的模型：一局随机地图随机车，**谁跑了谁才有数据**。
+          所以两边都没跑过时，`result_p1`/`result_p2` **一个都不发** ——
+          这样 PVPTrack+0x08/+0x0C 都是 0，客户端就不会去下对手幽灵
+          （`startRace` @0x4fa22c 读 `PVPTrack+0x0C`），符合「没人跑过就没幽灵」。
+          玩家交完成绩后 `h_pvp_race` 会让人机也跑一次（`_pvp_bot_runs`），
+          那时两条成绩都在，玩家再跑这条赛道才会拿到对手幽灵。
         """
         tid = int(tid)
-        opp_ms = _pvp_ghost_time(tid)
-        rec = _mine.get(tid) or {}
-        try:
-            my_score = int(rec.get("score") or 0)
-        except (TypeError, ValueError):
-            my_score = 0
-        if my_score > 0:
-            my = _pvp_track_result(_pvp_time_of_score(my_score),
-                                   _pvp_faults_of_score(my_score),
-                                   bike_data=(rec.get("bike_data") or bike))
-        else:
-            # 还没跑过 → 合成一个略慢于对手的成绩，让这条赛道一开始归对手
-            # （玩家一进来就有记录可挑战，而不是自己守着）。
-            my = _pvp_track_result(_pvp_slower_than(opp_ms), 0, bike_data=bike)
-        return {
+        out = {
             "track": tid,
             "bike": bike,
             # ★ `owner_change_time` 就是车种 ID：onStartRaceSent @0x5e59ec 读
@@ -1956,13 +1977,18 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
             #   写进 GameWorld+0x1efc；填 0 → UpgradeManager::getBike(0) 为 NULL →
             #   加载关卡时崩。
             "owner_change_time": bike,
-            # ★★ result_p1/result_p2 **必须发**：parseMatch 从 `score` 解出双方用时写进
-            #   PVPTrack+0x08（对手）+0x0C（自己），而 startRace @0x4fa22c 只按
-            #   `PVPTrack+0x0C != 0` 决定要不要下对手幽灵：不发 → /start_race 回来后
-            #   cmd 0x2c 分支直接 cbz 跳过 → 比赛里没有幽灵（m05071 根因）。
-            "result_p1": my,
-            "result_p2": _pvp_track_result(opp_ms, 0, bike_data=bike),
         }
+        for slot, pid in (("result_p1", profile_id), ("result_p2", opponent_id)):
+            rec = ((_m.get("results") or {}).get(pid) or {}).get(tid) or {}
+            try:
+                sc = int(rec.get("score") or 0)
+            except (TypeError, ValueError):
+                sc = 0
+            if sc > 0:
+                out[slot] = _pvp_track_result(_pvp_time_of_score(sc),
+                                              _pvp_faults_of_score(sc),
+                                              bike_data=(rec.get("bike_data") or bike))
+        return out
 
     # 两个槽用同一套票数/段位：parseMatch 收尾把「最后处理的那个槽」当自己、
     # 另一个当对手（见 server/tf_server.py 上方注释），两边都给才不会踩空。
@@ -2333,6 +2359,9 @@ def h_pvp_race(path, query, body, headers):
                     "bike_data": data.get("bike_data"),
                     "at": int(time.time()),
                 }
+            # ★ 人机「跑」同一条赛道（用户 m04586：谁跑了谁才有数据；一局开始谁都没有
+            #   记录，玩家跑完人机才有一条自己的成绩，两条一比自己算归属）。
+            _pvp_bot_runs(m, tid)
             # 归属变了 → 重置这条赛道的筹码累积起点
             # （用户 m04404：对手拿回赛道后，筹码累积速度重置，又从快开始变慢）。
             _who = _pvp_owner_of(m, tid)
