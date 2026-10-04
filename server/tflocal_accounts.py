@@ -16,7 +16,10 @@ Trials Frontier —— 本地账号系统 + 存档持久化
     data/sessions.json        会话票据 -> 账号
     data/save/<pid>/latest.json   该账号最近一次上传的存档
     data/save/<pid>/history/<ts>.json   历史快照（保留最近 N 份）
-    data/ghosts/<track>/<name>.bin      上传/内置的幽灵文件
+    data/ghosts/<track>/<name>.bin      内置/抓取到的幽灵文件（原始字节）
+    data/ghosts/index.json              幽灵仓库索引（contentId -> 元数据）
+    data/ghosts/store/<id>.bin          客户端上传的幽灵二进制
+    data/ghosts/replays.json            replay_id 登记（谁在哪条赛道跑了多少）
 
 授权头格式（实测）：
     Authorization: Ubi_v1 t=<base64("user:pass")>          ← 用户名密码登录
@@ -857,6 +860,27 @@ def restore_save(profile_id, ts):
 
 
 # ------------------------------------------------------------------ 幽灵
+# 两层存储，各有来历：
+#
+#   1) 「按赛道放文件」的老目录  data/ghosts/<track>/<name>.bin
+#      从原版设备上抓来的内置幽灵（别人的最好线路）就放在这里。resultservice
+#      那几个直接回原始字节的端点优先读它。文件格式见 data/ghosts/README.md。
+#
+#   2) 新的 userstorage v2 内容仓库  data/ghosts/store/<id>.bin + data/ghosts/index.json
+#      客户端上传**自己的**幽灵时走这条链（实测顺序）：
+#        POST /public/userstorage/v2/content/ghost          建容器 -> 必须回真实 contentId
+#        PUT  /public/userstorage/v2/content/ghost/<id>/payload   传二进制
+#        PUT  /public/userstorage/v2/content/ghost/<id>           更新 metadata
+#      服务器的 create 响应如果不带 contentId，客户端就一路用 id=0（实测踩过），
+#      下发给别人时也就查不到。所以这里必须分配并持久化真实 id。
+GHOST_STORE = os.path.join(GHOST_DIR, "store")
+GHOST_INDEX = os.path.join(GHOST_DIR, "index.json")
+GHOST_REPLAYS = os.path.join(GHOST_DIR, "replays.json")
+
+# 实测客户端会给 players 发 "0" 表示「不限玩家」。
+GHOST_ANY_PLAYERS = ("", "0", "-1", "any", "all", "null")
+
+
 def ghost_dir(track_id):
     return os.path.join(GHOST_DIR, str(track_id))
 
@@ -884,3 +908,347 @@ def load_ghost(track_id, name):
         with open(p, "rb") as f:
             return f.read()
     return None
+
+
+def _load_ghosts():
+    obj = _load(GHOST_INDEX, None)
+    if not isinstance(obj, dict):
+        obj = {}
+    if not isinstance(obj.get("items"), dict):
+        obj["items"] = {}
+    try:
+        obj["next_id"] = max(1, int(obj.get("next_id") or 1))
+    except Exception:
+        obj["next_id"] = 1
+    return obj
+
+
+def _save_ghosts(obj):
+    _store(GHOST_INDEX, obj)
+
+
+def ghost_probe(blob):
+    """读幽灵文件头（0x00 version / 0x04 tag / 0x08 解压后长度 / 0x10 zlib）。
+
+    只解压前 20 字节就够拿到「这次跑的时间」和帧数，不用整段解压。
+    返回 (drive_time, tag, frames)；不是幽灵文件就返回 (None, None, None)。
+    """
+    import struct
+    import zlib
+
+    if not blob or len(blob) < 20 or blob[:4] != b"\x03\x00\x00\x00":
+        return None, None, None
+    tag = struct.unpack_from("<I", blob, 4)[0]
+    try:
+        d = zlib.decompressobj()
+        head = d.decompress(blob[16:], 32)
+    except Exception:
+        return None, tag, None
+    if len(head) < 0x0C:
+        return None, tag, None
+    drive_time = struct.unpack_from("<I", head, 0x04)[0]
+    frames = struct.unpack_from("<I", head, 0x08)[0]
+    return int(drive_time), int(tag), int(frames)
+
+
+def _legacy_ghost_files():
+    """扫描 data/ghosts/<track>/*.bin，产出 (track_id, 相对 data 的路径, 绝对路径)。"""
+    out = []
+    if not os.path.isdir(GHOST_DIR):
+        return out
+    for name in sorted(os.listdir(GHOST_DIR)):
+        d = os.path.join(GHOST_DIR, name)
+        if not os.path.isdir(d) or name in ("store", "inbox"):
+            continue
+        if not name.isdigit() or int(name) <= 0:
+            continue
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".bin"):
+                p = os.path.join(d, fn)
+                out.append((int(name), os.path.relpath(p, DATA).replace("\\", "/"), p))
+    return out
+
+
+def ghost_sync_legacy():
+    """把老目录里的内置幽灵登记进新仓库（只登记一次，用 relpath 记录来源）。"""
+    with _LOCK:
+        obj = _load_ghosts()
+        items = obj["items"]
+        known = set()
+        for rec in items.values():
+            if rec.get("legacy_path"):
+                known.add(rec["legacy_path"])
+        added = 0
+        for track, rel, p in _legacy_ghost_files():
+            if rel in known:
+                continue
+            try:
+                with open(p, "rb") as f:
+                    blob = f.read()
+            except OSError:
+                continue
+            drive_time, tag, frames = ghost_probe(blob)
+            cid = int(obj["next_id"])
+            obj["next_id"] = cid + 1
+            items[str(cid)] = {
+                "contentId": cid,
+                "track_id": track,
+                "owner": "6f857655",
+                "metadata": {
+                    "track_id": track,
+                    "drive_time": drive_time or 0,
+                    "checksum": tag or 0,
+                    "version": 79401,
+                },
+                "drive_time": drive_time or 0,
+                "checksum": tag or 0,
+                "version": 79401,
+                "created": int(time.time()),
+                "updated": int(time.time()),
+                "legacy_path": rel,
+                "frames": frames,
+                "builtin": True,
+            }
+            added += 1
+        if added:
+            _save_ghosts(obj)
+            print("[ghost] 登记内置幽灵 %d 个" % added, flush=True)
+        return added
+
+
+def _ghost_record(cid):
+    obj = _load_ghosts()
+    return obj["items"].get(str(cid))
+
+
+def ghost_get(cid):
+    return _ghost_record(cid)
+
+
+def ghost_create(track_id, owner, metadata):
+    """建幽灵容器，返回分配到的 contentId（必须回给客户端）。"""
+    md = dict(metadata) if isinstance(metadata, dict) else {}
+    if track_id is None:
+        try:
+            track_id = int(md.get("track_id"))
+        except Exception:
+            track_id = None
+    now = int(time.time())
+    with _LOCK:
+        obj = _load_ghosts()
+        cid = int(obj["next_id"])
+        obj["next_id"] = cid + 1
+        rec = {
+            "contentId": cid,
+            "track_id": track_id,
+            "owner": owner,
+            "metadata": md,
+            "drive_time": _as_int(md.get("drive_time")),
+            "checksum": _as_int(md.get("checksum")),
+            "version": _as_int(md.get("version")),
+            "pvpid": _as_int(md.get("pvpid")),
+            "created": now,
+            "updated": now,
+            "size": None,
+        }
+        obj["items"][str(cid)] = rec
+        _save_ghosts(obj)
+    return cid
+
+
+def _as_int(v):
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def ghost_update(cid, metadata, owner=None):
+    """更新 metadata。
+
+    ⚠ 客户端 updateMetaData 的 body 里**没有 track_id**（实测
+    `{"metadata":{"drive_time":..,"checksum":..,"version":..}}`），
+    所以这里做合并，绝不能把 create 时记下的 track_id 抹掉。
+    """
+    with _LOCK:
+        obj = _load_ghosts()
+        rec = obj["items"].get(str(cid))
+        if rec is None:
+            return None
+        md = dict(metadata) if isinstance(metadata, dict) else {}
+        merged = dict(rec.get("metadata") or {})
+        merged.update(md)
+        rec["metadata"] = merged
+        if merged.get("track_id") is not None:
+            try:
+                rec["track_id"] = int(merged["track_id"])
+            except Exception:
+                pass
+        for key in ("drive_time", "checksum", "version", "pvpid"):
+            val = _as_int(merged.get(key))
+            if val is not None:
+                rec[key] = val
+        if owner:
+            rec["owner"] = owner
+        rec["updated"] = int(time.time())
+        _save_ghosts(obj)
+    return rec
+
+
+def ghost_put_payload(cid, blob):
+    rec = _ghost_record(cid)
+    if rec is None:
+        return None
+    os.makedirs(GHOST_STORE, exist_ok=True)
+    tmp = os.path.join(GHOST_STORE, "%s.bin.tmp" % cid)
+    with open(tmp, "wb") as f:
+        f.write(blob)
+    os.replace(tmp, os.path.join(GHOST_STORE, "%s.bin" % cid))
+    drive_time, tag, frames = ghost_probe(blob)
+    with _LOCK:
+        obj = _load_ghosts()
+        rec = obj["items"].get(str(cid))
+        if rec is None:
+            return None
+        rec["size"] = len(blob)
+        rec["stored"] = True
+        rec["frames"] = frames
+        rec["payload_drive_time"] = drive_time
+        rec["updated"] = int(time.time())
+        # 二进制头里的时间比 metadata 更权威（metadata 是上传前算的）。
+        if drive_time:
+            rec["drive_time"] = drive_time
+            md = dict(rec.get("metadata") or {})
+            md["drive_time"] = drive_time
+            rec["metadata"] = md
+        _save_ghosts(obj)
+    return rec
+
+
+def ghost_payload(cid):
+    """取幽灵二进制。新仓库优先，内置幽灵回落到老目录里的文件。"""
+    rec = _ghost_record(cid)
+    if rec is None:
+        return None
+    p = os.path.join(GHOST_STORE, "%s.bin" % cid)
+    if os.path.isfile(p):
+        with open(p, "rb") as f:
+            return f.read()
+    rel = rec.get("legacy_path")
+    if rel:
+        q = os.path.join(DATA, rel.replace("/", os.sep))
+        if os.path.isfile(q):
+            with open(q, "rb") as f:
+                return f.read()
+    return None
+
+
+def ghost_delete(cid):
+    with _LOCK:
+        obj = _load_ghosts()
+        rec = obj["items"].pop(str(cid), None)
+        if rec is not None:
+            _save_ghosts(obj)
+    p = os.path.join(GHOST_STORE, "%s.bin" % cid)
+    if os.path.isfile(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return rec
+
+
+def ghost_search(track_id=None, players=None, limit=1, drive_time=None):
+    """幽灵检索。返回按「该优先给谁」排好序的记录列表。
+
+    排序口径：请求方点名的玩家排前面，其次按时间接近度（给了 drive_time）
+    或按成绩快慢；内置幽灵垫后。`players` 一个都没命中时**回落到全部**——
+    单机离线只有自己一个人，严格过滤会导致永远查不到幽灵。
+    """
+    ghost_sync_legacy()
+    wanted = set()
+    if players:
+        for p in str(players).split(","):
+            p = p.strip().lower()
+            if p and p not in GHOST_ANY_PLAYERS:
+                wanted.add(p)
+    obj = _load_ghosts()
+    cands = []
+    for rec in obj["items"].values():
+        if track_id is not None and rec.get("track_id") != track_id:
+            continue
+        if not (rec.get("stored") or rec.get("legacy_path")):
+            continue          # 只有 metadata、没有二进制的容器不算
+        cands.append(rec)
+    if not cands:
+        return []
+    named = [r for r in cands
+             if wanted and str(r.get("owner") or "").lower() in wanted]
+    pool = named or cands
+
+    def sort_key(r):
+        if drive_time:
+            gap = abs((r.get("drive_time") or 0) - int(drive_time))
+        else:
+            gap = 0
+        return (0 if r in named else 1, gap, r.get("drive_time") or 0, r.get("contentId") or 0)
+
+    pool = sorted(pool, key=sort_key)
+    try:
+        n = max(1, int(limit))
+    except Exception:
+        n = 1
+    return pool[:n]
+
+
+def ghost_list(track_id=None):
+    ghost_sync_legacy()
+    obj = _load_ghosts()
+    out = []
+    for rec in obj["items"].values():
+        if track_id is not None and rec.get("track_id") != track_id:
+            continue
+        out.append(rec)
+    out.sort(key=lambda r: (r.get("track_id") or 0, r.get("drive_time") or 0))
+    return out
+
+
+def ghost_any_for_track(track_id):
+    """给 resultservice 那几个「回原始字节」的端点用：挑该赛道最好的一个。"""
+    rows = ghost_search(track_id=track_id, limit=1)
+    return rows[0] if rows else None
+
+
+# ------------------------------------------------------------ 回放登记（replay_id）
+def ghost_record_replay(profile_id, track_name, drive_time, faults=None, bike=None,
+                        client_ip=None):
+    """POST /public/resultservice/v1/replay_id —— 把「谁在哪条赛道跑了多少」记下来。
+
+    响应对客户端没有语义（它只当成功/失败），但记下来能对上后面上传的幽灵。
+    """
+    rec = {
+        "profile_id": profile_id,
+        "track_name": track_name,
+        "track_id": _as_int(str(track_name or "").replace("track", "")) or None,
+        "drive_time": _as_int(drive_time),
+        "faults": _as_int(faults),
+        "bike": _as_int(bike),
+        "client_ip": client_ip,
+        "ts": int(time.time()),
+    }
+    with _LOCK:
+        rows = _load(GHOST_REPLAYS, [])
+        if not isinstance(rows, list):
+            rows = []
+        rows.append(rec)
+        _store(GHOST_REPLAYS, rows[-500:])
+    return rec
+
+
+def ghost_replays(profile_id=None):
+    rows = _load(GHOST_REPLAYS, [])
+    if not isinstance(rows, list):
+        return []
+    if profile_id:
+        rows = [r for r in rows if r.get("profile_id") == profile_id]
+    return rows

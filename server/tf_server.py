@@ -395,43 +395,214 @@ FRIEND_NAMES = {
 # 说明幽灵是以「原始字节 + 长度」回调的，所以这里直接把 .bin 原样发回去。
 _GHOST_HINT = ("ghost", "replaydata")
 
+# 幽灵协议（反汇编 tmp/libcmp/orig-libTrialsGo.so 得到，见 notes）：
+#   tr::OnlineUserStorage 的资源名恒为 "ghost"，URL 模板 @0xb8c6d4 / 0xb8c6f4 /
+#   0xb8c71f / 0xb8c741：
+#     %s/%s/userstorage/v2/content/%s                建容器（POST，需回 contentId）
+#     %s/%s/userstorage/v2/content/%s/%d/payload     取/传二进制
+#     %s/%s/userstorage/v2/content/%s/%d             取/改/删 metadata
+#     %s/%s/userstorage/v2/search/%s/%s              按 tag 检索
+#   tag @0xb87a8e / 0xb87ab7 / 0xb87af4：
+#     get_ghost?track_id=%d&players=%s&limit=1
+#     get_ghost_timed?track_id=%d&players=%s&drive_time=%d&limit=1
+#     get_pvp_ghost?track_id=%d&players=%s&limit=1&pvpid=%d
+#   建容器的响应由 parseJsonResponse @0x578a08 解析，只认**顶层整型键 contentId**
+#   （@0xb87d21）；检索的响应由 GhostQueryObject::onQueryCompleted @0x508288 解析，
+#   要的是 {"contents":[{"contentId":<int>,"metadata":{...}}]}（contents @0xb87d18，
+#   metadata 必须是**对象**，字符串会让它按成员链表去读而崩）。
+_USERSTORAGE_RE = re.compile(r"^/public/userstorage/v2/(content|search)/ghost(?:/(.*))?$")
+
 
 def _looks_like_ghost(path):
     p = path.lower()
     return any(h in p for h in _GHOST_HINT)
 
 
-def h_ghost(path, query, body, headers):
+def _ghost_caller(headers):
+    """取调用者的 profileId（认不出就返回 None，不影响功能）。"""
+    try:
+        info, _err = acct.authenticate(headers)
+    except Exception:
+        info = None
+    if isinstance(info, dict):
+        return info.get("profileId")
+    return None
+
+
+def _ghost_metadata(body):
+    """客户端发的 body 是 {"metadata": {...}}；兼容直接给 metadata 的情况。
+
+    ⚠ 处理器拿到的 body 是**原始字节**（`_handle` 只读流、不做解析），
+    所以这里必须先自己 JSON 解析——踩过这个坑：不解析会静默拿到空元数据，
+    赛道号丢失，幽灵就永远检索不到。
+    """
+    if isinstance(body, (bytes, bytearray)):
+        body = _json_body(body)
+    if isinstance(body, dict):
+        md = body.get("metadata")
+        if isinstance(md, dict):
+            return md
+    return {}
+
+
+def h_userstorage(method, path, query, body, headers):
+    """userstorage v2 的幽灵内容仓库（客户端上传/检索自己的幽灵走这条）。"""
+    m = _USERSTORAGE_RE.match(path)
+    if not m:
+        return 200, {"Content-Type": "application/json"}, {"data": []}
+    kind, rest = m.group(1), (m.group(2) or "").strip("/")
     q = dict(parse_qsl(query, keep_blank_values=True))
-    track = q.get("track_id") or ""
-    if not track:
-        seg = path.rstrip("/").split("/")[-1]
-        if seg.isdigit():
-            track = seg
-    player = (q.get("player") or q.get("players") or "").split(",")[0].strip()
-    names = acct.list_ghosts(track) if track else []
-    if names:
-        pick = names[-1]
-        for n in names:                       # 优先匹配请求里点名的玩家
-            if player and player.lower().lstrip("0x") in n.lower():
-                pick = n
-                break
-        blob = acct.load_ghost(track, pick)
-        if blob:
-            print("[ghost] 赛道 %s -> %s (%d 字节)" % (track, pick, len(blob)), flush=True)
-            return 200, {"Content-Type": "application/octet-stream"}, blob
-    # 本地没有该赛道的幽灵：保持历史行为（客户端能安全消化 {"data": []}）
+    owner = _ghost_caller(headers)
+
+    if kind == "content":
+        parts = [p for p in rest.split("/") if p] if rest else []
+        cid = None
+        if parts and parts[0].lstrip("-").isdigit():
+            cid = int(parts[0])
+            tail = parts[1] if len(parts) > 1 else ""
+        else:
+            tail = ""
+
+        # POST /content/ghost —— 建容器，必须回真实 contentId
+        if method == "POST" and cid is None:
+            md = _ghost_metadata(body)
+            track = md.get("track_id")
+            try:
+                track = int(track) if track is not None else None
+            except Exception:
+                track = None
+            new_id = acct.ghost_create(track, owner, md)
+            print("[ghost] create 赛道 %s -> contentId=%d owner=%s"
+                  % (track, new_id, owner), flush=True)
+            return 200, {"Content-Type": "application/json"}, {"contentId": new_id}
+
+        if cid is None:
+            return 200, {"Content-Type": "application/json"}, {"data": []}
+
+        # PUT /content/ghost/<id>/payload —— 传二进制
+        if tail == "payload" and method == "PUT":
+            raw = body if isinstance(body, (bytes, bytearray)) else b""
+            rec = acct.ghost_put_payload(cid, bytes(raw))
+            if rec is None:
+                print("[ghost] payload id=%d 不存在，仍然接收（%d 字节）" % (cid, len(raw)),
+                      flush=True)
+                return 200, {"Content-Type": "application/json"}, {"contentId": cid}
+            print("[ghost] payload id=%d 赛道 %s %d 字节 drive_time=%s frames=%s"
+                  % (cid, rec.get("track_id"), len(raw), rec.get("drive_time"),
+                     rec.get("frames")), flush=True)
+            return 200, {"Content-Type": "application/json"}, {"contentId": cid}
+
+        # GET /content/ghost/<id>/payload —— 回二进制
+        if tail == "payload":
+            blob = acct.ghost_payload(cid)
+            if blob:
+                print("[ghost] 下发幽灵 id=%d (%d 字节)" % (cid, len(blob)), flush=True)
+                return 200, {"Content-Type": "application/octet-stream"}, blob
+            return 200, {"Content-Type": "application/json"}, {"data": []}
+
+        # PUT /content/ghost/<id> —— 更新 metadata（body 里没有 track_id，靠合并）
+        if method == "PUT" and not tail:
+            md = _ghost_metadata(body)
+            rec = acct.ghost_update(cid, md, owner)
+            if rec is None:
+                new_id = acct.ghost_create(None, owner, md)
+                print("[ghost] update id=%d 不存在，补建 contentId=%d" % (cid, new_id),
+                      flush=True)
+                return 200, {"Content-Type": "application/json"}, {"contentId": new_id}
+            print("[ghost] 更新 metadata id=%d 赛道 %s drive_time=%s"
+                  % (cid, rec.get("track_id"), rec.get("drive_time")), flush=True)
+            return 200, {"Content-Type": "application/json"}, {"contentId": cid}
+
+        if method == "DELETE" and not tail:
+            acct.ghost_delete(cid)
+            return 200, {"Content-Type": "application/json"}, {"data": []}
+
+        # GET /content/ghost/<id> —— 取 metadata
+        rec = acct.ghost_get(cid)
+        if rec:
+            return 200, {"Content-Type": "application/json"}, {
+                "contentId": cid,
+                "metadata": rec.get("metadata") or {},
+            }
+        return 200, {"Content-Type": "application/json"}, {"data": []}
+
+    # search/<tag>?...
+    tag = rest or ""
+    def _num(name, default=None):
+        try:
+            return int(q.get(name))
+        except Exception:
+            return default
+
+    track = _num("track_id")
+    limit = _num("limit", 1)
+    drive_time = _num("drive_time")
+    rows = acct.ghost_search(track_id=track, players=q.get("players"),
+                             limit=limit, drive_time=drive_time)
+    print("[ghost] search %s 赛道 %s players=%s -> %d 个"
+          % (tag, track, q.get("players"), len(rows)), flush=True)
+    return 200, {"Content-Type": "application/json"}, {
+        "contents": [{"contentId": r.get("contentId"),
+                      "metadata": r.get("metadata") or {}} for r in rows]
+    }
+
+
+def h_ghost(path, query, body, headers):
+    """resultservice 下的幽灵端点：这些回的是**原始幽灵字节**。
+
+    实测调用顺序（玩家跑完一条赛道）：
+      POST .../enhancestats/track<ID>            成绩落库
+      GET  .../replaydata?track_id=<ID>          问「服务器上有没有我这条赛道的回放」
+      （随后客户端才走 userstorage 上传幽灵，见 h_userstorage）
+    所以 replaydata 的 query 形式**故意继续回 {"data": []}**：这是在问
+    「有没有」，回「没有」客户端才会老老实实把新幽灵传上来。真正的下载走
+    userstorage 的 search/content，以及 replaydata 的路径形式。
+    """
+    q = dict(parse_qsl(query, keep_blank_values=True))
+    seg = path.rstrip("/").split("/")[-1]
+    track = q.get("track_id") or (seg if seg.isdigit() else "")
+    tracking = int(track) if str(track).isdigit() else None
+
+    if "/replaydata" in path and not seg.isdigit() and q.get("track_id"):
+        return 200, {"Content-Type": "application/json"}, {"data": []}
+
+    if tracking:
+        rec = acct.ghost_any_for_track(tracking)
+        if rec:
+            blob = acct.ghost_payload(rec.get("contentId"))
+            if blob:
+                print("[ghost] %s 赛道 %s -> contentId=%s (%d 字节)"
+                      % (path, tracking, rec.get("contentId"), len(blob)), flush=True)
+                return 200, {"Content-Type": "application/octet-stream"}, blob
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
 
 def h_ghost_upload(path, query, body, headers):
-    """客户端核对/上报幽灵时把二进制塞进来，落盘备用。"""
+    """PUT .../payload 之外落单的二进制上传（老路径），落盘到 inbox 备用。"""
     q = dict(parse_qsl(query, keep_blank_values=True))
     track = q.get("track_id") or ""
     raw = body if isinstance(body, (bytes, bytearray)) else b""
     if track and raw[:4] == b"\x03\x00\x00\x00":
-        p = acct.store_ghost(track, "upload_%s_%d.bin" % (q.get("player", "anon")[:12], int(time.time())), bytes(raw))
+        p = acct.store_ghost(track, "upload_%s_%d.bin"
+                             % (q.get("player", "anon")[:12], int(time.time())), bytes(raw))
         print("[ghost] 收到上传 赛道 %s -> %s (%d 字节)" % (track, p, len(raw)), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"data": []}
+
+
+def h_replay_id(path, query, body, headers):
+    """POST /public/resultservice/v1/replay_id —— 登记「谁在哪条赛道跑了多少」。"""
+    b = _json_body(body)
+    client_ip = None
+    try:
+        client_ip = headers.get("_client_ip") or headers.get("X-Real-IP")
+    except Exception:
+        pass
+    rec = acct.ghost_record_replay(b.get("profile_id"), b.get("track_name"),
+                                   b.get("drive_time"), b.get("faults"), b.get("bike"),
+                                   client_ip)
+    print("[ghost] replay_id %s %s %s ms" % (rec.get("profile_id"),
+                                             rec.get("track_name"), rec.get("drive_time")),
+          flush=True)
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
 
@@ -904,7 +1075,15 @@ def pick_dynamic(method, path):
             return fn, "dyn:%s %s" % (m, p)
     if method == "POST" and path.startswith("/public/resultservice/v1/enhancestats/"):
         return h_result_stats, "dyn:result-stats"
-    # 幽灵：resultservice 下的 ghost / replaydata（GET 取幽灵，POST 上传幽灵）
+    # 幽灵：userstorage v2 的内容仓库（客户端上传/检索自己的幽灵）。
+    # 这一个处理器要按 HTTP 方法分派建/取/改/删，所以把 method 绑进去。
+    if path.startswith("/public/userstorage/v2/"):
+        return (lambda p, q, b, h: h_userstorage(method, p, q, b, h)), "dyn:userstorage-ghost"
+    # 幽灵：resultservice 下的 ghost / replaydata / replay_id
+    # （replay_id 这条路径里不含 ghost/replaydata 字样，必须单独先判，
+    #   否则会掉进 resultservice 的通配规则里，登记就丢了）
+    if path.endswith("/replay_id") and path.startswith("/public/resultservice/"):
+        return h_replay_id, "dyn:replay-id"
     if _looks_like_ghost(path) and path.startswith("/public/resultservice/"):
         return (h_ghost_upload if method == "POST" else h_ghost), "dyn:ghost"
     for m, prefix, fn in DYNAMIC:
@@ -1232,14 +1411,23 @@ class Handler(BaseHTTPRequestHandler):
             out = {}
             if os.path.isdir(root):
                 for t in sorted(os.listdir(root)):
+                    if t in ("store", "inbox") or not os.path.isdir(os.path.join(root, t)):
+                        continue
                     out[t] = acct.list_ghosts(t)
-            return js({"ghosts": out})
+            store = [{"contentId": r.get("contentId"), "track_id": r.get("track_id"),
+                      "owner": r.get("owner"), "drive_time": r.get("drive_time"),
+                      "frames": r.get("frames"), "size": r.get("size"),
+                      "builtin": bool(r.get("builtin")), "stored": bool(r.get("stored"))}
+                     for r in acct.ghost_list()]
+            return js({"ghosts": out, "store": store,
+                       "replays": acct.ghost_replays()[-20:],
+                       "note": "ghosts=<赛道>/内置文件；store=客户端上传的内容仓库"})
         if path == "/__help":
             return js({"endpoints": ["/__ping", "/__log", "/__accounts", "/__devices",
                                      "/__sessions", "/__saves", "/__save?profile=<pid>",
                                      "/__history?profile=<pid>",
                                      "/__restore?profile=<pid>&ts=<时间戳|latest>",
-                                     "/__ghosts",
+                                     "/__ghosts（内置幽灵文件 + 上传的幽灵仓库 + replay_id 登记）",
                                      "/__leaderboards（排行榜落库与主榜聚合）",
                                      "/__register（注册网页，也可用 /__ui）",
                                      "POST /__api/register {username,password,nameOnPlatform}",

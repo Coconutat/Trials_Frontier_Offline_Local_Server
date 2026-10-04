@@ -222,12 +222,22 @@ Tapjoy 广告墙、AdMob 插屏/激励视频、Flurry、AdColony 全部不会再
 | `POST /v3/profiles/sessions`（登录） | **真实现 + 登录固化**。响应里必须带 `rememberMeTicket`，客户端会把它存进安全存储，下次启动静默换会话，不必再手输账号 |
 | `POST /public/resultservice/v1/enhancestats/track<ID>` | **真实现**。真实跑图成绩落库，按「账号 + 赛道」唯一，只保留更快的 `drivetime` |
 | `GET /public/playerstats/v1/ranking/<board>`、`.../stats/<board>` | **真实现**。赛道榜读落库数据；`global_stats` / `global_stats_donkey` 由赛道记录**实时聚合**（不落库），没跑过的赛道与账号不会出现 |
+| `POST /public/resultservice/v1/enhancestats/batch_update` | **真实现**。逐条取 `stats.drivetime > 0` 的更新入库（`drivetime` 为 0 的是「解锁但没跑」的占位行，必须丢） |
+| `POST /public/userstorage/v2/content/ghost` | **真实现**。建幽灵容器并回 `{"contentId": N}`（客户端拿它当后续 PUT/GET 的 id；回空数组会退化成 id 0） |
+| `PUT /public/userstorage/v2/content/ghost/<N>/payload` | **真实现**。收幽灵二进制本体（`application/octet-stream`），写 `data/ghosts/store/<N>.bin` |
+| `PUT /public/userstorage/v2/content/ghost/<N>` | **真实现**。metadata **合并**（该请求体里没有 `track_id`，覆盖会丢赛道号） |
+| `GET /public/userstorage/v2/search/ghost/get_ghost`（及 `_timed` / `get_pvp_ghost`）| **真实现**。回 `{"contents":[{"contentId":N,"metadata":{…}}]}`；没有候选回 `{"contents":[]}`。`metadata` 必须是 JSON 对象 |
+| `GET /public/userstorage/v2/content/ghost/<N>/payload` | **真实现**。按 id 回幽灵二进制 |
+| `GET /public/resultservice/v1/replaydata/<track_id>`、`robot_replaydata`、`pvp_replaydata` | **真实现**。按 `track_id` 找幽灵，原样二进制发回 |
+| `GET /public/resultservice/v1/replaydata?track_id=<ID>` | **故意回 `{"data": []}`**。它是 `submitGhost` 的上传前检查（问「服务器上有没有我的回放」），回「有」客户端就不传了 |
+| `POST /public/resultservice/v1/replay_id` | **真实现**。登记「谁在哪条赛道交过幽灵」，供检索与对手挑选 |
 | 其它任何请求 | 兜底 200 `{}` |
 
 想看游戏到底在请求什么：
 
 * 浏览器打开 `http://127.0.0.1:8000/__log` → 最近 100 条请求的完整记录。
 * `http://127.0.0.1:8000/__leaderboards` → 落库的每条赛道记录 + 主界面总榜的聚合结果。
+* `http://127.0.0.1:8000/__ghosts` → 幽灵索引、仓库文件、最近的 `replay_id` 登记。
 * 或者看 `work/trials-frontier/notes/server-log.jsonl`（每行一条 JSON，含请求头/请求体/响应体/耗时）。
 * `http://127.0.0.1:8000/__ping` → `pong`，用来确认服务器活着。
 
@@ -247,6 +257,8 @@ Tapjoy 广告墙、AdMob 插屏/激励视频、Flurry、AdColony 全部不会再
 * **联机功能部分可用**（官方早已停服，这些全是本地服务器自己造的）：
   **排行榜已通** —— 你真实跑过的赛道会落库，主界面大榜单由这些真实成绩聚合而成；
   没跑过的赛道、以及没有真实成绩的两个假好友都不会出现在榜单里。
+  **幽灵已通** —— 跑完一场比赛客户端会把幽灵上传到服务器的 `contentId` 仓库，
+  比赛时服务器再把幽灵下发给客户端（详见 8.3 / 9.3）。
   好友/邮件/社交仍是返回空数据或少数写死的假数据；碉堡、午夜杯、限时周赛还没做。
 * 服务器是**开发用桩**，不适合直接暴露到公网。
 
@@ -307,27 +319,39 @@ https://s3.amazonaws.com/frontieronlinecontent/<offer_id>.png
 > **还活着**（来自 `/data/data/<pkg>/files/request.json`，305198 字节，md5 一致），
 > 但里面只有交叉推广素材（6 张图 + 3 个 HTML），不是 offer 图。
 
-### 8.3 仍然缺：幽灵（Ghost / 对手回放）
+### 8.3 幽灵（Ghost / 对手回放）——已实现
 
-幽灵和排行榜都挂在 `resultservice` / `playerstats` 下，端点已经全部定位（见
-`work/trials-frontier/notes/online-endpoints.md`）：
+幽灵真正的协议**不在 `resultservice` 下**，而是走 `userstorage/v2` 的内容仓库
+（`tr::OnlineUserStorage`）。从 `libTrialsGo.so` 里解出来的完整链路是：
 
 ```
-<base>/<ns>/resultservice/v1/robot_replaydata?track_id=%d&time=%d&player=%s   ← 幽灵本体
-<base>/<ns>/resultservice/v1/get_ghost?track_id=%d&players=%s&limit=1
-<base>/<ns>/resultservice/v1/get_ghost_timed?track_id=%d&players=%s&drive_time=%d&limit=1
-<base>/<ns>/resultservice/v1/get_pvp_ghost?track_id=%d&players=%s&limit=1&pvpid=%d
-<base>/<ns>/playerstats/v1/ranking/%s?range=%d,%d
-<base>/<ns>/playerstats/v1/ranking/%s?players=<pid,pid,…>      ← 好友榜
-<base>/<ns>/pvp/v1/opponent?leaderboard=%d
+# 上传（跑完一场比赛后客户端自动走这条链，4 步）
+POST /public/userstorage/v2/content/ghost              body={"metadata":{"track_id":T,"drive_time":D,"checksum":C,"version":V}}
+     ← 必须回 {"contentId": N}，客户端拿它当容器 id；回空数组就会一路用 id 0
+PUT  /public/userstorage/v2/content/ghost/<N>/payload  body=幽灵二进制裸数据（首 4 字节 03 00 00 00）
+PUT  /public/userstorage/v2/content/ghost/<N>          body={"metadata":{"drive_time":D,"checksum":C,"version":V}}
+     # 注意：这一步没有 track_id，服务器必须做「合并」而不是覆盖，否则赛道号会丢
+POST /public/resultservice/v1/replay_id                body={"profile_id":…,"track_name":"track100","drive_time":…,"faults":…,"bike":…}
+
+# 下载（比赛时取幽灵）
+GET /public/userstorage/v2/search/ghost/get_ghost?track_id=T&players=<csv>&limit=1
+     ← 回 {"contents":[{"contentId":N,"metadata":{…原样回显…}}]}；没有就回 {"contents":[]}
+GET /public/userstorage/v2/search/ghost/get_ghost_timed?track_id=T&players=<csv>&drive_time=D&limit=1
+GET /public/userstorage/v2/search/ghost/get_pvp_ghost?track_id=T&players=<csv>&limit=1&pvpid=P
+GET /public/userstorage/v2/content/ghost/<N>/payload   ← 幽灵二进制本体
+GET /public/resultservice/v1/replaydata/<track_id>     ← 匿名幽灵的另一条路
 ```
 
-本地幽灵文件形态：`ghost_%x_%d.bin`（`%x` = 玩家 online-id 哈希，`%d` = 赛道 id），
-设备上实测有 `ghost_0_1024.bin`、`ghost_6f857655_1041.bin` 等 14 个，在
-`/data/data/<pkg>/files/` 下。
+`replaydata?track_id=<ID>`（**查询式**）**故意保持回 `{"data":[]}`**：xref 显示它被
+`OnlineGhostManager::submitGhost` 内部引用，是「服务器上有没有我这条赛道的回放」的
+**上传前检查**——回「有」客户端就不传了。真正下发给客户端的是**路径式**
+`replaydata/<track>`（`getGhostAnonymous`）。
 
-**还没有实现**：这些端点现在返回兜底 `{"data": []}`，所以游戏里没有幽灵、没有排行榜名次。
-要做的话得先搞清 `robot_replaydata` 的响应二进制格式。
+`metadata` 必须是 JSON **对象**：`GhostQueryObject::onQueryCompleted` 会把
+`[metadata_value+0x10]` 当成员链表头继续读，传字符串会读到野指针。
+
+幽灵文件形态：`ghost_%x_%d.bin`（`%x` = 玩家 online-id 哈希，`%d` = 赛道 id），
+游戏自己用的命名。服务器的新仓库不按文件名存，改用 `contentId` 索引。
 
 ### 8.4 关于「数据包不完整」的实测结论
 
@@ -359,7 +383,11 @@ https://s3.amazonaws.com/frontieronlinecontent/<offer_id>.png
 | `data/sessions.json` | 已签发的会话票据（保留最近 200 张） |
 | `data/save/<profileId>/latest.json` | 该账号最近一次上报的存档 |
 | `data/save/<profileId>/history/<时间戳>.json` | 历史存档（保留最近 20 份） |
-| `data/ghosts/<赛道id>/*.bin` | 幽灵文件（见 9.3） |
+| `data/ghosts/<赛道id>/*.bin` | 内置幽灵文件（见 9.3，服务器启动后会自动登记进索引） |
+| `data/ghosts/index.json` | 幽灵索引：`{next_id, items{<contentId>: {track_id, owner, metadata, size, frames, builtin, stored}}}` |
+| `data/ghosts/store/<contentId>.bin` | 客户端上传的幽灵本体（`contentId` 由服务器分配） |
+| `data/ghosts/replays.json` | `replay_id` 登记（谁在哪条赛道交过幽灵，保留最近 500 条） |
+| `data/ghosts/inbox/` | 没有匹配到容器的、落单的二进制上传（运行期诊断用） |
 
 * **登录怎么走**：客户端把 `用户名:口令` base64 后放进
   `Authorization: Ubi_v1 t=<base64>`，POST 到 `/v1/profiles/sessions` 或
@@ -454,25 +482,35 @@ POST /public/playerprogress/v1/progress
 验证：`ghost_6f857655_1041.bin` 里 @0x04 = 0x6438 = **25656 毫秒**，
 和存档 `highscores2` 里赛道 1041 的成绩 `25656` 一模一样 ⇒ 确认这个字段就是成绩。
 
-服务器怎么用：
+服务器怎么用（两条路都通了）：
 
-* 游戏请求 `GET /public/resultservice/v1/.../robot_replaydata?track_id=..&time=..&player=..`
-  （以及 `get_ghost` / `get_ghost_timed` / `get_pvp_ghost`）时，
-  服务器按 `track_id` 去 `data/ghosts/<赛道id>/` 里挑一个 `.bin`，**原样二进制发回**
-  （`Content-Type: application/octet-stream`）。
+* **新路（`contentId` 仓库）**：客户端 `POST /public/userstorage/v2/content/ghost`
+  建容器 → 服务器回 `{"contentId": N}` 并把 create 时的 metadata（含 `track_id`）
+  和 N 绑定 → 客户端 `PUT .../ghost/N/payload` 传本体、`PUT .../ghost/N` 补 metadata
+  （**合并**，不能覆盖，否则 `track_id` 丢）→
+  比赛时 `GET /public/userstorage/v2/search/ghost/get_ghost?track_id=T&players=<csv>`
+  由服务器回 `{"contents":[{"contentId":N,"metadata":{…}}]}`，客户端再
+  `GET .../ghost/N/payload` 取本体。
+* **老路（内置文件）**：`GET /public/resultservice/v1/replaydata/<赛道id>`
+  （`getGhostAnonymous`）与 `robot_replaydata` 按 `track_id` 去
+  `data/ghosts/<赛道id>/` 挑一个 `.bin` **原样二进制发回**（`application/octet-stream`）。
   依据：`tr::OnlineGhostManagerListener::onGhostReceived(TR_ONLINE_ERROR,int,void*,int,int)`
   和 `submitGhost(..., void*, ...)` 都是"原始字节 + 长度"。
-* 目录里没有该赛道的文件 → 退回 `{"data": []}`（和以前一样，客户端能安全消化）。
-* 如果游戏反过来上传幽灵（POST），前 4 字节是 `03 00 00 00` 就会被存进库里。
+* 目录里没有该赛道的文件 → 退回 `{"data": []}`（客户端能安全消化）。
+* 索引完 `data/ghosts/index.json` 里的记录会优先于老文件；老目录改动靠
+  `ghost_sync_legacy()` 在每次检索时增量登记，**不用重启**。
+
+`players=<csv>` 过滤的注意点：单机离线环境下**永远只有自己一个玩家 id**，所以
+服务器在「按 players 过滤后一个都没命中」时会回落到全部候选幽灵，否则竞速永远
+没有对手。只有真的命中了某个指定玩家才会收紧。
 
 **现在库里有什么**：`data/ghosts/1041/` 和 `data/ghosts/66633/` 各有一个
-真的从原版游戏设备上抓下来的**别人的**幽灵（`ghost_6f857655_*.bin`）。
+真的从原版游戏设备上抓下来的**别人的**幽灵（`ghost_6f857655_*.bin`），
+服务器启动后第一次检索时会把它们登记进索引（`builtin: true`）。
 想加更多：把 `.bin` 丢进 `data/ghosts/<赛道id>/` 就行，不用重启。
 
-**还没做的**：`OnlineGhostManager::getGhost` 那条链不走 URL，走的是育碧的
-`userstorage/v2/*` 协议（`/userstorage/v2/search/...`、`/userstorage/v2/content/.../payload`），
-要先把那套协议实现了才能在"排行榜/好友成绩"里看到别人的幽灵。
-现在排行榜页还是显示"没人做出成绩"。
+排障：`curl http://127.0.0.1:8000/__ghosts` 能看到索引、仓库文件和最近的
+`replay_id` 登记。
 
 ### 9.4 已知不足（老实说）
 
@@ -487,8 +525,9 @@ POST /public/playerprogress/v1/progress
 | 账号 / 密码 / 票据 | ✅ 完成 |
 | 存档上传落盘 | ✅ 完成 |
 | 存档自动恢复下发 | ⚠️ 代码在（`?download=1`），默认关着，因为响应形状没验证 |
-| 幽灵文件格式 / 回放数据下发 | ✅ 完成 |
-| 排行榜 / 好友成绩页 | ❌ 需要 `userstorage/v2` 协议 |
+| 幽灵文件格式 / 回放数据下发 | ✅ 完成（上传/检索/下发全链路）|
+| 幽灵 `userstorage/v2/*` 协议 | ✅ 完成（`contentId` 契约 + `contents` 数组）|
+| 排行榜 / 好友成绩页 | ✅ 完成（真实成绩落库 + 主榜实时聚合）|
 | 商店/offer 图片 | ⚠️ 原始素材在原育碧 S3 上已永久丢失（`NoSuchBucket`），服务器改成发占位图 |
 
 ---

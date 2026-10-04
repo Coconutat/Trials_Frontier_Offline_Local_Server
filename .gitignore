@@ -30,3 +30,10 @@ server/data/leaderboards.json
 server/data/save/
 # 从设备抓下来的幽灵二进制（游戏数据）；ghosts/README.md 保留
 server/data/ghosts/**/*.bin
+
+# ── 幽灵仓库（userstorage v2）的运行期状态 ─────────────────
+# 客户端上传的幽灵内容、分配过的 contentId、replay_id 登记，
+# 都属于玩家运行期数据，不入库。
+server/data/ghosts/index.json
+server/data/ghosts/replays.json
+server/data/ghosts/inbox/

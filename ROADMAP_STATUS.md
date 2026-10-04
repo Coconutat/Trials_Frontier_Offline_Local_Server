@@ -1,7 +1,7 @@
 # ROADMAP 进度与任务规划
 
 > 对应根目录 [`ROADMAP.md`](ROADMAP.md)。本文档记录每一条的**当前完成度、证据、缺口、下一步动作**。
-> 最后更新：2026-10-04 19:10（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
+> 最后更新：2026-10-04 19:25（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
 
 ---
 
@@ -12,7 +12,7 @@
 | 1 | 修复 APK 启动 BUG（联网闪退） | ✅ **已修复并实机验证（m14/m15）** | 100% |
 | 2 | 修复账号管理（注册 / 登录分离） | ✅ **已实现并 curl 实测（含内置注册页）** | 85% |
 | 2b | VIP 下发（买了 VIP 就激活 VIP 事件） | ✅ **已实机验证（m16）** | 100% |
-| 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **排行榜已真实落库 + 主榜聚合；限时活动/碉堡/午夜杯待做** | 40% |
+| 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **排行榜 + 幽灵已通；限时活动/碉堡/午夜杯待做** | 55% |
 | 4 | WebUI 管理界面 | 🟡 **已起头：`/__ui` 注册页 + `/__api/*`** | 15% |
 | 5 | 一键开服打包成 exe | ⚪ 未开始 | 0% |
 
@@ -207,29 +207,48 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
   `resultservice`（幽灵）、`playerstats/v1/ranking/*`（排行榜）、`pvp_matches/v1/*`、
   `liveevents/v1/weekly_track_system/*`、`gift/v1/*`、`friends/v1/update`、
   `playerprogress/v1/*`、`receiptvalidation/v1/*`、`timeservice`、`targeting`、`pushnotification` 等，未命中的走 `*` 兜底 200。
-- **幽灵对手**：文件格式已解出（前 4 字节 `03 00 00 00`），
-  `server/data/ghosts/<trackId>/<name>.bin` 存真数据；
-  `h_ghost` 对 `GET /public/resultservice/v1/{robot_replaydata,get_ghost,get_ghost_timed}` 返回
-  `200 + application/octet-stream` 原始字节；`h_ghost_upload` 校验 magic 后落盘。
+- **幽灵对手（全链路已通）**：文件格式已解出（前 4 字节 `03 00 00 00`），
+  上传走 `userstorage/v2` 的 `contentId` 仓库、下载走
+  `userstorage/v2/search/ghost/get_ghost` 与 `resultservice/v1/replaydata/<track>`；
+  `server/data/ghosts/` 下同时保留内置 `.bin` 与客户端上传的 `store/<contentId>.bin`。
+  细节见下面「缺口 → 幽灵 userstorage 协议」一节的实现说明（该缺口已关闭）。
 - **真钱内购（IAP）完整破解** ✅ 已实机验证（见 §3.1）。
 - **广告**：native 侧 `AdInterface::initAndroid()` 短路，Tapjoy/AdMob/Flurry/AdColony 全部不加载；
   logcat 实测广告相关 0 条。服务端遥测也已打桩。
 - **反作弊**：`tr::AntiCheating::isValid()` 恒返回 true；`MenuzStateMain::isUserBlackListed()` 恒 0。
 
 ### 缺口
-- **幽灵的 `userstorage/v2/*` 链没做**：`OnlineGhostManager::getGhost/getGhostMetaData` 走的是
-  `%s/%s/userstorage/v2/search/%s/%s`@`0xb8c71f`、`content/%s/%d`@`0xb8c741`、
-  `content/%s/%d/payload`@`0xb8c700`（`payloadUploadUrl`@`0xb8c77a`、`downloadUrls`@`0xb8c78b`）。
-  这是"从排行榜下载别人幽灵"的正路，目前只覆盖了 `resultservice` 那条。
+- **幽灵的 `userstorage/v2/*` 链已实现**（2026-10-04 补）：
+  - **根因**：`POST /public/userstorage/v2/content/ghost` 的响应由
+    `tr::OnlineUserStorage::parseJsonResponse` @`0x578a08` 解析，**只认顶层整型键 `contentId`**。
+    以前一律回 `{"data": []}` ⇒ 客户端拿不到 id ⇒ 退化成一路 `PUT /content/ghost/0/payload`，
+    于是所有幽灵都撞在同一个 id 上、也检索不出来。
+  - **上传链**：create 回 `{"contentId": N}` → `PUT .../ghost/N/payload` 存本体 →
+    `PUT .../ghost/N` 补 metadata（**该请求体里没有 `track_id`，必须做字段合并**）→
+    `POST /public/resultservice/v1/replay_id` 登记。
+  - **下载链**：`GET /public/userstorage/v2/search/ghost/get_ghost?track_id=T&players=<csv>&limit=1`
+    回 `{"contents":[{"contentId":N,"metadata":{…原样回显…}}]}`（**`metadata` 必须是 JSON 对象**，
+    `GhostQueryObject::onQueryCompleted` @`0x508288` 会把它当成员链表继续读，传字符串会读到野指针）；
+    客户端再 `GET .../ghost/N/payload` 取本体。另有 `replaydata/<track>` 的匿名幽灵路径。
+  - **`replaydata?track_id=<ID>`（查询式）故意保持回 `{"data": []}`**：xref 显示它被
+    `OnlineGhostManager::submitGhost` 内部引用，是「服务器上有没有我这条赛道的回放」的
+    **上传前检查**——回「有」客户端就不传了。别好心把它改成下发二进制。
+  - `players=<csv>` 过滤在单机离线环境下没有意义（库里只有自己），所以
+    「按 players 过滤后一个都没命中」时回落到全部候选，否则竞速永远没有对手。
+  - 诊断端点 `GET /__ghosts`：幽灵索引 + 仓库文件 + 最近的 `replay_id` 登记。
+  - 端到端回归 `tmp/ghost_e2e.py`（复刻真机抓到的调用顺序）12 项断言全绿。
 - **排行榜：真实成绩落库 + 主界面总榜聚合**（2026-10-04 重做）
   - 旧实现会给**没跑过的赛道**生成随机记录、时间也对不上，玩家的反馈是
     「时间和记录对不上，然后我没跑的也有记录」。现已删除全部合成数据。
   - 落库规则（`server/tf_server.py` 的 `_record_result`）：按 **(账号, 赛道)** 唯一，
     同一赛道只保留更快的 `drivetime`，更慢的提交直接丢弃；`global_score` 只在客户端真的
     带了这个字段时才写，不再用 `score_value` 伪造。
-  - **只信单赛道提交**：`POST /public/resultservice/v1/enhancestats/track<ID>` 才算一次真实跑图；
-    `POST .../batch_update` 是启动时把本地整张 `highscores` 表重发一遍（里面含解锁但从未跑过的图），
-    现在**明确忽略**，不再污染排行榜。
+  - **数据源（2026-10-04 第二次修正）**：真机上跑完图客户端**只发** `POST .../enhancestats/batch_update`
+    （一次 15 条），从不发单赛道提交 —— 早先「只信单赛道、忽略 batch_update」的判断是错的，
+    正是「跑了一个图但没看到记录」的原因。现在两条路都入库，判据统一为 **`drivetime > 0`**：
+    存档 `highscores2` 里没跑过的赛道是 `[track, 0, 256, 0, 0]` 的占位行，`drivetime` 为 0 的一律丢。
+  - **存档即真相**：客户端上报进度时（`POST /public/playerprogress/v1/progress`）服务器会顺带
+    解析 body 里的 `highscores2` 整表入库，所以榜单永远与玩家真实进度一致，不依赖客户端分批提交。
   - **主界面大榜单**（`/public/playerstats/v1/ranking/global_stats` 与 `global_stats_donkey`）
     改为**实时聚合视图**、不落库：把该账号每一条真实赛道记录汇总成一行
     （`data` = 已完成赛道数、`drivetime` = 各图最佳时间之和、`score_value`/`global_score` = 各图分数之和、
