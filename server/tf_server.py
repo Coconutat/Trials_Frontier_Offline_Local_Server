@@ -73,15 +73,57 @@ _TF_CONFIG_DEFAULTS = {
         "free_tickets_max": 3,
         "free_tickets_initial": 3,
         "free_tickets_interval_seconds": 3600,
+        # 天梯起始等级。★ 25 = 最低级，不能发 0：客户端 `rank == 0` 是
+        #   「未揭示/顶级」的特殊态，`MenuzStatePVPPostMatch::increaseOneStar`
+        #   @0x730698 一看到 0 就直接返回，晋级动画永远不会触发。
+        #   总共 25 级（`MissingRewardFallbackRewards` 恰好 25 个键 "1".."25"）。
+        "start_rank": 25,
     },
     "season": {
         "track_id": 1041,
         "title_text": "Trials Frontier",
         "banner_path": "/pvp_banner/season.png",
         "duration_days": 30,
-        "star_array": [],
-        "product_list": [],
-        "rewards": [],
+        # ★ `star_array` @0xb86be8 —— 扁平 int 数组，最多 26 个
+        #   （`parseSeason` @0x4fd694：struct(0x00e21c78)+428+i*4，`cmp i,#0x19; b.gt` 停）。
+        #   `PVPManager::getStarCountForRank(rank)` @0x5e16e8 读的是
+        #   `PVPManager+0x1ac + 4*(rank-1)`，也就是 **star_array[rank-1]**
+        #   = 「从该 rank 升上去需要几颗星」。index 0 = rank 1（最高），
+        #   index 24 = rank 25（最低）。不发/发空 → 客户端读未初始化内存。
+        "star_array": [20, 16, 16, 14, 14, 12, 12, 10, 10, 9,
+                       9, 8, 8, 7, 7, 6, 6, 5, 5, 4,
+                       4, 3, 3, 2, 2],
+        # ★ `product_list` @0xb86bf3 —— `[{"product_id": "<商城 id>", "amount": int}]`，
+        #   `parseSeason` @0x4fd230 处理；`chip_shop.goldentickets` @0xb86c00 是特例
+        #   （给黄金参赛票 item id 0x87=135 重定价），其余 product_id 在
+        #   UpgradeItemData 注册表里查不到就被静默忽略 —— 所以这里只放确定存在的 id。
+        "product_list": [{"product_id": "chip_shop.goldentickets", "amount": 3}],
+        # ★ `current_season.rewards` @0xb8d6de —— `parseSeasonData` @0x4fe4f4 的
+        #   天梯奖励栏契约：数组，每项 `{"rank": int, "item_id": int, "amount": int}`
+        #   （按 `rank` 归组进外层 vector，同一 rank 可给多个 (item_id, amount)；
+        #   `rank < 0` 跳过）。item_id 的语义沿用 `tr::PVPReward`：
+        #     1 = 金币、2 = 钻石、145 = 特殊奖励占位（RewardID 100），
+        #     其余 = 物品表里的 id（`tmp/packout/ITEM_IDS_REPORT_CN.md` 有全表）。
+        #   ⚠ `ItemId` 只在同一个 `Type` 内唯一，这里发的是物品栏 item id（Type 0）。
+        "rewards": [
+            {"rank": 1, "item_id": 1, "amount": 500},
+            {"rank": 1, "item_id": 2, "amount": 5},
+            {"rank": 1, "item_id": 459, "amount": 1},
+            {"rank": 2, "item_id": 1, "amount": 400},
+            {"rank": 2, "item_id": 2, "amount": 4},
+            {"rank": 3, "item_id": 1, "amount": 300},
+            {"rank": 3, "item_id": 2, "amount": 3},
+            {"rank": 5, "item_id": 1, "amount": 250},
+            {"rank": 5, "item_id": 49, "amount": 2},
+            {"rank": 10, "item_id": 1, "amount": 200},
+            {"rank": 10, "item_id": 44, "amount": 2},
+            {"rank": 15, "item_id": 1, "amount": 150},
+            {"rank": 15, "item_id": 39, "amount": 2},
+            {"rank": 20, "item_id": 1, "amount": 100},
+            {"rank": 20, "item_id": 34, "amount": 2},
+            {"rank": 25, "item_id": 1, "amount": 50},
+            {"rank": 25, "item_id": 29, "amount": 2},
+        ],
     },
     # 筹码（chips）。
     # 用户 m03154 的规则：筹码不是开局白送的 200，是「按赛道定期生成的硬件」
@@ -99,8 +141,9 @@ _TF_CONFIG_DEFAULTS = {
         "start": 0,
         # 每条已拥有赛道每隔这么多秒产 1 枚（0 或负数 = 不产）。
         "per_track_seconds": 3600,
-        # 上限（0 = 不限）。
-        "max": 200,
+        # 上限（0 = 不限）。★ 别再用 200：筹码商店里最贵的一条赛道 63000 筹码，
+        # 顶到 200 会让商店永久锁死。
+        "max": 0,
     },
     # 赛后奖励。比赛 JSON 的 `rewards` 是**数组**，parseMatch @0x4fd9d0 只读前 3 个整数
     # （`cmp w9,#2; b.gt`，见 0x4fdd78），然后拼成 PVPMatch+0x170 上的
@@ -1189,7 +1232,7 @@ def h_liveevents_accept(path, query, body, headers):
 # ---------------------------------------------------------------------------
 
 
-def _pvp_player_info(chips=None, tickets=3):
+def _pvp_player_info(chips=None, tickets=3, rank=None):
     """`parseRankingData` @0x4fc918 的响应契约（键地址已逐个确认）。
 
     +0x00 `rank`(0xb869b5) / +0x04 `star`(0xb86947) / +0x08 `elo_rank`(0xb869b1)
@@ -1198,11 +1241,16 @@ def _pvp_player_info(chips=None, tickets=3):
     ⚠ 另有一个键 `elo`(0xb86a0e) 走 `ldr d0,[node+0x28]; fcvtzs`，即**值是 double**。
       它和 `elo_rank` 写同一个字段（+0x08），所以我们只发整数版的 `elo_rank`。
     `chips=None` 时取服务器记的余额（见 `_pvp_chips_for`）。
+    `rank=None` 时取 `matchmaking.start_rank`（默认 25 = 最低级）。
+    ★ 不要发 rank=0：那是「未揭示/顶级」的特殊态，`increaseOneStar` @0x730698 会
+      直接 return，晋级动画与奖励栏都动不了。
     """
     if chips is None:
         chips = cfg_int("chips", "start", default=0)
+    if rank is None:
+        rank = cfg_int("matchmaking", "start_rank", default=25)
     return {
-        "rank": 0,
+        "rank": rank,
         "star": 0,
         "elo_rank": 1000,
         "season": 0,
@@ -1210,6 +1258,59 @@ def _pvp_player_info(chips=None, tickets=3):
         "chips": chips,
         "win_streak": 0,
     }
+
+
+def _pvp_star_array():
+    """`star_array` @0xb86be8 —— 扁平 int 数组，最多 26 项，`parseSeason` @0x4fd694。"""
+    vals = cfg("season", "star_array", default=None) or []
+    out = []
+    for v in vals[:26]:
+        try:
+            out.append(int(v))
+        except (TypeError, ValueError):
+            out.append(0)
+    return out
+
+
+def _pvp_product_list():
+    """`product_list` @0xb86bf3 —— `[{"product_id": str, "amount": int}]`，@0x4fd230。"""
+    vals = cfg("season", "product_list", default=None) or []
+    out = []
+    for it in vals:
+        if not isinstance(it, dict):
+            continue
+        pid = it.get("product_id")
+        if not isinstance(pid, str) or not pid:
+            continue
+        try:
+            amt = int(it.get("amount", 1))
+        except (TypeError, ValueError):
+            amt = 1
+        out.append({"product_id": pid, "amount": amt})
+    return out
+
+
+def _pvp_season_rewards():
+    """`current_season.rewards` @0xb8d6de —— `parseSeasonData` @0x4fe4f4。
+
+    每项 `{"rank": int, "item_id": int, "amount": int}`。三个键都必须存在且是
+    JSON 整数，否则整条被丢（`orr w8,w28,w21; tbnz w8,#0x1f` 那条判断）。
+    """
+    vals = cfg("season", "rewards", default=None) or []
+    out = []
+    for it in vals:
+        if not isinstance(it, dict):
+            continue
+        try:
+            rk = int(it.get("rank"))
+            iid = int(it.get("item_id"))
+            amt = int(it.get("amount", 1))
+        except (TypeError, ValueError):
+            continue
+        if rk < 0:
+            continue
+        out.append({"rank": rk, "item_id": iid, "amount": amt})
+    return out
 
 
 def _pvp_season(banner_url=""):
@@ -1228,11 +1329,18 @@ def _pvp_season(banner_url=""):
         pvp_skill_decay_in_fanpoint @0xb86b64 / pvp_skill_fanpoints @0xb86b80 /
         chip_store_specials_refresh_interval_hours @0xb86b94 /
         additional_match_cost @0xb86bbf / match_price_factor @0xb86bd5
-        （`star_array` @0xb86be8 / `product_list` @0xb86bf3 故意不发，形态未定）
+        （`star_array` @0xb86be8 / `product_list` @0xb86bf3 见 `_pvp_star_array` /
+          `_pvp_product_list`，取值走 `tf_config.json` 的 `season.star_array` /
+          `season.product_list`）
       `current_season` @0xb86c18 —— 交给 `parseSeasonData` @0x4fe4f4 解析：
         end_time @0xb876b2 / title_text @0xb86c55 / banner_url @0xb86c60 /
-        rewards @0xb8d6de（故意不发）/ rank @0xb869b5。
+        rewards @0xb8d6de（= 天梯奖励栏，`[{"rank","item_id","amount"}]`，
+        见 `_pvp_season_rewards`）/ rank @0xb869b5。
     ⚠ `banner_url` 留空字符串：非空会触发一次 `getSeasonBanner`（cmd 0x32）去下图。
+    ⚠ `chip_equation_x/y` 必须发 0/0：`PVPManager::getNumChipsTotal` @0x5e1838 是
+      `pow(t, x) * y`，而 t 的基准 `PVPTrack+0x20` 同时被 `onStartRaceSent` @0x5e59ec
+      当成车种 ID（发的是 1），所以一旦 y != 0，客户端会算出 `pow(now-1, x)*y`
+      这种天文数字。筹码改由服务器记账（`_pvp_chips_for`），客户端只做展示。
     """
     now = int(time.time())
     week_start, _wi = _week_index()
@@ -1240,36 +1348,44 @@ def _pvp_season(banner_url=""):
     ftk_max = cfg_int("matchmaking", "free_tickets_max", default=3)
     ftk_init = cfg_int("matchmaking", "free_tickets_initial", default=ftk_max)
     ftk_iv = cfg_int("matchmaking", "free_tickets_interval_seconds", default=3600)
-    return {
-        "pvp_match_settings": {
-            "free_tickets_interval": ftk_iv if ftk_iv > 0 else 3600,
-            "Pvp_skill_counter": 0,
-            "free_tickets_max": ftk_max if ftk_max > 0 else 3,
-            "free_tickets_initial": ftk_init,
-            "chip_equation_x": 0,
-            "chip_equation_y": 0,
-            "winner_chip_heritage": 100,
-            "loser_chip_heritage": 50,
-            "ranked_match_duration": cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600,
-            "friendly_match_duration": 3600,
-            "ranked_match_slots": 3,
-            "ranked_match_limit": 10,
-            "game_mode": 0,
-            "pvp_skill_time_bonus_seconds": 0,
-            "pvp_skill_fault_punishment_factor": 1,
-            "pvp_skill_decay_in_fanpoint": 0,
-            "pvp_skill_fanpoints": 0,
-            "chip_store_specials_refresh_interval_hours": 24,
-            "additional_match_cost": 0,
-            "match_price_factor": 1,
-        },
-        "current_season": {
-            "end_time": max(now + days * 24 * 3600, week_start + _WEEK_SECONDS),
-            "title_text": cfg("season", "title_text", default=None) or "Trials Frontier",
-            "banner_url": banner_url,
-            "rank": 0,
-        },
+    settings = {
+        "free_tickets_interval": ftk_iv if ftk_iv > 0 else 3600,
+        "Pvp_skill_counter": 0,
+        "free_tickets_max": ftk_max if ftk_max > 0 else 3,
+        "free_tickets_initial": ftk_init,
+        "chip_equation_x": 0,
+        "chip_equation_y": 0,
+        "winner_chip_heritage": 100,
+        "loser_chip_heritage": 50,
+        "ranked_match_duration": cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600,
+        "friendly_match_duration": 3600,
+        "ranked_match_slots": 3,
+        "ranked_match_limit": 10,
+        "game_mode": 0,
+        "pvp_skill_time_bonus_seconds": 0,
+        "pvp_skill_fault_punishment_factor": 1,
+        "pvp_skill_decay_in_fanpoint": 0,
+        "pvp_skill_fanpoints": 0,
+        "chip_store_specials_refresh_interval_hours": 24,
+        "additional_match_cost": 0,
+        "match_price_factor": 1,
     }
+    sa = _pvp_star_array()
+    if sa:
+        settings["star_array"] = sa
+    pl = _pvp_product_list()
+    if pl:
+        settings["product_list"] = pl
+    season = {
+        "end_time": max(now + days * 24 * 3600, week_start + _WEEK_SECONDS),
+        "title_text": cfg("season", "title_text", default=None) or "Trials Frontier",
+        "banner_url": banner_url,
+        "rank": 0,
+    }
+    rw = _pvp_season_rewards()
+    if rw:
+        season["rewards"] = rw
+    return {"pvp_match_settings": settings, "current_season": season}
 
 
 # --- 匹配（new_ranked → matches）-------------------------------------------
