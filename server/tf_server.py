@@ -232,6 +232,13 @@ def h_progress(path, query, body, headers):
         return 401, {"Content-Type": "application/json"}, {"error": err}
     if pid:
         brief["ok"] = True
+        # ★ 排行榜的数据源：存档里的 highscores2 是**玩家自己的最佳成绩表**，
+        #   真正跑过的图 drivetime > 0，没跑过的是 `[track, 0, 256, 0, 0]`。
+        #   直接从存档同步，榜单就和玩家的实际进度永远一致，
+        #   也不会出现"客户端只提交了一部分成绩"导致榜单缺图的情况。
+        n = _ingest_highscores(pid, _json_body(body))
+        if n:
+            print("[rank-save] profile=%s 从存档同步了 %d 条赛道成绩" % (pid, n), flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "version": int(brief.get("server_version") or 0),
         "time_stamp": int(brief.get("saved_at") or 0),
@@ -565,14 +572,36 @@ def _load_leaderboards():
 
 def _save_leaderboards(obj):
     os.makedirs(os.path.dirname(LEADERBOARD_PATH), exist_ok=True)
-    tmp = LEADERBOARD_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, LEADERBOARD_PATH)
+    # ★ Windows 上 os.replace 偶发 WinError 5（杀软/索引器短暂占用目标文件），
+    #   事务性写盘因此要重试，否则会留下 leaderboards.json.tmp 且丢一次成绩。
+    tmp = "%s.%d.tmp" % (LEADERBOARD_PATH, os.getpid())
+    last = None
+    for attempt in range(6):
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, LEADERBOARD_PATH)
+            return
+        except OSError as exc:            # PermissionError 也是 OSError
+            last = exc
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    print("[rank-save] 榜单落盘失败：%s" % last, flush=True)
 
 
 def _record_result(profile_id, track_name, stats):
-    """保存一条真实成绩；同一账号/赛道只保留最佳 drivetime。"""
+    """保存一条真实成绩；同一账号/赛道只保留最佳 drivetime。
+
+    ★ 两个来源字段并不一致，所以是**合并**而不是整条覆盖：
+        · 存档 highscores2 行 = [track, drivetime, data, upgrades, submittime]
+          —— 有 drivetime/data/upgrades，**没有 score_value**；
+        · batch_update 的 JSON —— 有 drivetime/score_value/data/upgrades。
+      如果谁后到就把整条覆盖，score_value 会被存档同步清零。
+      规则：drivetime 更小才算新纪录；时间相同则补齐缺失字段；时间更差直接丢弃。
+    """
     if not profile_id or not track_name or not isinstance(stats, dict):
         return False
     try:
@@ -584,50 +613,133 @@ def _record_result(profile_id, track_name, stats):
     clean = {
         "player": profile_id,
         "drivetime": drivetime,
-        "score_value": int(stats.get("score_value", 0) or 0),
         "submittime": int(stats.get("submittime", 0) or 0),
         "data": int(stats.get("data", 0) or 0),
         "upgrades": int(stats.get("upgrades", 0) or 0),
         "extradata": int(stats.get("extradata", 0) or 0),
         "updated": int(time.time()),
     }
-    if "global_score" in stats:
-        try:
-            clean["global_score"] = float(stats["global_score"])
-        except (TypeError, ValueError):
-            pass
+    # 只有来源真的带了这个字段才写，避免用"不存在的 0"覆盖已有数据。
+    for key in ("score_value", "global_score"):
+        if key in stats and stats[key] is not None:
+            try:
+                clean[key] = float(stats[key]) if key == "global_score" else int(stats[key])
+            except (TypeError, ValueError):
+                pass
+    if "_client_submittime" in stats:
+        clean["_client_submittime"] = int(stats["_client_submittime"] or 0)
     with LEADERBOARD_LOCK:
         db = _load_leaderboards()
         board = db.setdefault(track_name, {})
         old = board.get(profile_id)
-        if old is not None and int(old.get("drivetime", 0)) <= drivetime:
-            return False
+        if old is not None:
+            old_time = int(old.get("drivetime", 0))
+            if old_time < drivetime:
+                return False                      # 更慢的一次，直接丢
+            if old_time == drivetime:
+                merged = dict(old)
+                for k, v in clean.items():
+                    if k in ("player", "drivetime", "updated"):
+                        continue
+                    if not merged.get(k) and v:
+                        merged[k] = v             # 补齐缺失字段，不覆盖已有值
+                if merged == old:
+                    return False
+                board[profile_id] = merged
+                _save_leaderboards(db)
+                return True
         board[profile_id] = clean
         _save_leaderboards(db)
     return True
 
 
+def _u32(v):
+    """存档里的 data/upgrades 是有符号 int，按 32 位无符号回放。"""
+    try:
+        return int(v) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return 0
+
+
+def _record_highscores_row(profile_id, row):
+    """把存档 highscores2 的一行 [track, drivetime, data, upgrades, submittime] 入库。
+
+    ★ 这一行是不是"跑过"完全看 drivetime：客户端给没跑过的赛道写成 0
+      （实测 191 行里 163 行是 `[track, 0, 256, 0, 0]` 占位）。
+      所以 drivetime > 0 就是"真的跑过"的唯一判据，不需要别的推断。
+    """
+    if not isinstance(row, (list, tuple)) or len(row) < 2:
+        return False
+    try:
+        track = int(row[0])
+        drivetime = int(row[1])
+    except (TypeError, ValueError):
+        return False
+    if drivetime <= 0 or track <= 0:
+        return False
+    return _record_result(profile_id, "track%d" % track, {
+        "drivetime": drivetime,
+        "data": _u32(row[2] if len(row) > 2 else 0),
+        "upgrades": _u32(row[3] if len(row) > 3 else 0),
+        # ★ 存档行的 submittime 恒为 0（客户端从没填过）。直接回显会让榜单
+        #   显示 1970-01-01，所以填"服务器收到这条成绩的时间" —— 真实值，不是编的。
+        "submittime": int(time.time()),
+        "_client_submittime": int(row[4] or 0) if len(row) > 4 else 0,
+    })
+
+
+def _ingest_highscores(profile_id, content):
+    """从玩家上报的存档里同步成绩表。只收 drivetime > 0 的赛道。"""
+    if not isinstance(content, dict):
+        return 0
+    rows = content.get("highscores2") or content.get("highscores") or []
+    if not isinstance(rows, list):
+        return 0
+    n = 0
+    for row in rows:
+        if _record_highscores_row(profile_id, row):
+            n += 1
+    return n
+
+
 def h_result_stats(path, query, body, headers):
-    """接收真实跑图成绩，禁止用启动批量同步污染排行榜。"""
+    """接收真实跑图成绩。只收真正跑过的图，不制造任何记录。"""
     payload = _json_body(body)
     caller, err = acct.authenticate(headers)
     if err or not caller or caller.get("kind") != "account":
         return 401, {"Content-Type": "application/json"}, {"error": "invalid-credentials"}
     profile_id = caller["profileId"]
-
-    # batch_update 是启动/进度同步：它会把本地已有的整张 highscores 表
-    # 再发一遍，其中可能包含解锁但从未实际跑过的赛道。真正跑完一张图时，
-    # 客户端还会发 /enhancestats/track<ID>；排行榜只信这条单赛道提交。
     endpoint = path.rstrip("/").rsplit("/", 1)[-1]
+    accepted = 0
+
     if endpoint == "batch_update":
-        print("[rank-save] profile=%s ignored=batch_update" % profile_id, flush=True)
+        # ★ 批量同步是启动/进度同步时把本地整张 highscores 表发上来。
+        #   表里有 191 行，但**只有真正跑过的图 drivetime > 0**，
+        #   其余 163 行是 [track, 0, 256, 0, 0] 的占位（解锁但没跑）。
+        #   以前这里一律入库，就是"我没跑的也有记录"的根源。
+        #   现在只收 drivetime > 0 的行，未跑过的图永远不会出现在榜单里。
+        for item in (payload.get("updates") or []):
+            if not isinstance(item, dict):
+                continue
+            track = str(item.get("track_name") or "")
+            stats = item.get("stats") or {}
+            if not re.fullmatch(r"track[0-9]+", track) or not isinstance(stats, dict):
+                continue
+            try:
+                if int(stats.get("drivetime", 0) or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if _record_result(profile_id, track, stats):
+                accepted += 1
+        print("[rank-save] profile=%s batch_update accepted=%d" % (profile_id, accepted),
+              flush=True)
         return 200, {"Content-Type": "application/json"}, {"data": []}
 
     track = endpoint.strip()
     if not re.fullmatch(r"track[0-9]+", track):
         return 400, {"Content-Type": "application/json"}, {"error": "invalid-track"}
     updates = payload.get("updates", []) if isinstance(payload, dict) else []
-    accepted = 0
     if isinstance(updates, list) and updates:
         # 单赛道请求的 body 通常是 updates:[{stats:...}]；忽略其中可能
         # 被篡改的 track_name，赛道身份以 URL 为准。
