@@ -1,7 +1,7 @@
 # ROADMAP 进度与任务规划
 
 > 对应根目录 [`ROADMAP.md`](ROADMAP.md)。本文档记录每一条的**当前完成度、证据、缺口、下一步动作**。
-> 最后更新：2026-10-04 19:25（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
+> 最后更新：2026-10-04 20:00（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
 
 ---
 
@@ -212,6 +212,15 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
   `userstorage/v2/search/ghost/get_ghost` 与 `resultservice/v1/replaydata/<track>`；
   `server/data/ghosts/` 下同时保留内置 `.bin` 与客户端上传的 `store/<contentId>.bin`。
   细节见下面「缺口 → 幽灵 userstorage 协议」一节的实现说明（该缺口已关闭）。
+- **幽灵素材库（2026-10-04 补）**：从原版真机提取 **44 个幽灵 / 30 条赛道 / 79441 字节**
+  进 `server/data/ghosts/<赛道id>/`，全部通过 zlib 自检；`.gitignore` 里
+  `server/data/ghosts/**/*.bin` 的屏蔽**已解除**（`store/`、`index.json`、`replays.json`、
+  `inbox/` 这些运行期数据仍然不入库）。逐条清单见 `server/data/ghosts/INDEX.md`，
+  格式与「比赛幽灵怎么被加载」的逆向结论见 `server/data/ghosts/README.md`。
+  ★ 关键结论：`GameWorld::initGhostReplay`@`0x4c434c` 是唯一决策点，
+  `MissionManager::checkGhostOverride` 返回 false 时比赛**干脆没有幽灵**（走 `GhostReplay::uninit`），
+  所以单人跑图看不到对手幽灵是设计而非 bug；幽灵只来自「内存里的在线幽灵」
+  「在线任务幽灵」「内置关卡幽灵（datapack 的 `/level/ghost/`）」三类。
 - **真钱内购（IAP）完整破解** ✅ 已实机验证（见 §3.1）。
 - **广告**：native 侧 `AdInterface::initAndroid()` 短路，Tapjoy/AdMob/Flurry/AdColony 全部不加载；
   logcat 实测广告相关 0 条。服务端遥测也已打桩。

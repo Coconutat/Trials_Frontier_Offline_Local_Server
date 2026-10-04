@@ -28,12 +28,11 @@ server/data/remember.json
 server/data/leaderboards.json
 # 玩家存档（真实进度，含金币 / 赛道纪录 / identifier）
 server/data/save/
-# 从设备抓下来的幽灵二进制（游戏数据）；ghosts/README.md 保留
-server/data/ghosts/**/*.bin
-
-# ── 幽灵仓库（userstorage v2）的运行期状态 ─────────────────
-# 客户端上传的幽灵内容、分配过的 contentId、replay_id 登记，
-# 都属于玩家运行期数据，不入库。
+# ── 幽灵仓库（server/data/ghosts/）─────────────────────────
+# 【已解除屏蔽】<赛道id>/*.bin 是游戏自带的静态幽灵数据（原版 DLC / 从设备提取），
+# 是离线服务器唯一能让比赛出现"别人的幽灵"的素材，必须入库。
+# 注意 store/ 与 index.json / replays.json 是玩家运行期数据，仍然不入库。
+server/data/ghosts/store/
 server/data/ghosts/index.json
 server/data/ghosts/replays.json
 server/data/ghosts/inbox/
