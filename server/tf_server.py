@@ -97,6 +97,7 @@ def h_timeservice(path, query, body, headers):
 # 所以这里现画一张占位图发回去，免得页面上出现空白/破图。
 _IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 _PLACEHOLDER_PNG = None
+_BANNER_PNG = None
 
 
 def _placeholder_png():
@@ -139,6 +140,94 @@ def _placeholder_png():
 
 def h_placeholder_image(path, query, body, headers):
     return 200, {"Content-Type": "image/png"}, _placeholder_png()
+
+
+# ------------------------------------------------------------ 赛季横幅
+# 「碉堡 → 赛季横幅」在原本设计里是 `current_season.banner_url` 指向运营素材。
+# 取图链路（已反汇编）：
+#   `OnlinePVP::parseSeason` @0x4fcfb4 把 `banner_url`@0xb86c60 拷进出参，
+#   `OnlinePVP::parseJsonResponse` 的 cmd 0x27 分支发现它非空就调
+#   `OnlinePVP::getSeasonBanner` @0x4fabf0 —— 它**把 banner_url 原样**交给
+#   `OnlineCore::getRequest(..., cmd=0x32, 0,0,0)`（还置了二进制标志）。
+#   响应不走 JSON：`OnlinePVP::onNetworkDataReceived` @0x4fbeac 里 cmd 0x32
+#   分支用 `SaveFile` 把**原始字节**落盘成缓存文件，缓存名 =
+#   `mt::String::getHashCode(banner_url)`；`PVPManager::loadSeasonBannerTexture`
+#   再把它当贴图读进去。
+# 所以服务器只要在 banner_url 上回一张 PNG 原图即可，不需要任何 JSON 包装。
+_BANNER_PATH = "/pvp_banner/season.png"
+
+
+def _req_host(headers):
+    """从请求头取 Host —— 它就是客户端的 base URL（设备侧靠 adb reverse）。
+
+    ⚠ 不能用写死的 127.0.0.1：PC 局域网部署时客户端连的是 192.168.x.x，
+    banner_url 里若是 127.0.0.1 就会去连手机自己。
+    """
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if k.lower() == "host" and v:
+                return v
+    return "127.0.0.1:8000"
+
+
+def _banner_url(headers):
+    return "http://%s%s" % (_req_host(headers), _BANNER_PATH)
+
+
+def _placeholder_banner_png():
+    """现画一张 640x128 的赛季横幅占位图（手搓 PNG，不依赖 Pillow）。
+
+    ⚠ 必须做小：客户端下载后走 `SaveFile` 落盘，那个路径给的缓冲上限是
+    0x800（2048）字节。所以图案**只随 y 变化**（每行是纯色）：这样 Up 滤波后
+    一行里除首像素外全 0，同样的行在 deflate 里被彻底折叠，实测 300 字节上下。
+    早先版本带 x 方向渐变的斜纹，光靠滤波只能压到 3155 字节，仍然超限。
+    """
+    global _BANNER_PNG
+    if _BANNER_PNG is not None:
+        return _BANNER_PNG
+    import struct
+    import zlib
+    w, h = 640, 128
+
+    def row_color(y):
+        fy = y / (h - 1)
+        if y < 3 or y >= h - 3:             # 上下两条金线
+            return 0xE8, 0xC0, 0x6A
+        if y < 8 or y >= h - 8:             # 深色内衬
+            return 0x2A, 0x18, 0x0C
+        # 中段是一条更亮的「标题带」
+        band = 0x14 if (0.30 * h <= y < 0.70 * h) else 0x00
+        return (min(255, int(0xD2 - 0x54 * fy) + band) & 0xFF,
+                min(255, int(0x86 - 0x42 * fy) + band // 2) & 0xFF,
+                max(0, int(0x2A - 0x14 * fy)) & 0xFF)
+
+    rows = bytearray()
+    prev = bytes(3 * w)                     # 上一行的**原始**像素（Up 滤波器要求）
+    for y in range(h):
+        # ⚠ PNG filter type = 2（Up）：与上一行相减后行内几乎全 0，deflate 折叠。
+        rows.append(2)
+        r, g, b = row_color(y)
+        row = bytes((r, g, b)) * w
+        cur = bytearray()
+        for i in range(3 * w):
+            cur.append((row[i] - prev[i]) & 0xFF)
+        rows += cur
+        prev = row
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    _BANNER_PNG = (b"\x89PNG\r\n\x1a\n"
+                   + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                   + chunk(b"IDAT", zlib.compress(bytes(rows), 9))
+                   + chunk(b"IEND", b""))
+    return _BANNER_PNG
+
+
+def h_pvp_banner(path, query, body, headers):
+    """GET /pvp_banner/season.png —— 赛季横幅原图（cmd 0x32 的响应体）。"""
+    return 200, {"Content-Type": "image/png"}, _placeholder_banner_png()
 
 
 # ------------------------------------------------------ 本地账号 / 存档 / 幽灵
@@ -931,7 +1020,7 @@ def _pvp_player_info(chips=200, tickets=3):
     }
 
 
-def _pvp_season():
+def _pvp_season(banner_url=""):
     """`parseSeason` @0x4fcfb4 的响应契约。
 
     根对象两个键：
@@ -981,7 +1070,7 @@ def _pvp_season():
         "current_season": {
             "end_time": max(now, week_start + _WEEK_SECONDS),
             "title_text": "Trials Frontier",
-            "banner_url": "",
+            "banner_url": banner_url,
             "rank": 0,
         },
     }
@@ -1076,7 +1165,7 @@ def h_pvp_init(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {
         "player_info": _pvp_player_info(),
         "match_info": _pvp_match_info(_ghost_caller(headers)),
-        "pvp_config": _pvp_season(),
+        "pvp_config": _pvp_season(_banner_url(headers)),
     }
 
 
@@ -1105,7 +1194,7 @@ def h_pvp_config(path, query, body, headers):
       URL 是 `%s/%s/pvp_matches/v1/pvp_config?lang=%s`（0x4faa7c `add x2,x2,#0x6de`）。
       真正拼 `season/%d?lang=` 的是 `getSeasonDataById` @0x4faaec（cmd 0x31）。
     """
-    return 200, {"Content-Type": "application/json"}, _pvp_season()
+    return 200, {"Content-Type": "application/json"}, _pvp_season(_banner_url(headers))
 
 
 def h_pvp_season_data(path, query, body, headers):
@@ -1118,7 +1207,7 @@ def h_pvp_season_data(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {
         "end_time": now + 30 * 24 * 3600,
         "title_text": "Trials Frontier",
-        "banner_url": "",
+        "banner_url": _banner_url(headers),
         "rank": 0,
     }
 
@@ -1658,6 +1747,8 @@ DYNAMIC = [
     ("GET", "/public/pvp_matches/v1/matches", h_pvp_matches),
     # 匹配下单（cmd 0x28）——见 h_pvp_new_ranked 上方注释：真正出对手的是 matches。
     ("GET", "/public/pvp_matches/v1/new_ranked", h_pvp_new_ranked),
+    # 赛季横幅：注意它还要在 pick_dynamic 的「图片通配」之前判一次，见那里的注释。
+    ("GET", _BANNER_PATH, h_pvp_banner),
     # ⚠ 顺序有讲究：`players?profiles=` 的 path 是 /…/players，
     # 它是 /…/player/ 的前缀，必须排在前面，否则会被 h_pvp_player 抢走。
     ("GET", "/public/pvp_matches/v1/players", h_pvp_accept),
@@ -1672,6 +1763,11 @@ DYNAMIC = [
 
 
 def pick_dynamic(method, path):
+    # 赛季横幅必须抢在下面那条「图片通配」前面：它的路径以 .png 结尾，
+    # 否则会被 h_placeholder_image 吃掉，客户端下到的是 256x256 的占位方块，
+    # 而且 2868 字节超过了 SaveFile 的 0x800（2048）上限。
+    if method == "GET" and path == _BANNER_PATH:
+        return h_pvp_banner, "dyn:pvp-banner"
     # 图片与好友头像：<base>/<pid>/picture?width=..&height=..（见 .rodata @0xb887cc）
     if method == "GET" and (path.lower().endswith(_IMAGE_EXT) or path.endswith("/picture")):
         return h_placeholder_image, "dyn:placeholder-image"
