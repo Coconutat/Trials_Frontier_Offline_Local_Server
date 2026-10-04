@@ -199,6 +199,48 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
 - 真机验证：登录 → `/progress/version` → `GET /progress` 下载 → `player.bin` 1096→1890 →
   HUD `402/402` 汽油、`6,633,802` 金币、`8,905` 宝石、`9` 星 ✅
 
+#### 2.1.1 第二次清档事故（2026-10-04 22:42，「半个档」覆盖，已修复）
+- **现象**：玩家进游戏只见**新手教程**（"你好骑手！请在提车前确认"），金币/钻石/赛道纪录全没。
+- **根因**：客户端在一次冷启动里会连做两次 `syncProgress` —— 先 POST 一份**完整档**
+  （17 个键 / ~25 KB），**约 6 秒后**再 POST 一份**半个档**（7~8 个键 / ~3.9 KB）。
+  后者只带 `checksum / game_version / identifier / items2 / (robotman) / timers2 /
+  timestamp / version`，而 `profile`、`highscores2`、`achievements2`、`missions2`、
+  `statistics2`、`tutorials2`、`settings` **全部缺失**（客户端自己的序列化时序问题）。
+- **为什么旧护栏没拦住**：第一道护栏只看 `_richness`（`items2/2 + highscores2 +
+  achievements2 + tutorials2 + (missions2?5) + (statistics2?5)`）。半个档的 items2 有
+  **428 对**，`428*2 = 856 > 650/2` ⇒ 判定"不算清档"，照常覆盖 `latest.json`
+  （实测 `richness 650 -> 428`、段落 `17 -> 8`）。
+- **修复**（`server/tflocal_accounts.py`）：
+  - 新增 `_SAVE_SECTIONS` 与 `_lost_sections()`：**旧档里非空、新档里缺失/变空的段落，
+    一个都不许丢**（`items2 / highscores2 / achievements2 / missions2 / statistics2 /
+    tutorials2 / settings / profile / store_bonus / dailyexperience`）。
+  - 护栏改为「段落丢失 **或** richness 减半」命中即拒绝，被拒的那份仍写进 `history/`。
+  - 拒绝分支回 `server_version = 旧版本 + 1`。旧实现误写成 `version` 键 ⇒ `h_progress`
+    回 `version=0` ⇒ 客户端以为服务器没档、下一轮继续推本地（永远走不到恢复）。
+    回「+1」而**不是**旧版本，是为了让下一轮 `GET /progress/version` 与客户端记在
+    `Player+0x4864` 的本地版本对不上 ⇒ `ProgressSyncManager::onProgressCheckComplete`
+    判定版本冲突 ⇒ 拉起 `MenuzStateSyncProgress`，把"用云端"的恢复入口交回给玩家。
+- **恢复过程**：完整档仍在 `history/1791124895.json`（22:41:35）；`tmp/restore_now.py`
+  把它提回 `latest.json` 并把 `version` 抬到 71。真机复验：
+  `GET /progress/version → GET /progress/status → GET /progress` 客户端拉下完整档，
+  村庄 HUD 回到 **16,748,033 金币 / 9,066,302 钻石 / 456/456 汽油**，
+  `highscores2` 里 **36 条真跑过的赛道纪录一条不少**（旧档的 200 条里有 164 条是
+  `[track,0,256,0,0]` 占位，客户端重新序列化时把它们丢了，不是数据损失）✅
+- **关键反向结论（恢复入口在哪）**：
+  - `ProgressSyncManager::checkProgressSyncEv` @`0x006262d4` **唯一调用者**是
+    `tr::OnlineCore::onAuthenticationComplete` @`0x0056c1e4` ⇒ 版本比对只在
+    **认证完成**时跑。调用前有三道门：`[0xe20000+0x490]` 的首个 int `== 2`、
+    `ProgressSyncManager::switchLocalProgress()` @`0x00625b7c` 返回位 0 为 1、
+    且 `MenuzStateMachine::searchPositionFromTop(0) != -1`
+    ⇒ **新手教程期间状态栈顶不是常规菜单，比对会被跳过**，必须先走完教程。
+  - `ProgressSyncManager::getServerProgressAsync` @`0x006263a4` **唯一调用者**是
+    `tr::MenuzStateSyncProgress::onConfirmationDone(int idx, MZ_MENUZ_CONFIRM_RESULT res)`
+    @`0x007ab0d4`：只在 `res == 1` 且 **按钮 index == 6** 时 `b #PLT_getServerProgressAsync`
+    （index 5 / 7 是别的动作，**index 0x4d2 = 1234 会调 `Player::resetProgress()`，千万别点**）。
+    ⇒ 「进度冲突」对话框里**下载云端那一项 = 按钮 6**。
+  - 服务器侧对应入口：`GET /__restore?profile=<pid>&ts=<时间戳|latest>`
+    （`acct.restore_save`），历史快照用 `GET /__history?profile=<pid>` 列。
+
 ---
 
 ## 3. 在线功能完善

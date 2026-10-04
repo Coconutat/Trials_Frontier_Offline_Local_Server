@@ -604,6 +604,27 @@ def _richness(obj):
     return n
 
 
+# ★★ 第二道防清档护栏（2026-10-04 第二次真机事故复盘）：
+#   客户端在一次冷启动里会连做两次 syncProgress —— 先 POST 一份**完整档**（17 个键，
+#   ~25 KB），约 6 秒后再 POST 一份**半个档**（7~8 个键，~3.9 KB）。第二次那份只带
+#   `checksum/game_version/identifier/items2/(robotman)/timers2/timestamp/version`，
+#   **`profile`、`highscores2`、`achievements2`、`missions2`、`statistics2`、
+#   `tutorials2`、`settings` 全没了**（那是客户端自己的序列化时序问题，不是玩家的选择）。
+#   而第一道护栏（richness 减半）拦不住它：items2 有 428 对，光这一项就够 856 > 650/2，
+#   于是半个档照样覆盖了 latest.json ⇒ 玩家真机表现 = 回到新手教程、赛道纪录全没。
+#   所以再加一道**按段落**的判定：旧档里非空、新档里缺失/变空的段落，一个都不许丢。
+_SAVE_SECTIONS = ("items2", "highscores2", "achievements2", "missions2",
+                  "statistics2", "tutorials2", "settings", "profile",
+                  "store_bonus", "dailyexperience")
+
+
+def _lost_sections(old, new):
+    """返回旧档里非空、但新档里缺失或变空的段落名（按 _SAVE_SECTIONS 顺序）。"""
+    if not isinstance(old, dict) or not isinstance(new, dict):
+        return []
+    return [k for k in _SAVE_SECTIONS if old.get(k) and not new.get(k)]
+
+
 def save_progress(headers, body, client_ip=None):
     """把客户端上传的存档落盘。返回 (profileId or None, 摘要 dict, error)。
 
@@ -648,20 +669,31 @@ def save_progress(headers, body, client_ip=None):
         except Exception:
             pass
 
-    # ★★ 防清档护栏（真机事故复盘）：
-    #   客户端在"登录/换 owner/首次同步"这些时序上会把**重置后的默认存档**上报回来
-    #   （实测 items2 从 45 对掉到个位数）。一旦覆盖 latest.json，玩家进度就再也回不去。
-    #   所以：明显劣化时**只写 history，不覆盖 latest**，并把旧档继续当作可下发来源。
+    # ★★ 防清档护栏（两次真机事故复盘）：
+    #   客户端在"登录/换 owner/首次同步/冷启动"这些时序上会把**重置后的默认存档**或
+    #   **只序列化了一半的存档**上报回来（实测 richness 从 650 掉到 428、段落从 17 个
+    #   掉到 8 个）。一旦覆盖 latest.json，玩家进度就再也回不去。
+    #   所以两道判定，命中任意一条就**只写 history，不覆盖 latest**：
+    #     (a) 段落丢失：旧档非空、新档缺失/变空的 `_SAVE_SECTIONS` 里的任一段落；
+    #     (b) richness 减半：旧档 ≥10 且新档不到旧档一半。
+    #   ★ 拒绝时回的 `server_version` 取**旧版本 +1**（而落盘的旧档版本号并不变）：
+    #     `h_progress` 把它当 `{"version": …}` 发给客户端，客户端会把它记进
+    #     `Player+0x4864`。这样下一轮 `GET /progress/version` 返回的仍是真实旧版本，
+    #     与客户端记的对不上 ⇒ `ProgressSyncManager` 判定"版本冲突"、拉起
+    #     `MenuzStateSyncProgress`，玩家就拿到了"用云端"的恢复入口。
+    #     若这里回 0（旧实现的 bug）客户端会以为服务器没档，继续推本地，永远走不到恢复。
     old = load_progress(pid)
+    old_ver = int((old or {}).get("version") or 0)
     old_rich = _richness((old or {}).get("content"))
     new_rich = _richness(obj)
-    if old and old_rich >= 10 and new_rich * 2 < old_rich:
-        print("[save] ⚠ 拒绝用明显更空的存档覆盖 %s（旧 richness=%d -> 新 richness=%d），"
+    lost = _lost_sections((old or {}).get("content"), obj)
+    if old and (lost or (old_rich >= 10 and new_rich * 2 < old_rich)):
+        print("[save] ⚠ 拒绝覆盖 %s 的存档（丢失段落=[%s]，旧 richness=%d -> 新 richness=%d），"
               "新数据已存进 history/%d.json；如需强制接受请删掉 latest.json"
-              % (who, old_rich, new_rich, now), flush=True)
-        return pid, {"rejected": True, "old_richness": old_rich,
+              % (who, ",".join(lost), old_rich, new_rich, now), flush=True)
+        return pid, {"rejected": True, "lost_sections": lost, "old_richness": old_rich,
                      "new_richness": new_rich, "saved_at": now, "account": who,
-                     "version": int((old or {}).get("version") or 0)}, None
+                     "server_version": old_ver + 1}, None
 
     _store(os.path.join(d, "latest.json"), payload)
     brief = {
