@@ -696,6 +696,186 @@ def h_match_robot(path, query, body, headers):
     }
 
 
+# ------------------------------------------------- 限时活动 / 赛季（weekly_track_system）
+# 客户端调用链（反汇编 tr::OnlineWeeklyChallenge，全部经 OnlineCore::getRequest）：
+#   requestWeekIndex           cmd 0x76  %s/%s/liveevents/v1/weekly_track_system/basic_info
+#   requestWeeklyConfiguration cmd 0x77  %s/%s/liveevents/v1/weekly_track_system/config/%d
+#   requestOpponentId          cmd 0x78  %s/%s/liveevents/v1/weekly_track_system/find_opponent
+#   requestRewardConfig        cmd 0x79  "%s%s%d"（base + reward_config/ + 槽位数）
+# 响应由 OnlineWeeklyChallenge::parseJsonResponse @0x504ef4 分派：
+#   sub w8, cmd, #0x76 ; cmp w8, #9 ; 跳转表 @0xb8710c
+#   0x76 -> 0x504f7c（basic_info） 0x77 -> 0x505124（config）
+#   0x78 -> 0x505164（opponent）   0x79 -> 0x5051e8（reward_config）
+# ⚠ 所有数值字段都必须带 JSON **整数**类型标签（客户端逐个判 [node+0x30] == 4），
+#   给字符串或 null 会被当成「这个键不存在」。
+_WEEK_SECONDS = 7 * 24 * 3600
+
+
+def _week_index():
+    """-> (week_start, week_index)。basic_info 与 config 必须给出同一个周，
+    否则客户端会认为「配置不属于当前周」而拒绝开赛。"""
+    week_start = (int(time.time()) // _WEEK_SECONDS) * _WEEK_SECONDS
+    return week_start, (week_start // _WEEK_SECONDS) & 0xFFFFFF
+
+
+# 本周挑战的赛道。必须挑一条游戏真能加载、且玩家跑过的赛道：1041 在幽灵库里
+# （owner 0 / 6f857655 / 99511744 都有它的幽灵），真机日志里也出现过
+# `GET /public/playerstats/v1/ranking/track1041` 与 ghost_*_1041.bin。
+_WEEKLY_TRACK_ID = 1041
+
+
+def h_liveevents_basic_info(path, query, body, headers):
+    """GET|POST /public/liveevents/v1/weekly_track_system/basic_info —— 限时活动的「门」。
+
+    ⚠ 同一个 URL 服务两条命令，响应形状共用：
+      · GET  → cmd **0x76**：客户端逐个解析下面的键，回调
+        `vtable[3](err=0, week_index, week_start, weeK_end, last_participated_week,
+         last_participated_week_lb, left_retry_times, midnight_circuit_start_time,
+         midnight_circuit_end_time, last_attempt_time)`。
+      · POST → cmd **0x7f**（`postLastWeekData`，body `{"last_participated_week":%d,
+        "last_participated_week_lb":%d,"additional_retry":%d}`，反汇编 0x503800 确认
+        它也是拼 basic_info）：只取 `last_participated_week` /
+        `last_participated_week_lb` / `left_retry_times`，然后回调 vtable[3] 与 vtable[7]。
+      （POST 的 cmd 由 `OnlineCore::postJson` 的第 4 个参数带进去，不是 URL 决定的。）
+
+    客户端契约（`OnlineWeeklyChallenge::parseJsonResponse` cmd 0x76 @0x504f7c）：
+    根对象成员逐个 json_strcmp，命中后取值，最后一次性回调上面那个函数。
+
+    ⚠ 两个坑：
+      1. 键名是 `weeK_end`（**大写 K**，.rodata @0xb8763a 就是这么拼的）。
+         写成 `week_end` 客户端收不到；`week_end` 那个拼法只出现在 config 里
+         （@0xb876f0）。
+      2. `midnight_circuit_start_time` / `midnight_circuit_end_time` 是**午夜杯**
+         （Midnight Circuit）的时间窗，留 0 等于「永不开放」。
+    """
+    now = int(time.time())
+    week_start, week_index = _week_index()
+    payload = {
+        "week_index": week_index,
+        "week_start": week_start,
+        "weeK_end": week_start + _WEEK_SECONDS,   # ★大写 K
+        "last_participated_week": 0,
+        "last_participated_week_lb": 0,
+        "left_retry_times": 3,
+        # 午夜杯先给一个常开窗口（1 小时前 ~ 24 小时后），保证能点进去
+        "midnight_circuit_start_time": now - 3600,
+        "midnight_circuit_end_time": now + 24 * 3600,
+        "last_attempt_time": 0,
+    }
+    print("[liveevent] basic_info week_index=%s" % payload["week_index"], flush=True)
+    return 200, {"Content-Type": "application/json"}, payload
+
+
+def h_liveevents_config(path, query, body, headers):
+    """GET /public/liveevents/v1/weekly_track_system/config/<n> —— 本周挑战配置。
+
+    响应契约（`parseChallengeConfiguration` @0x5055f0，键地址已逐个反汇编确认）：
+        week_index                                        -> cfg+0x00
+        week_settings{week_start, week_end, week_leaderboard,
+                      global_cooldown_time, global_retry_count,
+                      global_gem_amount}                  -> cfg+0x04..0x14, 0x70
+        challenge_settings{track_id, bike_id, bike_skin,
+                           bike_upgrade{handle,engine,wheel,frame},
+                           force_upgrade, task[]}         -> cfg+0x18..0x34, 0x38/0x40
+        extra_settings{ad_reward_skip_cooldown_time,
+                       ad_reward_retry_count}             -> cfg+0x68/0x6c
+        retry_pool[{retry,gems}]                          -> cfg+0x48/0x50/0x58
+    ⚠ 收尾会做 `strcmp(json, "null")`：**响应体字面为 "null" 时回调 err=7** 直接失败。
+    ⚠ 路径末段那个 %d 是客户端传进来的（周号），我们忽略即可，任何值都回同一份配置。
+    """
+    week_start, week_index = _week_index()
+    payload = {
+        "week_index": week_index,
+        "week_settings": {
+            "week_start": week_start,
+            "week_end": week_start + _WEEK_SECONDS,
+            "week_leaderboard": 0,
+            # 冷却/重试：给 0 冷却 + 3 次重试，避免玩家一进去就被冷却卡住
+            "global_cooldown_time": 0,
+            "global_retry_count": 3,
+            "global_gem_amount": 1,
+        },
+        "challenge_settings": {
+            "track_id": _WEEKLY_TRACK_ID,
+            "bike_id": 0,
+            "bike_skin": 0,
+            "bike_upgrade": {"handle": 0, "engine": 0, "wheel": 0, "frame": 0},
+            # 0 = 用玩家自己的车；1 = 强制用上面那台（force_upgrade 只是个布尔）
+            "force_upgrade": 0,
+            # task 故意留空：skill 名字要靠 MissionDB 反查，填错名字有解引用空指针的
+            # 风险。等真机确认过合法 skill 名（.rodata 里疑似有 in_air_upsidedown /
+            # backwheel / fronflip / backflip @0xb86c28）再填。
+            "task": [],
+        },
+        "extra_settings": {
+            "ad_reward_skip_cooldown_time": 0,
+            "ad_reward_retry_count": 1,
+        },
+        "retry_pool": [{"retry": 1, "gems": 1}],
+    }
+    print("[liveevent] config -> 赛道 %d 周号 %d" % (_WEEKLY_TRACK_ID, week_index), flush=True)
+    return 200, {"Content-Type": "application/json"}, payload
+
+
+def h_liveevents_find_opponent(path, query, body, headers):
+    """GET /public/liveevents/v1/weekly_track_system/find_opponent —— 本周对手。
+
+    响应契约（`OnlineWeeklyChallenge::parseJsonResponse` cmd 0x78 @0x505164）：
+        {"opponent": "<str>", "replay_id": <int>}
+    → `ChallengeOpponent+0x00`（mt::String::operator=）/ `+0x20`（int），然后
+      `listener->vtable[1](listener, err=0)`。
+    ⚠ `"opponent"` 在 .rodata 里是 `/find_opponent` 的尾巴子串（@0xb871fe），
+      别被字符串搜索误导成独立常量。
+    名字必须对同一周稳定：客户端会拿它去查头像和幽灵。
+    """
+    name, drive, rec = _robot_opponent(_WEEKLY_TRACK_ID)
+    print("[liveevent] find_opponent -> %s (%d ms)" % (name, drive), flush=True)
+    return 200, {"Content-Type": "application/json"}, {
+        "opponent": name,
+        "replay_id": 0,
+    }
+
+
+def h_liveevents_reward_config(path, query, body, headers):
+    """GET /public/liveevents/v1/weekly_track_system/reward_config/<槽位数> —— 奖励表。
+
+    响应契约（cmd 0x79 @0x5051e8 → `parseRewardsSlot` @0x505d28）：
+    根对象的**每个成员**都被当成一个「奖励槽」，槽名 = 成员键，槽体交给
+    parseRewardsSlot 解析成 `vector<pair<int,int>>`（物品 id + 数量），最后塞进
+    `map<String, vector<pair<int,int>>>`。
+    槽体到底长什么样（对象里包一层 "reward"？还是 [[id,count],…]？）反汇编读下来
+    自相矛盾（配对的第二个 int 取的是**下一个成员**的子节点），所以先回空对象：
+    cmd 0x79 对空的第一个成员有 `cbz` 保护，不会崩，只是奖励界面空着。
+    真机跑通后再按实际需求补。
+    """
+    print("[liveevent] reward_config %s -> {}" % path, flush=True)
+    return 200, {"Content-Type": "application/json"}, {}
+
+
+def h_liveevents_accept(path, query, body, headers):
+    """weekly_track_system 里那几个 POST（start_race / end_race / skip_cooldown /
+    refill_retry_count / last_week_data …）的宽容接收端。
+
+    为什么可以只回 `{"data": []}`：
+      · 这些请求走 `OnlineCore::postJson`（POST + JSON body），
+      · 响应 cmd 落在 0x7a–0x7e，`OnlineWeeklyChallenge::parseJsonResponse`
+        的跳转表把这一段全部指向 **0x5053d8**，而那里只有函数收尾（ret/析构），
+        **一个字节都不解析**——客户端只关心 HTTP 成功。
+    请求体（.rodata 常量，反汇编已确认，逗号后带空格）：
+      start_race       {"gem":%s,"checksum":"%s","timestamp":%u, "restart":%s}
+      end_race         {"score":%u,"checksum":"%s","timestamp":%u}
+      skip_cooldown    {"gem":%s,"skiptimer":%s,"checksum":"%s","timestamp":%u}
+      refill_retry_count {"checksum":"%s","retry_times":"%d","timestamp":%u}
+    checksum 是客户端算的 MD5（`OnlineChecksum::calculateMD5`），我们不做校验。
+    ⚠ 上传周数据（`postLastWeekData`，body 见上面 last_participated_week 那条）
+      **不是独立端点**：它的 URL 也是 basic_info（反汇编 0x503800 `add x2,x2,#0x16c`），
+      只是走 POST + cmd 0x7f。所以由 `h_liveevents_basic_info` 一并覆盖。
+    """
+    b = _json_body(body)
+    print("[liveevent] %s %s <- %s -> data:[]" % (path, query, b), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"data": []}
+
+
 def h_ghost_upload(path, query, body, headers):
     """PUT .../payload 之外落单的二进制上传（老路径），落盘到 inbox 备用。"""
     q = dict(parse_qsl(query, keep_blank_values=True))
@@ -1185,6 +1365,25 @@ DYNAMIC = [
     # A.N.B.A（Robotman）支线的对手查询。前缀匹配顺带兜住 robot_v2
     # （"%s/%s/match/v1/robot_v2?track_name=%s&score=%lu&range=%d" @0xb86362）。
     ("GET", "/public/match/v1/robot", h_match_robot),
+    # 限时活动/赛季：basic_info 是整条支线的入口（POST 与 GET 两个版本真机都发过）。
+    # 它此前落到 rules.json 的 "*" 兜底 {"data": []}，客户端拿到的 week_index 全是 0，
+    # 于是活动列表恒为空。
+    ("GET", "/public/liveevents/v1/weekly_track_system/basic_info", h_liveevents_basic_info),
+    ("POST", "/public/liveevents/v1/weekly_track_system/basic_info", h_liveevents_basic_info),
+    # 活动配置：URL 末段带周号（`config/%d`），只能前缀匹配。
+    ("GET", "/public/liveevents/v1/weekly_track_system/config/", h_liveevents_config),
+    ("POST", "/public/liveevents/v1/weekly_track_system/config/", h_liveevents_config),
+    # 本周对手（无反汇编出来的参数，纯 GET；POST 变体一并用宽容端兜住）。
+    ("GET", "/public/liveevents/v1/weekly_track_system/find_opponent", h_liveevents_find_opponent),
+    ("POST", "/public/liveevents/v1/weekly_track_system/find_opponent", h_liveevents_find_opponent),
+    # 奖励表：URL 末段是槽位数（`reward_config/%d`）。
+    ("GET", "/public/liveevents/v1/weekly_track_system/reward_config/", h_liveevents_reward_config),
+    ("POST", "/public/liveevents/v1/weekly_track_system/reward_config/", h_liveevents_reward_config),
+    # 开赛/完赛/跳冷却/补重试次数——响应在客户端侧完全不被解析，见 h_liveevents_accept。
+    ("POST", "/public/liveevents/v1/weekly_track_system/start_race", h_liveevents_accept),
+    ("POST", "/public/liveevents/v1/weekly_track_system/end_race", h_liveevents_accept),
+    ("POST", "/public/liveevents/v1/weekly_track_system/skip_cooldown", h_liveevents_accept),
+    ("POST", "/public/liveevents/v1/weekly_track_system/refill_retry_count", h_liveevents_accept),
 ]
 
 
