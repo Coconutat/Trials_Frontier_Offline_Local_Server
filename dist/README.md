@@ -218,12 +218,16 @@ Tapjoy 广告墙、AdMob 插屏/激励视频、Flurry、AdColony 全部不会再
 | `POST /v3/profiles/sessions`、`GET /v1/profiles/sessions` | **伪造的育碧账号会话**（ticket / profileId / sessionId 全套），SDK 层认为已登录 |
 | `GET /v1/applications/<appid>/configuration` | **真实现**。返回 `configuration.sandboxes.<name>.{name,friendlyName,url}`。客户端 `parseConfigurationJson` 只认 `friendlyName == "triag_an_lnch61_a_ws"` 或 `"android_beta"` 的 sandbox，写错就不生效 |
 | `GET /`（gamecfg）、`/ingame/.../News/`、`/public/targeting/...`、`/dlcontent_.../info.json` | 桩（返回 `{}`），够用 |
-| `GET /public/receiptvalidation/v1/product/configuration` | 目前走兜底返回 `{}` |
+| `GET /public/receiptvalidation/v1/product/configuration` | **真实现**。客户端 `StoreManager::parseStoreConfiguration` @`0x0057b30c` 只认顶层键 `limited_purchases`（数组，元素字段 `name` / `product_id` / `limit` / `counter` / `fake_counter`）。空数组是安全的 |
+| `POST /v3/profiles/sessions`（登录） | **真实现 + 登录固化**。响应里必须带 `rememberMeTicket`，客户端会把它存进安全存储，下次启动静默换会话，不必再手输账号 |
+| `POST /public/resultservice/v1/enhancestats/track<ID>` | **真实现**。真实跑图成绩落库，按「账号 + 赛道」唯一，只保留更快的 `drivetime` |
+| `GET /public/playerstats/v1/ranking/<board>`、`.../stats/<board>` | **真实现**。赛道榜读落库数据；`global_stats` / `global_stats_donkey` 由赛道记录**实时聚合**（不落库），没跑过的赛道与账号不会出现 |
 | 其它任何请求 | 兜底 200 `{}` |
 
 想看游戏到底在请求什么：
 
 * 浏览器打开 `http://127.0.0.1:8000/__log` → 最近 100 条请求的完整记录。
+* `http://127.0.0.1:8000/__leaderboards` → 落库的每条赛道记录 + 主界面总榜的聚合结果。
 * 或者看 `work/trials-frontier/notes/server-log.jsonl`（每行一条 JSON，含请求头/请求体/响应体/耗时）。
 * `http://127.0.0.1:8000/__ping` → `pong`，用来确认服务器活着。
 
@@ -240,7 +244,10 @@ Tapjoy 广告墙、AdMob 插屏/激励视频、Flurry、AdColony 全部不会再
 * **真钱内购（Google Play IAP）没有伪造**。`tr::StoreManager::purchase` 有两条路径：
   标为 server item 的走「服务器发奖」，其余的走 Google Play。后者没有做假的成功回调。
   不过实机上软货币已经无限（`PlayerItems::remove` 被改成加法），普通商店里能用货币买的东西全部免费。
-* **联机功能不可用**（本来就已停服）：排行榜、好友、邮件、社交这些只是返回空数据或少数写死的假数据。
+* **联机功能部分可用**（官方早已停服，这些全是本地服务器自己造的）：
+  **排行榜已通** —— 你真实跑过的赛道会落库，主界面大榜单由这些真实成绩聚合而成；
+  没跑过的赛道、以及没有真实成绩的两个假好友都不会出现在榜单里。
+  好友/邮件/社交仍是返回空数据或少数写死的假数据；碉堡、午夜杯、限时周赛还没做。
 * 服务器是**开发用桩**，不适合直接暴露到公网。
 
 ---

@@ -37,6 +37,9 @@ DATA = os.path.join(HERE, "data")
 ACCOUNTS = os.path.join(DATA, "accounts.json")
 SESSIONS = os.path.join(DATA, "sessions.json")
 DEVICES = os.path.join(DATA, "devices.json")
+# 长期凭据（育碧叫 rememberMeTicket）。跟 sessions.json 分开存，
+# 因为 sessions 只保留最近 200 张会被裁剪，长期凭据不能被裁掉。
+REMEMBER = os.path.join(DATA, "remember.json")
 SAVE_DIR = os.path.join(DATA, "save")
 GHOST_DIR = os.path.join(DATA, "ghosts")
 
@@ -131,13 +134,22 @@ def parse_authorization(headers):
         decoded = ""
     info = {"kind": None, "raw": raw, "scheme": scheme, "token": token, "decoded": decoded}
 
+    # ★ 我们自己签发的票据一律 tf- 开头，**任何 scheme 下都当票据处理**。
+    #   必须放在 UbiMobile 分支之前：登录固化用的 rememberMeTicket 就是这种长票据，
+    #   若被误判成设备 token，会解出一个根本不存在的 device_id，
+    #   于是静默掉进匿名槽 —— 表现就是"每次重启都要重新登录"。
+    if token.startswith("tf-") or decoded.startswith("tf-"):
+        info["kind"] = "bearer"
+        info["ticket"] = token if token.startswith("tf-") else decoded
+        info["decoded_ticket"] = decoded
+        return info
+
     if scheme.lower().startswith("ubimobile"):
         info["kind"] = "device"
         info["device_id"] = decoded.split(":")[0] if decoded else ""
         return info
 
-    # 我们自己签发的票据一律是 tf- 开头，不能被误当成"用户名:口令"
-    if not token.startswith("tf-") and ":" in decoded:
+    if ":" in decoded:
         info["kind"] = "basic"
         info["username"], info["password"] = decoded.split(":", 1)
         return info
@@ -274,8 +286,10 @@ def delete_account(username):
 def list_accounts_public():
     """给网页/内省用：去掉口令与盐。"""
     db = _load(ACCOUNTS, {})
+    remember = _load(REMEMBER, {})
     out = []
     for key, acc in sorted(db.get("users", {}).items()):
+        rm = remember.get(key) or {}
         out.append({
             "username": acc.get("username", key),
             "nameOnPlatform": acc.get("nameOnPlatform"),
@@ -286,6 +300,11 @@ def list_accounts_public():
             "last_login_iso": _iso(acc.get("last_login")),
             "logins": acc.get("logins", 0),
             "banned": bool(acc.get("banned")),
+            # 登录固化状态：有 ticket 就说明这台服务器已经给过长期凭据，
+            # 客户端下次启动应当能静默换会话，不必再手输账号。
+            "rememberTicket": rm.get("ticket"),
+            "remember_since_iso": _iso(rm.get("created")),
+            "remember_uses": rm.get("uses", 0),
         })
     return out
 
@@ -314,6 +333,77 @@ def account_by_ticket(ticket):
         if not sess:
             return None
         return _load(ACCOUNTS, {}).get("users", {}).get(sess.get("user", ""))
+
+
+# ------------------------------------------------------- 长期凭据（登录固化）
+def issue_remember_ticket(acc):
+    """签发 / 复用该账号的 rememberMeTicket —— 登录固化的关键。
+
+    ★ 为什么需要它（反汇编依据）：
+      `Playground::Credentials::SaveToPersistentStorage()` @0x1856a0 把凭据存进
+      SecureInfoManager；下次启动时 `Playground::Credentials::AreValid()` 会调
+      `IsRememberMeTicket()` @0x1851e4，为真则走
+      `USDataAuthenticationConverters::Convert()` @0x1903c4 的分支：
+          PlayerCredentials(ubiservices::String(ticket), /*type=*/7, /*rememberMe=*/0)
+      也就是"拿长期票据直接静默换会话"。
+      票据的来源是 `ubiservices::SessionInfo::getRememberMeTicket()` @0x4705b8，
+      而它读的就是 `/v3/profiles/sessions` 响应里的 `rememberMeTicket` 字段
+      （字段名 @0x00834288，同一个解析器里还有 ticket/userId/expiration/sessionKey…）。
+
+      我们以前的响应只有 `"rememberMe": true` 却**没有** `rememberMeTicket`，
+      客户端拿不到可长期复用的凭据 ⇒ 每次重启只能退回设备静默匿名会话
+      （`Player-C83D83` 那个槽），于是玩家看到的是"没有分数记录、没有在线碉堡"，
+      必须手动再登录一次。
+
+    票据做成**每账号稳定**的：同一个账号反复登录拿到同一张，
+    这样即使客户端把旧票据存了很久也依然有效。
+    """
+    if not acc:
+        return None
+    key = (acc.get("username") or "").lower()
+    if not key:
+        return None
+    with _LOCK:
+        db = _load(REMEMBER, {})
+        rec = db.get(key)
+        if rec and rec.get("ticket"):
+            ticket = rec["ticket"]
+            rec["last_used"] = int(time.time())
+            rec["uses"] = rec.get("uses", 0) + 1
+        else:
+            ticket = "tf-rm-%s-%s" % (key[:12], binascii.hexlify(os.urandom(4)).decode("ascii"))
+            rec = {"ticket": ticket, "profileId": acc.get("profileId"),
+                   "created": int(time.time()), "uses": 1}
+            print("[acct] 为 %s 签发长期凭据 %s" % (key, ticket), flush=True)
+        db[key] = rec
+        _store(REMEMBER, db)
+    return ticket
+
+
+def account_by_remember_ticket(ticket):
+    """长期凭据 -> 账号。被 authenticate() 的 bearer 分支调用。"""
+    if not ticket:
+        return None
+    with _LOCK:
+        for key, rec in _load(REMEMBER, {}).items():
+            if rec.get("ticket") == ticket:
+                return _load(ACCOUNTS, {}).get("users", {}).get(key)
+    return None
+
+
+def list_remember_tickets():
+    with _LOCK:
+        return dict(_load(REMEMBER, {}))
+
+
+def forget_remember_ticket(username):
+    """踢掉某个账号的长期凭据（管理用）。返回被删的票据或 None。"""
+    key = (username or "").lower()
+    with _LOCK:
+        db = _load(REMEMBER, {})
+        rec = db.pop(key, None)
+        _store(REMEMBER, db)
+    return rec.get("ticket") if rec else None
 
 
 # ------------------------------------------------------------- 设备（未登录）
@@ -412,6 +502,11 @@ def authenticate(headers):
         if acc:
             return {"kind": "account", "who": acc["username"].lower(),
                     "profileId": acc["profileId"]}, None
+        # 长期凭据（rememberMeTicket）：登录固化的静默会话走这条
+        acc = account_by_remember_ticket(c)
+        if acc:
+            return {"kind": "account", "who": acc["username"].lower(),
+                    "profileId": acc["profileId"]}, None
         dev = device_by_ticket(c)
         if dev:
             return {"kind": "device", "who": "device:" + str(dev.get("deviceId"))[:8],
@@ -428,17 +523,28 @@ def lookup_account(username):
 
 
 # ------------------------------------------------------------------ 会话响应
-def session_body(acc, ticket, remember_me=False):
-    """育碧 /v3/profiles/sessions 的响应体（实测字段）。"""
+def session_body(acc, ticket, remember_me=False, remember_ticket=None):
+    """育碧 /v3/profiles/sessions 的响应体（实测字段）。
+
+    ★ `rememberMeTicket` 是**登录固化**的必需字段，不是可选装饰：
+      `ubiservices::SessionInfo::getRememberMeTicket()` @0x4705b8 读它，
+      游戏侧 `Playground::Credentials::SaveToPersistentStorage()` @0x1856a0 把它
+      存进安全存储，下次启动 `IsRememberMeTicket()` 为真就用
+      `PlayerCredentials(ticket, type=7, rememberMe=0)`（`Convert()` @0x1903c4）
+      静默换会话。缺了它，客户端每次重启都会退回设备匿名会话。
+    字段名与同族键（ticket/userId/expiration/rememberMeTicket/sessionKey…）
+    都在 libubiservices.so 的同一个 session 解析器里，`rememberMeTicket` @0x00834288。
+    """
     if acc:
         pid = acc["profileId"]
         name = acc.get("nameOnPlatform") or acc["username"]
     else:
         pid = ANON_PROFILE_ID
         name = "LocalPlayer"
-    return {
+    body = {
         "platformType": "ubimobile",
         "ticket": ticket,
+        "twoFactorAuthenticationTicket": None,
         "profileId": pid,
         "userId": pid,
         "nameOnPlatform": name,
@@ -452,6 +558,9 @@ def session_body(acc, ticket, remember_me=False):
         "sessionKey": "tf-local-session-key",
         "rememberMe": bool(remember_me),
     }
+    if remember_ticket:
+        body["rememberMeTicket"] = remember_ticket
+    return body
 
 
 def profile_body(acc):

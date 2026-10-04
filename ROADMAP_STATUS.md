@@ -1,7 +1,7 @@
 # ROADMAP 进度与任务规划
 
 > 对应根目录 [`ROADMAP.md`](ROADMAP.md)。本文档记录每一条的**当前完成度、证据、缺口、下一步动作**。
-> 最后更新：2026-10-04 11:45（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
+> 最后更新：2026-10-04 19:10（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
 
 ---
 
@@ -12,7 +12,7 @@
 | 1 | 修复 APK 启动 BUG（联网闪退） | ✅ **已修复并实机验证（m14/m15）** | 100% |
 | 2 | 修复账号管理（注册 / 登录分离） | ✅ **已实现并 curl 实测（含内置注册页）** | 85% |
 | 2b | VIP 下发（买了 VIP 就激活 VIP 事件） | ✅ **已实机验证（m16）** | 100% |
-| 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🔴 端点骨架在，玩法未通 | 25% |
+| 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **排行榜已真实落库 + 主榜聚合；限时活动/碉堡/午夜杯待做** | 40% |
 | 4 | WebUI 管理界面 | 🟡 **已起头：`/__ui` 注册页 + `/__api/*`** | 15% |
 | 5 | 一键开服打包成 exe | ⚪ 未开始 | 0% |
 
@@ -221,7 +221,25 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
   `%s/%s/userstorage/v2/search/%s/%s`@`0xb8c71f`、`content/%s/%d`@`0xb8c741`、
   `content/%s/%d/payload`@`0xb8c700`（`payloadUploadUrl`@`0xb8c77a`、`downloadUrls`@`0xb8c78b`）。
   这是"从排行榜下载别人幽灵"的正路，目前只覆盖了 `resultservice` 那条。
-- **排行榜没人**：`playerstats/v1/ranking/*` 只是兜底 200，没有真实榜单数据。
+- **排行榜：真实成绩落库 + 主界面总榜聚合**（2026-10-04 重做）
+  - 旧实现会给**没跑过的赛道**生成随机记录、时间也对不上，玩家的反馈是
+    「时间和记录对不上，然后我没跑的也有记录」。现已删除全部合成数据。
+  - 落库规则（`server/tf_server.py` 的 `_record_result`）：按 **(账号, 赛道)** 唯一，
+    同一赛道只保留更快的 `drivetime`，更慢的提交直接丢弃；`global_score` 只在客户端真的
+    带了这个字段时才写，不再用 `score_value` 伪造。
+  - **只信单赛道提交**：`POST /public/resultservice/v1/enhancestats/track<ID>` 才算一次真实跑图；
+    `POST .../batch_update` 是启动时把本地整张 `highscores` 表重发一遍（里面含解锁但从未跑过的图），
+    现在**明确忽略**，不再污染排行榜。
+  - **主界面大榜单**（`/public/playerstats/v1/ranking/global_stats` 与 `global_stats_donkey`）
+    改为**实时聚合视图**、不落库：把该账号每一条真实赛道记录汇总成一行
+    （`data` = 已完成赛道数、`drivetime` = 各图最佳时间之和、`score_value`/`global_score` = 各图分数之和、
+    `upgrades`/`extradata` 按位掩码合并），按 `global_score` 降序排名。
+    **一张图都没跑过就不会出现在总榜里。**
+  - 新增诊断端点 `GET /__leaderboards`：可直接看到落库的每条赛道记录与总榜聚合结果。
+  - 回归测试 `REGRESSION PASS`：批量同步不入库；`track100` 依次提交 30000 / 35000 / 28000 后
+    只剩 28000 一条；未提交的 `track999` 保持空榜；总榜聚合出 `tracks=2`。
+- 好友位仍是写死的 `GhostRider` / `TangoPro`，但它们没有真实成绩，
+  因此不会出现在任何榜单里 —— 这是刻意的（旧版给它们塞假成绩正是报障根源）。
 - **限时活动 / 赛季**：`liveevents/v1/*` 未构造真实数据；很多现时内购礼包需要服务器触发。
 - **碉堡 / 午夜杯**：未做。
 

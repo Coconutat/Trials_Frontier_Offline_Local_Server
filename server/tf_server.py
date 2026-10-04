@@ -29,6 +29,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -176,7 +177,31 @@ def h_session(path, query, body, headers):
                             else "用户名或密码不正确"),
             }
         ticket = acct.issue_session(acc)
-        return 200, {"Content-Type": "application/json"}, acct.session_body(acc, ticket, remember)
+        # ★ 登录固化：把长期凭据一并发下去，客户端会存进安全存储，
+        #   下次启动就能静默换会话，不必再让玩家手输账号（见 tflocal_accounts
+        #   里 issue_remember_ticket 的反汇编依据）。
+        rm = acct.issue_remember_ticket(acc)
+        return 200, {"Content-Type": "application/json"}, \
+            acct.session_body(acc, ticket, remember, remember_ticket=rm)
+
+    # ★ 登录固化的静默换会话：客户端拿我们发过的长期凭据（rememberMeTicket）
+    #   或普通会话票来换新会话，不该再退化成匿名槽。
+    #   依据：Playground::Credentials::Convert() @0x1903c4 的 type=7 分支
+    #   会把 rememberMeTicket 当票据重新走一次会话建立。
+    # 登录固化：票据既可能出现在 Authorization 头，也可能被放在请求体里，
+    # 两条路径都要认（SDK 的 PlayerCredentials 走头，但保不齐换个版本走体）。
+    body_tok = js.get("rememberMeTicket") or js.get("ticket")
+    if info.get("kind") == "bearer" or (body_tok and not username):
+        tok = info.get("ticket") or body_tok
+        acc = acct.account_by_remember_ticket(tok) or acct.account_by_ticket(tok)
+        if acc is not None:
+            rm = acct.issue_remember_ticket(acc)
+            return 200, {"Content-Type": "application/json"}, \
+                acct.session_body(acc, acct.issue_session(acc), True, remember_ticket=rm)
+        dev = acct.device_by_ticket(tok)
+        if dev is not None:
+            return 200, {"Content-Type": "application/json"}, \
+                acct.session_body(dev, dev["ticket"], remember)
 
     # 设备静默登录：按设备 id 分配独立的 profileId，
     # 这样不登录的多台设备不会挤在同一个槽里互相覆盖存档。
@@ -525,9 +550,196 @@ def h_vip_badge_option(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"badge_display": val}
 
 
+LEADERBOARD_PATH = os.path.join(HERE, "data", "leaderboards.json")
+LEADERBOARD_LOCK = threading.Lock()
+
+
+def _load_leaderboards():
+    try:
+        with open(LEADERBOARD_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_leaderboards(obj):
+    os.makedirs(os.path.dirname(LEADERBOARD_PATH), exist_ok=True)
+    tmp = LEADERBOARD_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, LEADERBOARD_PATH)
+
+
+def _record_result(profile_id, track_name, stats):
+    """保存一条真实成绩；同一账号/赛道只保留最佳 drivetime。"""
+    if not profile_id or not track_name or not isinstance(stats, dict):
+        return False
+    try:
+        drivetime = int(stats.get("drivetime", 0))
+    except (TypeError, ValueError):
+        return False
+    if drivetime <= 0:
+        return False
+    clean = {
+        "player": profile_id,
+        "drivetime": drivetime,
+        "score_value": int(stats.get("score_value", 0) or 0),
+        "submittime": int(stats.get("submittime", 0) or 0),
+        "data": int(stats.get("data", 0) or 0),
+        "upgrades": int(stats.get("upgrades", 0) or 0),
+        "extradata": int(stats.get("extradata", 0) or 0),
+        "updated": int(time.time()),
+    }
+    if "global_score" in stats:
+        try:
+            clean["global_score"] = float(stats["global_score"])
+        except (TypeError, ValueError):
+            pass
+    with LEADERBOARD_LOCK:
+        db = _load_leaderboards()
+        board = db.setdefault(track_name, {})
+        old = board.get(profile_id)
+        if old is not None and int(old.get("drivetime", 0)) <= drivetime:
+            return False
+        board[profile_id] = clean
+        _save_leaderboards(db)
+    return True
+
+
+def h_result_stats(path, query, body, headers):
+    """接收真实跑图成绩，禁止用启动批量同步污染排行榜。"""
+    payload = _json_body(body)
+    caller, err = acct.authenticate(headers)
+    if err or not caller or caller.get("kind") != "account":
+        return 401, {"Content-Type": "application/json"}, {"error": "invalid-credentials"}
+    profile_id = caller["profileId"]
+
+    # batch_update 是启动/进度同步：它会把本地已有的整张 highscores 表
+    # 再发一遍，其中可能包含解锁但从未实际跑过的赛道。真正跑完一张图时，
+    # 客户端还会发 /enhancestats/track<ID>；排行榜只信这条单赛道提交。
+    endpoint = path.rstrip("/").rsplit("/", 1)[-1]
+    if endpoint == "batch_update":
+        print("[rank-save] profile=%s ignored=batch_update" % profile_id, flush=True)
+        return 200, {"Content-Type": "application/json"}, {"data": []}
+
+    track = endpoint.strip()
+    if not re.fullmatch(r"track[0-9]+", track):
+        return 400, {"Content-Type": "application/json"}, {"error": "invalid-track"}
+    updates = payload.get("updates", []) if isinstance(payload, dict) else []
+    accepted = 0
+    if isinstance(updates, list) and updates:
+        # 单赛道请求的 body 通常是 updates:[{stats:...}]；忽略其中可能
+        # 被篡改的 track_name，赛道身份以 URL 为准。
+        for item in updates:
+            if isinstance(item, dict) and _record_result(profile_id, track, item.get("stats") or {}):
+                accepted += 1
+    elif isinstance(payload, dict):
+        stats = payload.get("stats") or payload
+        if _record_result(profile_id, track, stats):
+            accepted = 1
+    print("[rank-save] profile=%s track=%s accepted=%d" %
+          (profile_id, track, accepted), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"data": []}
+
+
+GLOBAL_LEADERBOARDS = {"global_stats", "global_stats_donkey"}
+
+
+def _aggregate_global_entries():
+    """从真实单赛道记录计算主界面总榜；不为未跑赛道创建行。"""
+    with LEADERBOARD_LOCK:
+        db = _load_leaderboards()
+    totals = {}
+    for board, records in db.items():
+        if board in GLOBAL_LEADERBOARDS or not board.startswith("track"):
+            continue
+        for profile_id, row in (records or {}).items():
+            try:
+                drivetime = int(row.get("drivetime", 0))
+            except (TypeError, ValueError):
+                continue
+            if drivetime <= 0:
+                continue
+            out = totals.setdefault(profile_id, {
+                "player": profile_id,
+                "data": 0,
+                "upgrades": 0,
+                "submittime": 0,
+                "drivetime": 0,
+                "score_value": 0,
+                "extradata": 0,
+                "global_score": 0.0,
+                "updated": 0,
+            })
+            out["data"] += 1
+            # upgrades/extradata 是位掩码，合并而非相加。
+            out["upgrades"] |= int(row.get("upgrades", 0) or 0)
+            out["extradata"] |= int(row.get("extradata", 0) or 0)
+            out["submittime"] = max(out["submittime"], int(row.get("submittime", 0) or 0))
+            out["drivetime"] += drivetime
+            out["score_value"] += int(row.get("score_value", 0) or 0)
+            if "global_score" in row:
+                out["global_score"] += float(row.get("global_score") or 0)
+            else:
+                # 客户端单图提交没有 global_score；总榜分数用真实单图
+                # score_value 的和推导，不生成任何额外赛道记录。
+                out["global_score"] += float(row.get("score_value", 0) or 0)
+            out["updated"] = max(out["updated"], int(row.get("updated", 0) or 0))
+    rows = list(totals.values())
+    rows.sort(key=lambda r: (-float(r["global_score"]), -int(r["data"]), r["player"]))
+    return [dict(row, rank=rank) for rank, row in enumerate(rows, 1)]
+
+
+def _stored_entries(board, requested_players=None):
+    if board in GLOBAL_LEADERBOARDS:
+        rows = _aggregate_global_entries()
+    else:
+        with LEADERBOARD_LOCK:
+            rows = list((_load_leaderboards().get(board) or {}).values())
+        rows.sort(key=lambda r: (int(r.get("drivetime", 0)), str(r.get("player", ""))))
+        rows = [dict(row, rank=rank) for rank, row in enumerate(rows, 1)]
+    wanted = set(requested_players or [])
+    if wanted:
+        rows = [r for r in rows if r.get("player") in wanted]
+    return rows
+
+
+def _rank_entry(row):
+    return {
+        "player": row["player"],
+        "rank": int(row["rank"]),
+        "stats": {k: row[k] for k in (
+            "data", "upgrades", "submittime", "drivetime",
+            "score_value", "extradata", "global_score") if k in row},
+    }
+
+
+def h_playerstats_ranking(path, query, body, headers):
+    board = path.rstrip("/").rsplit("/", 1)[-1] or "unknown"
+    q = dict(parse_qsl(query, keep_blank_values=True))
+    players = [x for x in (q.get("players") or "").split(",") if x]
+    rows = _stored_entries(board, players)
+    return 200, {"Content-Type": "application/json"}, {
+        "leaderboard": board, "playerCount": len(rows), "httpCode": 200,
+        "results": [_rank_entry(r) for r in rows],
+    }
+
+
+def h_playerstats_stats(path, query, body, headers):
+    board = path.rstrip("/").rsplit("/", 1)[-1] or "unknown"
+    q = dict(parse_qsl(query, keep_blank_values=True))
+    players = [x for x in (q.get("players") or "").split(",") if x]
+    rows = _stored_entries(board, players or [_caller_profile(headers)])
+    return 200, {"Content-Type": "application/json"}, {
+        "statboard": board,
+        "results": [_rank_entry(rows[0])] if rows else [],
+    }
+
+
 DYNAMIC_EXACT = [
-    ("POST", "/v1/profiles/sessions", h_session),
-    ("POST", "/v3/profiles/sessions", h_session),
+    ("POST", "/public/resultservice/v1/enhancestats/batch_update", h_result_stats),
+    ("POST", "/public/resultservice/v1/enhancestats/track", h_result_stats),
     ("POST", "/public/playerprogress/v1/progress", h_progress),
     ("GET", "/public/playerprogress/v1/progress", h_progress_latest),
     ("GET", "/public/playerprogress/v1/progress/version", h_progress_version),
@@ -551,6 +763,11 @@ DYNAMIC_EXACT = [
 
 DYNAMIC = [
     ("GET", "/public/timeservice/v1/gettime", h_timeservice),
+    # 排行榜与玩家统计（板名在路径末段，只能用前缀匹配）：
+    #   /public/playerstats/v1/ranking/{track66633|track1097|legends|global_stats…}
+    #   /public/playerstats/v1/stats/{...}?players=
+    ("GET", "/public/playerstats/v1/ranking/", h_playerstats_ranking),
+    ("GET", "/public/playerstats/v1/stats/", h_playerstats_stats),
 ]
 
 
@@ -561,6 +778,8 @@ def pick_dynamic(method, path):
     for m, p, fn in DYNAMIC_EXACT:
         if m == method and path == p:
             return fn, "dyn:%s %s" % (m, p)
+    if method == "POST" and path.startswith("/public/resultservice/v1/enhancestats/"):
+        return h_result_stats, "dyn:result-stats"
     # 幽灵：resultservice 下的 ghost / replaydata（GET 取幽灵，POST 上传幽灵）
     if _looks_like_ghost(path) and path.startswith("/public/resultservice/"):
         return (h_ghost_upload if method == "POST" else h_ghost), "dyn:ghost"
@@ -866,6 +1085,24 @@ class Handler(BaseHTTPRequestHandler):
             if not got:
                 return js({"error": "no snapshot %s for %s" % (ts, pid)}, 404)
             return js({"ok": True, "profileId": pid, "ts": ts})
+        if path == "/__leaderboards":
+            # 排行榜诊断：track 榜是原始落库数据，global_stats 是实时聚合视图。
+            db = _load_leaderboards()
+            tracks = {}
+            for board, records in sorted(db.items()):
+                rows = sorted((records or {}).values(),
+                              key=lambda r: int(r.get("drivetime", 0)))
+                tracks[board] = [{"rank": i, "player": r.get("player"),
+                                  "drivetime": r.get("drivetime"),
+                                  "score_value": r.get("score_value")}
+                                 for i, r in enumerate(rows, 1)]
+            global_rows = [{"rank": r["rank"], "player": r["player"],
+                            "tracks": r["data"], "total_drivetime": r["drivetime"],
+                            "global_score": r["global_score"]}
+                           for r in _aggregate_global_entries()]
+            return js({"tracks": tracks,
+                       "global_stats": global_rows,
+                       "note": "global_stats 由真实单赛道记录实时聚合，不落库"})
         if path == "/__ghosts":
             root = acct.GHOST_DIR
             out = {}
@@ -879,6 +1116,7 @@ class Handler(BaseHTTPRequestHandler):
                                      "/__history?profile=<pid>",
                                      "/__restore?profile=<pid>&ts=<时间戳|latest>",
                                      "/__ghosts",
+                                     "/__leaderboards（排行榜落库与主榜聚合）",
                                      "/__register（注册网页，也可用 /__ui）",
                                      "POST /__api/register {username,password,nameOnPlatform}",
                                      "POST /__api/login {username,password}",

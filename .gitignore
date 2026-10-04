@@ -24,6 +24,8 @@ __pycache__/
 server/data/accounts.json
 server/data/sessions.json
 server/data/devices.json
+server/data/remember.json
+server/data/leaderboards.json
 # 玩家存档（真实进度，含金币 / 赛道纪录 / identifier）
 server/data/save/
 # 从设备抓下来的幽灵二进制（游戏数据）；ghosts/README.md 保留
