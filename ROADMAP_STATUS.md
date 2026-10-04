@@ -1,7 +1,7 @@
 # ROADMAP 进度与任务规划
 
 > 对应根目录 [`ROADMAP.md`](ROADMAP.md)。本文档记录每一条的**当前完成度、证据、缺口、下一步动作**。
-> 最后更新：2026-10-04 20:00（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
+> 最后更新：2026-10-04 22:40（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
 
 ---
 
@@ -15,6 +15,7 @@
 | 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **排行榜 + 幽灵已通；限时活动/碉堡/午夜杯待做** | 55% |
 | 4 | WebUI 管理界面 | 🟡 **已起头：`/__ui` 注册页 + `/__api/*`** | 15% |
 | 5 | 一键开服打包成 exe | ⚪ 未开始 | 0% |
+| 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
 
 ---
 
@@ -321,6 +322,75 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
 
 ---
 
+## 6. 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>`（`files/` 已挪出私有目录）
+
+> 用户要求（2026-10-04）：**「现在游戏所有数据都在 `/data/data/包名`，我们能不能让他重定向到 `/sdcard/Android/data/包名`。」**
+> 目的：存档 / 幽灵 / 下载内容包放到用户可访问的共享目录，方便备份、换机、用文件管理器直接改。
+
+### ✅ 已完成并实机验证（含 `adb reboot` 后自动恢复）
+
+**方案：ext4 绑定挂载**（**不是**软链接）
+
+```sh
+mount --bind /data/media/0/Android/data/$PKG/files /data/data/$PKG/files
+```
+
+- 关掉游戏 → `mkdir -p /data/data/$PKG/files` → `mount --bind <底层 ext4 路径> <私有目录>`
+  → 游戏数据落在 `/data/media/0/Android/data/$PKG/files`，同时**照旧能在 `/sdcard/Android/data/$PKG/files` 看到和编辑**（同一批 inode）。
+- 一次性/手工：`sh tools/tf_redirect_mount.sh`；回滚：`sh tools/tf_redirect_unmount.sh`（会先 `am force-stop`，再把外部目录里的游戏数据搬回私有目录）。
+- 幂等：已挂载时再执行直接 `exit 0`，可安全重复调用。
+
+### ★ 为什么必须绑 ext4 路径，而不是绑 `/sdcard/...`
+- `/sdcard/Android/data` 是 **sdcardfs** 视图（`/data/media on /mnt/user/0/emulated/0/Android/data type sdcardfs`），
+  而 `/data/media/0/Android/data/$PKG` 本身是**纯 ext4**（`/dev/block/sda21`，标签 `u:object_r:media_rw_data_file:s0`）。
+- 绑底层 ext4 ⇒ 游戏拿到**正常 ext4 语义**；绑 sdcardfs ⇒ 会踩到 sdcardfs 的路径/权限怪行为。
+
+### ⛔ 走过的弯路：整目录软链接（**已否决，别再试**）
+第一版把 `/data/data/$PKG/files` 换成 `ln -s /sdcard/Android/data/$PKG/files`。结果**游戏一进 `CustomNativeActivity` 就 SIGSEGV，2/2 复现**，回滚后立刻恢复。tombstone：
+
+```
+signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer dereference
+#00 libc.so (__strcmp_aarch64+32)
+#01/#02 libTrialsGo.so 0x8b4c18 / 0x8b4dcc
+#03 mz::IAPManagerAndroid::queryProducts(...)+500   = 0x889008
+#04 mz::IAPManager::queryProducts(...)+124          = 0x88a314
+#05 tr::StoreManager::reinit()+396                  = 0x579180
+#06 tr::StoreManager::init()+40                     = 0x578fcc
+#07 tr::GlobalData::init(mz::InputPointerState*)+1216 = 0x4d0a5c
+#08 tr::MainApp::init()+112                         = 0x8436a0
+```
+
+根因（`tmp/disasm.py` 实证）：`IAPManager_CallInit` 包装函数在
+`0x8b4da8 cbz x8, 0x8b4e24` / `0x8b4dac cbz x20, 0x8b4e44` 处发现 **portal 名为 NULL** 时，
+`0x8b4e44` 只打了一条警告（`IAPManager_CallInit: IAP called on an unvailable store. Please check your db file` @`0xbac6dd`）
+**然后 `0x8b4e60 b #0x8b4db0` 又跳回去继续，把 NULL 传给 `IAPManager_CallInit`** →
+`strcmp("Google Play", NULL)` 崩在第 0 页。**这是游戏自身的上游 bug**；
+真正的诱因是软链接把 `files/` 的路径解析重定向到了 sdcardfs，导致它读不到拿 portal 名所需的那份 db/配置。
+
+> 教训：**在这个游戏上改动 `files/` 的落盘位置，唯一可行的是绑定挂载到真正的 ext4 目录。**
+> 任何把访问重定向到 sdcardfs 的方案（软链接、bind 到 `/sdcard/...`）都会让启动段错误。
+
+### 持久化：KernelSU 开机钩子（重启实测通过）
+- 设备有 `/data/adb/service.d/` 与 `/data/adb/modules/`，但**原本没有 `/data/adb/post-fs-data.d/`**，已新建。
+- `tf_files_bind.sh` 同时装到 **`/data/adb/post-fs-data.d/tf_files_bind.sh`** 与 **`/data/adb/service.d/tf_files_bind.sh`**（`chmod 0755`），
+  内容即幂等调用 `tools/tf_redirect_mount.sh`。
+- **`adb reboot` 实测**：重启后 `uptime` = `up 1 min`、`sys.boot_completed=1`，
+  `/proc/mounts` 里 3 条绑定（`/data/data/...`、`/data/user/0/...`、`/data_mirror/data_ce/null/0/...`）仍在，
+  `/data/data/$PKG/files` 仍是 136 项 ⇒ **无需任何人工干预即自动恢复**。
+
+### SELinux 结论（Enforcing 下也成立）
+- 私有目录标签 `u:object_r:app_data_file:s0:c512,c768`；外部目录及其内容 `u:object_r:media_rw_data_file:s0`（底层）/ `sdcardfs:s0`（`/sdcard` 视图）。
+- 绑定挂载后 `ls -Z` 显示目录是 `media_rw_data_file:s0`，里面**游戏自己新建**的文件是 `app_data_file:s0:c512,c768`。
+- logcat 里**没有任何涉及 `media_rw_data_file` 的 `avc: denied`** ⇒ `untrusted_app` 读写 `media_rw_data_file` 是被允许的。
+- 目录属主 `u0_a296 sdcard_rw`（10296:1015），与重定向前一致。
+
+### 验证证据
+- 重定向后游戏正常启动（进程存活），并在 `/sdcard/Android/data/$PKG/files` 里看到**新的写入**：
+  `player.bin`（4015 B）、`pvp_ghost_1_1041_328389155.bin`（1888 B）。
+  后者**顺带真机证实了 §3 的「PVP 对手幽灵下发」真的落地了**。
+
+---
+
 ## 附：当前交付物
 
 | 路径 | 说明 |
@@ -330,6 +400,8 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
 | `dist/server/` | 本地服务器（`tf_server.py`、`tflocal_accounts.py`、`rules.json`、`data/ghosts/`） |
 | `dist/README.md` | 完整交付说明（526 行，含内购破解章节） |
 | `tools/patch_native.py` | 10 条 native 补丁，`--dry-run` 对原版 `libTrialsGo.so` 自检全 `[OK]` |
+| `tools/tf_redirect_mount.sh` | 把 `files/` 绑定挂载到 `/sdcard/Android/data/<pkg>/files`（幂等，见 §6） |
+| `tools/tf_redirect_unmount.sh` | 卸载绑定并把游戏数据搬回私有目录（回滚用，见 §6） |
 | `tmp/build/tf-m8-release-backup.apk` | 上一版发布基线备份（无 IAP 补丁） |
 
 ### 构建流水线

@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# 设备端 shell 脚本必须保持 LF：拷到 Android 上执行时，行尾的 \r 会让 sh 报错
+*.sh text eol=lf
