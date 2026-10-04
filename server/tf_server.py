@@ -876,6 +876,204 @@ def h_liveevents_accept(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
 
+# ---------------------------------------------------------------------------
+# 碉堡 / PVP —— /public/pvp_matches/v1/*
+#
+# 请求 → (方法, URL, cmd) 全表（cmd 已逐个反汇编确认；getRequest 的 cmd 在 w3，
+# postJson 的在 w4）：
+#   POST pvp_init                    0x27  OnlinePVP::initMatches      @0x4f9bd8
+#   POST tracks                      0x2e  submitUnlockedTracks       @0x4f9ac0
+#   GET  matches/%d                  0x29  queryMatch                 @0x4f9ffc
+#   GET  matches                     0x2a  queryMatches               @0x4fa118
+#   GET  player/%s                   0x2b  queryPlayerRanking         @0x4fa768
+#   GET  new_ranked?…                0x28  startRankedMatch           @0x4f9d88
+#   POST race                        0x2d  submitMatchResult          @0x4fa528
+#   GET  pvp_config?lang=%s          0x30  getSeasonData              @0x4fa9f0
+#   GET  season/%d?lang=%s           0x31  getSeasonDataById          @0x4faaec
+#   GET  …（2KB 缓冲，横幅）          0x32  getSeasonBanner            @0x4fabf0
+#   POST increase_rewards            0x33  submitMatchRewards         @0x4faf94
+#   POST chips                       0x34  spendChips                 @0x4fb1f8
+#   POST close_season                0x36  closeSeason                @0x4fb994
+#   GET  players?profiles=           0x37  getFriendLeaderboard       @0x4fb650
+#
+# 响应分派：`OnlinePVP::parseJsonResponse` @0x4fc108，跳转表 @0xb86448，
+# `sub w8, cmd, #0x27; cmp w8, #0x11`。**碉堡的总闸是 cmd 0x27（pvp_init）**：
+# 它的响应是一个根对象，只看三个成员键（0x4fc1c4 的循环里只有三次 json_strcmp）：
+#   "player_info" @0xb86901 -> parseRankingData(node, PVPPlayerData@query+0x44)
+#   "match_info"  @0xb8690d -> parseMatches(node, vector<PVPMatch>@query+0x78)
+#   "pvp_config"  @0xb86918 -> parseSeason(node, PVPSeason@query+0xa0, &banner_url)
+# 循环结束后 `OnlinePVPMatchQuery::resolveOpponentNames()`，随后若 banner_url 非空
+# 就再拉一次 getSeasonBanner（cmd 0x32），最后回调 listener。
+#
+# ⚠ 客户端 JSON 解析器**不做类型检查**，一律按 32 位字从 `[node+0x28]` 读，
+#   所以「对象形态不明的键」宁可**不发**（字段保持默认值），也不要发错类型。
+#   `star_array` / `product_list` / `rewards` 就是这么处理的。
+# ---------------------------------------------------------------------------
+
+
+def _pvp_player_info(chips=200, tickets=3):
+    """`parseRankingData` @0x4fc918 的响应契约（键地址已逐个确认）。
+
+    +0x00 `rank`(0xb869b5) / +0x04 `star`(0xb86947) / +0x08 `elo_rank`(0xb869b1)
+    / +0x0c `season`(0xb868e5) / +0x10 `golden_ticket`(0xb899a0)
+    / +0x14 `chips`(0xb49233) / +0x18 `win_streak`(0xb86a12)。
+    ⚠ 另有一个键 `elo`(0xb86a0e) 走 `ldr d0,[node+0x28]; fcvtzs`，即**值是 double**。
+      它和 `elo_rank` 写同一个字段（+0x08），所以我们只发整数版的 `elo_rank`。
+    """
+    return {
+        "rank": 0,
+        "star": 0,
+        "elo_rank": 1000,
+        "season": 0,
+        "golden_ticket": tickets,
+        "chips": chips,
+        "win_streak": 0,
+    }
+
+
+def _pvp_season():
+    """`parseSeason` @0x4fcfb4 的响应契约。
+
+    根对象两个键：
+      `pvp_match_settings` @0xb86a1d —— 内层是 22 个标量键，全部按 int 读：
+        free_tickets_interval @0xb86a30 / Pvp_skill_counter @0xb86a46 /
+        free_tickets_max @0xb86a58 / free_tickets_initial @0xb86a69 /
+        chip_equation_x @0xb86a7e / chip_equation_y @0xb86a8e /
+        winner_chip_heritage @0xb86a9e / loser_chip_heritage @0xb86ab3 /
+        ranked_match_duration @0xb86ac7 / friendly_match_duration @0xb86add /
+        ranked_match_slots @0xb86af5 / ranked_match_limit @0xb86b08 /
+        game_mode @0xb86b1b / pvp_skill_time_bonus_seconds @0xb86b25 /
+        pvp_skill_fault_punishment_factor @0xb86b42 /
+        pvp_skill_decay_in_fanpoint @0xb86b64 / pvp_skill_fanpoints @0xb86b80 /
+        chip_store_specials_refresh_interval_hours @0xb86b94 /
+        additional_match_cost @0xb86bbf / match_price_factor @0xb86bd5
+        （`star_array` @0xb86be8 / `product_list` @0xb86bf3 故意不发，形态未定）
+      `current_season` @0xb86c18 —— 交给 `parseSeasonData` @0x4fe4f4 解析：
+        end_time @0xb876b2 / title_text @0xb86c55 / banner_url @0xb86c60 /
+        rewards @0xb8d6de（故意不发）/ rank @0xb869b5。
+    ⚠ `banner_url` 留空字符串：非空会触发一次 `getSeasonBanner`（cmd 0x32）去下图。
+    """
+    now = int(time.time())
+    week_start, _wi = _week_index()
+    return {
+        "pvp_match_settings": {
+            "free_tickets_interval": 3600,
+            "Pvp_skill_counter": 0,
+            "free_tickets_max": 5,
+            "free_tickets_initial": 5,
+            "chip_equation_x": 1,
+            "chip_equation_y": 1,
+            "winner_chip_heritage": 100,
+            "loser_chip_heritage": 50,
+            "ranked_match_duration": 3600,
+            "friendly_match_duration": 3600,
+            "ranked_match_slots": 3,
+            "ranked_match_limit": 10,
+            "game_mode": 0,
+            "pvp_skill_time_bonus_seconds": 0,
+            "pvp_skill_fault_punishment_factor": 1,
+            "pvp_skill_decay_in_fanpoint": 0,
+            "pvp_skill_fanpoints": 0,
+            "chip_store_specials_refresh_interval_hours": 24,
+            "additional_match_cost": 0,
+            "match_price_factor": 1,
+        },
+        "current_season": {
+            "end_time": max(now, week_start + _WEEK_SECONDS),
+            "title_text": "Trials Frontier",
+            "banner_url": "",
+            "rank": 0,
+        },
+    }
+
+
+def _pvp_match_info():
+    """`parseMatches` @0x4fcad0 的响应契约。
+
+    根对象两个键（已反汇编确认）：`waiting_requests` @0xb8695c（int）、
+    `matches` @0xb86562（**JSON 数组**，每个元素交给 `parseMatch` @0x4fd9d0，
+    元素结构体 `PVPMatch` 大小 0x1d8）。
+    没有真实对局时回空数组即可——`parseMatches` 对空数组走的是纯清理分支。
+    """
+    return {"matches": [], "waiting_requests": 0}
+
+
+def h_pvp_init(path, query, body, headers):
+    """POST /public/pvp_matches/v1/pvp_init —— 碉堡的总闸（cmd 0x27）。
+
+    请求体（真机实测）：{"tracks":"1024,2,4,…","bikes":521227,"lang":"zh_Hans"}。
+    我们只需要回上面那三个成员。返回前不落盘：PVP 对局状态还没做持久化。
+    """
+    b = _json_body(body)
+    print("[pvp] pvp_init <- %s" % (b,), flush=True)
+    return 200, {"Content-Type": "application/json"}, {
+        "player_info": _pvp_player_info(),
+        "match_info": _pvp_match_info(),
+        "pvp_config": _pvp_season(),
+    }
+
+
+def h_pvp_matches(path, query, body, headers):
+    """GET /public/pvp_matches/v1/matches —— 对局列表（cmd 0x2a）。"""
+    return 200, {"Content-Type": "application/json"}, _pvp_match_info()
+
+
+def h_pvp_player(path, query, body, headers):
+    """GET /public/pvp_matches/v1/player/<profileId> —— 对手/自己的资料（cmd 0x2b）。
+
+    解析器：`parseRankingData(node, PVPPlayerData@query+0x40)`（0x4fc318），
+    所以根对象就是 player_info 那一套键。之后还会走
+    `OnlineUbiservices::getPlayerProfile` + `OnlineGhostManager::getPVPGhost`。
+    """
+    print("[pvp] player %s" % path, flush=True)
+    return 200, {"Content-Type": "application/json"}, _pvp_player_info()
+
+
+def h_pvp_config(path, query, body, headers):
+    """GET /public/pvp_matches/v1/pvp_config?lang=%s —— 赛季配置（cmd 0x30）。
+
+    ⚠ 名字有误导：这个请求函数在符号表里叫 `getSeasonData` @0x4fa9f0，但它拼的
+      URL 是 `%s/%s/pvp_matches/v1/pvp_config?lang=%s`（0x4faa7c `add x2,x2,#0x6de`）。
+      真正拼 `season/%d?lang=` 的是 `getSeasonDataById` @0x4faaec（cmd 0x31）。
+    """
+    return 200, {"Content-Type": "application/json"}, _pvp_season()
+
+
+def h_pvp_season_data(path, query, body, headers):
+    """GET /public/pvp_matches/v1/season/<n>?lang=%s —— 赛季详情（cmd 0x31）。
+
+    解析器 `parseSeasonData` @0x4fe4f4，根对象直接是
+    {end_time, title_text, banner_url, rewards, rank}。
+    """
+    now = int(time.time())
+    return 200, {"Content-Type": "application/json"}, {
+        "end_time": now + 30 * 24 * 3600,
+        "title_text": "Trials Frontier",
+        "banner_url": "",
+        "rank": 0,
+    }
+
+
+def h_pvp_close_season(path, query, body, headers):
+    """POST /public/pvp_matches/v1/close_season —— 结赛（cmd 0x36）。
+
+    0x4fc65c 那个循环只认两个键，初值都是 -1：`rank` @0xb869b5 / `star` @0xb86947。
+    """
+    print("[pvp] close_season <- %s" % (_json_body(body),), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"rank": 0, "star": 0}
+
+
+def h_pvp_accept(path, query, body, headers):
+    """PVP 里那些「客户端拿到响应也不解析」的 POST 的宽容接收端。
+
+    `tracks`（cmd 0x2e）在跳转表里直接指向函数出口 0x4fc864，一个字节都不解析；
+    `race`（0x2d）/`increase_rewards`（0x33）/`chips`（0x34）需要真实对局状态，
+    现在还没有对局系统，先原样接收。
+    """
+    print("[pvp] %s <- %s -> data:[]" % (path, _json_body(body)), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"data": []}
+
+
 def h_ghost_upload(path, query, body, headers):
     """PUT .../payload 之外落单的二进制上传（老路径），落盘到 inbox 备用。"""
     q = dict(parse_qsl(query, keep_blank_values=True))
@@ -1384,6 +1582,21 @@ DYNAMIC = [
     ("POST", "/public/liveevents/v1/weekly_track_system/end_race", h_liveevents_accept),
     ("POST", "/public/liveevents/v1/weekly_track_system/skip_cooldown", h_liveevents_accept),
     ("POST", "/public/liveevents/v1/weekly_track_system/refill_retry_count", h_liveevents_accept),
+    # --- 碉堡 / PVP ---------------------------------------------------------
+    # pvp_init 是总闸：它的响应里同时带 player_info + match_info + pvp_config。
+    ("POST", "/public/pvp_matches/v1/pvp_init", h_pvp_init),
+    ("POST", "/public/pvp_matches/v1/tracks", h_pvp_accept),
+    ("GET", "/public/pvp_matches/v1/matches", h_pvp_matches),
+    # ⚠ 顺序有讲究：`players?profiles=` 的 path 是 /…/players，
+    # 它是 /…/player/ 的前缀，必须排在前面，否则会被 h_pvp_player 抢走。
+    ("GET", "/public/pvp_matches/v1/players", h_pvp_accept),
+    ("GET", "/public/pvp_matches/v1/player/", h_pvp_player),
+    ("GET", "/public/pvp_matches/v1/pvp_config", h_pvp_config),
+    ("GET", "/public/pvp_matches/v1/season/", h_pvp_season_data),
+    ("POST", "/public/pvp_matches/v1/close_season", h_pvp_close_season),
+    ("POST", "/public/pvp_matches/v1/race", h_pvp_accept),
+    ("POST", "/public/pvp_matches/v1/increase_rewards", h_pvp_accept),
+    ("POST", "/public/pvp_matches/v1/chips", h_pvp_accept),
 ]
 
 
