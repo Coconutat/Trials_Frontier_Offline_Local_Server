@@ -312,6 +312,23 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
 - 好友位仍是写死的 `GhostRider` / `TangoPro`，但它们没有真实成绩，
   因此不会出现在任何榜单里 —— 这是刻意的（旧版给它们塞假成绩正是报障根源）。
 - **限时活动 / 赛季**：`liveevents/v1/*` 未构造真实数据；很多现时内购礼包需要服务器触发。
+- **碉堡筹码（2026-10-04 第二次修正，用户 m04710 / m04835）**：
+  - 让客户端那个「赢家头像下慢慢填充的圆环」动起来，靠的是 `season.chip_equation_x/y`
+    （`PVPManager::getNumChipsTotal` @0x5e1838 = `pow(t,x)*y`；`PVPMatch::getChipProgress`
+    @0x5ed8c4 把它的**小数部分**当填充比例，回绕到 0 时 `animateChips` 出一枚）。
+    早先发 `0/0` 是错的（圆环永远空着），现在 `0.5/0.5`。
+  - `PVPTrack+0x20 = owner_change_time`（真 unix 时间戳）、`PVPTrack+0x24 = bike` —— 早前
+    把这两个偏移搞混，才误以为「`+0x20` 同时是车种 ID，所以曲线只能发 0」。
+  - `chip_base` 必须是「这一局开始时此人已有的筹码余额」：早前恒 0，导致客户端每局都把
+    对手头像下的红筹码清零（用户 m04835：「这一把 AI 的筹码清零了」）。现在人机有
+    `chips.bot_start` 一笔初始余额并持久化。
+  - **整局结算**：局内新产的筹码进余额之外，赢家还要**夺走输家已有的筹码**
+    （`chips.match_loser_keeps_pct`，默认输家保住 50%）。早前只加不减，所以
+    「三条赛道都赢了，对面已有的筹码也不会扣除」（用户 m04835）。
+    客户端的 `getChipHeritage` @0x5dec48 硬编码 0.5/0.1，只影响赛后文案，转移比例由服务器定。
+  - 人机成绩 = 玩家成绩 × `matchmaking.bot_time_margin_pct` + `bot_time_margin_ms`
+    （默认 +1.8% + 400ms），`_pvp_bot_time` 强制夹到 ≥ 1.0 —— 用户 m04710：「跑完以后
+    幽灵比我快……默认真人赢」。
 - **碉堡 / 午夜杯**：未做。
 
 ### 3.1 真钱内购破解结论（重要，别再走弯路）
@@ -350,6 +367,30 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
 2. 页面：账号列表 / 新建账号 / 改口令 / 删除；存档列表 + 一键回滚；幽灵库浏览与替换；
    全局开关（`Anticheating_Enabled`、活动时间、商品表下发）。
 3. 与 `tf_server.py` 同进程不同端口（例如 8001），或用 `/admin` 前缀挂在同端口。
+
+### ★ 决策记录：这些运营参数交给 WebUI 管（用户 m04835，2026-10-04）
+
+用户 m04835（verbatim）：「产出筹码速度和AI控制可以留给WebUI控制，赛季奖励可以在WebUI设置
+(然后可以保存模板)，这些决策记录在案。」
+
+所以**不把这些值写死在代码里**，它们都已经（或将）落到 `server/data/tf_config.json`，
+服务器每次请求热读，改完即时生效、不需要重启：
+
+| 需求 | 配置路径 | 当前默认 |
+| --- | --- | --- |
+| 筹码产出速度（局内曲线） | `season.chip_equation_x` / `season.chip_equation_y` | `0.5` / `0.5` |
+| 筹码产出速度（账号级赛道产线） | `chips.per_track_seconds` / `chips.max` | `3600` 秒 / 不限 |
+| 筹码结算 | `chips.match_loser_keeps_pct` / `chips.bot_start` | 输家保住 `50`% / 人机初始 `500` |
+| AI 控制（人机成绩） | `matchmaking.bot_time_margin_pct` / `bot_time_margin_ms` | `1.018` / `400` |
+| AI 控制（要不要人机、等多久、赛道池） | `matchmaking.enabled` / `bot_wait_seconds` / `candidate_tracks` / `track_ids` | `true` / `60` / 24 条 / 空=随机 |
+| 赛季奖励 | `season.rewards` | 17 条 `{rank,item_id,amount}` |
+
+- **赛季奖励要支持保存模板**：`season.rewards` 的契约来自 `parseSeasonData` @0x4fe4f4
+  （`[{"rank":int,"item_id":int,"amount":int}, …]`，同 rank 可多对）；WebUI 存成命名模板
+  （建议 `server/data/season_templates.json`），支持「存为模板 / 套用 / 导入导出 JSON」。
+- 这些全是**数值型运营参数**，形状（键名、数组结构）不变，所以改错最多是显示不好看，
+  **不会让客户端崩**（客户端 JSON 解析器不做类型检查，怕的是类型/形状变化，见 §3）。
+- `season.star_array`（25 项星章表）也属于同一类，一起交给 WebUI，但**长度必须 ≤ 26**。
 
 ---
 

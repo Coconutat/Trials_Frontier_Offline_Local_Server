@@ -40,7 +40,9 @@
       1221,
       1241,
       1291
-    ]
+    ],
+    "bot_time_margin_pct": 1.018,
+    "bot_time_margin_ms": 400
   },
   "season": {
     "_note": "season.star_array = 25 级天梯每级需要几颗星（index 0 = rank 1 最高，index 24 = rank 25 最低，最多 26 项）。season.rewards = 天梯奖励栏，[{\"rank\":N,\"item_id\":X,\"amount\":Y}]，item_id 1=金币 2=钻石 145=特殊奖励占位，其余见 tmp/packout/ITEM_IDS_REPORT_CN.md。season.product_list = [{\"product_id\":\"...\",\"amount\":N}]，只有 chip_shop.goldentickets 是确定存在的 id。",
@@ -191,9 +193,11 @@
     ]
   },
   "chips": {
-    "_note": "筹码。start/per_track_seconds/max 是账号级的长期产出（_pvp_chips_for）；局内筹码曲线在 season.chip_equation_x/y（客户端用它画赢家头像的填充圆环）。",
+    "_note": "筹码。start/per_track_seconds/max 是账号级的长期产出（_pvp_chips_for）；局内筹码曲线在 season.chip_equation_x/y（客户端用它画赢家头像的填充圆环）。bot_start = 人机已有的筹码（客户端把它画成对手头像下的红筹码）；match_loser_keeps_pct = 整局结算时输家保住的比例（%），其余被赢家夺走。",
     "start": 0,
     "per_track_seconds": 3600,
-    "max": 0
+    "max": 0,
+    "bot_start": 500,
+    "match_loser_keeps_pct": 50
   }
 }

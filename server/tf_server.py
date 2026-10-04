@@ -81,6 +81,12 @@ _TF_CONFIG_DEFAULTS = {
             1023, 1024, 1032, 1033, 1036, 1037, 1041, 1051, 1062, 1068, 1069, 1070,
             1075, 1087, 1088, 1090, 1097, 1099, 1106, 1123, 1133, 1221, 1241, 1291,
         ],
+        # ── AI 控制（用户 m04835：留给 WebUI 配置）──
+        # 人机成绩 = 玩家成绩 × bot_time_margin_pct + bot_time_margin_ms。
+        # ★ 必须 ≥ 1.0（`_pvp_bot_time` 会强制夹回去）：人机比玩家快 → parseMatch
+        #   0x4fe0dc 的 score 比较会把赛道判给人机，真机症状是「跑完以后幽灵比我快」。
+        "bot_time_margin_pct": 1.018,
+        "bot_time_margin_ms": 400,
         # 对局赛道里发给客户端的车种 ID（1 起始，见 UpgradeManager::getBikeIndexByID = id-1）。
         # ★ 必须写进 tracks[].owner_change_time：PVPManager::onStartRaceSent @0x5e59ec 是
         #   `ldr w9,[match+0x24]; str w9,[GameWorld+0x1efc]`，而 match+0x24 就是
@@ -181,6 +187,16 @@ _TF_CONFIG_DEFAULTS = {
         #   拿到这条赛道就开始累积，**前期快、后面越来越慢**；对手把赛道抢回去 →
         #   累积速度重置，又从快开始变慢；整局跑完才结算成 `chips` 余额。
         #   曲线见 `season.chip_equation_x/y`（`_pvp_match_chips` 用的就是它）。
+        #
+        # ── 人机（对手）的已有筹码。人机没有账号，但客户端会把
+        #   `player2.chips` 画成对手头像下的红筹码，且整局结算时「赢家夺走输家
+        #   已有的筹码」需要对面有筹码可夺（用户 m04835：三条赛道都赢了，
+        #   对面已有的筹码也不会扣除 / 这一把 AI 的筹码被清零了）。
+        "bot_start": 500,
+        # 整局结算时**输家保住**的比例（%），其余归赢家。
+        # ★ 客户端 `getChipHeritage` @0x5dec48 里那两个系数是硬编码的 0.5/0.1，
+        #   只影响赛后界面文案，真正的转移比例由这里决定。
+        "match_loser_keeps_pct": 50,
     },
     # 赛后奖励。比赛 JSON 的 `rewards` 是**数组**，parseMatch @0x4fd9d0 只读前 3 个整数
     # （`cmp w9,#2; b.gt`，见 0x4fdd78），然后拼成 PVPMatch+0x170 上的
@@ -1586,10 +1602,20 @@ def _pvp_chips_for(pid):
     用户 m03154：「筹码是硬件定期生成的，比如我赢了一局，这条赛道定期生成一个筹码」。
     客户端那边的公式已被 `chip_equation_x/y = 0` 关掉，所以它只会显示这个总额。
     """
-    if not pid or pid == _pvp_bot_id():
-        # 人机没有账号，也不该显示余额倒计时。
+    if not pid:
         return 0
     st = _pvp_chips_state(pid)
+    if pid == _pvp_bot_id():
+        # 人机没有账号，但**必须**有一个「已有筹码」余额：
+        #   1. 客户端把 `player2.chips` 画成对手头像下的红筹码，发 0 就永远是空的；
+        #   2. 整局结算时「赢家夺走输家已有的筹码」也需要对面有筹码可夺
+        #      （用户 m04835：「如果三条赛道都赢了，对面已有的筹码也不会扣除」）。
+        # 只在第一次给它播种，之后照常在结算里增减。
+        if not st.get("seeded"):
+            st["seeded"] = True
+            st["chips"] = max(0, cfg_int("chips", "bot_start", default=500) or 0)
+            st["ts"] = int(time.time())
+        return int(st["chips"] or 0)
     now = int(time.time())
     period = cfg_int("chips", "per_track_seconds", default=3600)
     ntrack = len(st.get("tracks") or [])
@@ -1837,8 +1863,19 @@ def _pvp_bot_time(m, tid, my_ms=None):
     if base <= 0:
         # 理论上走不到（只有玩家先交成绩才会叫人机跑），留个兜底免得算出 0。
         base = _pvp_ghost_time(tid)
-    # +1.8% + 400ms：大约慢 1~3 秒，视觉上像「差一点点」而不是被吊打。
-    t = int(base * 1.018) + 400
+    # 余量可配置（用户 m04835：AI 控制留给 WebUI）。默认 +1.8% + 400ms，
+    # 大约慢 1~3 秒，视觉上像「差一点点」而不是被吊打。
+    try:
+        pct = float(cfg("matchmaking", "bot_time_margin_pct", default=1.018))
+    except (TypeError, ValueError):
+        pct = 1.018
+    try:
+        add = int(cfg("matchmaking", "bot_time_margin_ms", default=400))
+    except (TypeError, ValueError):
+        add = 400
+    if pct < 1.0:
+        pct = 1.0          # 不允许比玩家快，见上面的用户规则
+    t = int(base * pct) + max(0, add)
     return max(1, min(3599000, t))
 
 
@@ -1960,19 +1997,60 @@ def _pvp_match_chips(m, who, now=None):
 
 
 def _pvp_bank_match_chips(m):
-    """整局跑完 → 把局内筹码结算进 `_pvp_chips`（幂等）。"""
+    """整局跑完 → 把局内筹码结算进 `_pvp_chips`（幂等）。
+
+    结算分两步（用户 m04835 的两条要求）：
+      1. **局内新产的筹码**进余额 —— 只加 `_pvp_match_chips - chip_base` 这一段差值，
+         否则 `chip_base` 里那份「入场时已有的余额」会被重复加一次；
+      2. **输家已有的筹码被赢家夺走** —— `chips.match_loser_keeps_pct`（默认 50）
+         是输家保住的比例，其余转给赢家。原先这里只加不减，
+         所以「三条赛道都赢了，对面已有的筹码也不会扣除」。
+         客户端那两个 `*_chip_heritage` 配置项（`getChipHeritage` @0x5dec48 硬编码
+         0.5/0.1）只影响赛后界面的文案，真正的转移由服务器决定。
+    """
     if not m or m.get("_banked"):
         return
     m["_banked"] = True
     now = int(time.time())
-    for p in (m.get("players") or []):
-        if not p or p == _pvp_bot_id():
+    players = [p for p in (m.get("players") or []) if p]
+    base_map = m.get("chip_base") or {}
+
+    # 先只把「局内新产的」记账，别动对手的余额。
+    for p in players:
+        st = _pvp_chips_state(p)
+        base = int(base_map.get(p) or 0)
+        got = int(_pvp_match_chips(m, p, now) or 0)
+        gain = max(0, got - base)
+        if gain > 0:
+            st["chips"] = int(st["chips"] or 0) + gain
+            print("[pvp] 结算局内筹码 %s +%d -> %d" % (p, gain, st["chips"]), flush=True)
+
+    # 再把输家已有的筹码转给赢家（3 条赛道占住 ≥2 条者为赢家）。
+    winner = None
+    for p in players:
+        if _pvp_match_won(m, p):
+            winner = p
+            break
+    if not winner:
+        return
+    keep = cfg_int("chips", "match_loser_keeps_pct", default=50)
+    try:
+        keep = max(0, min(100, int(keep)))
+    except (TypeError, ValueError):
+        keep = 50
+    for p in players:
+        if p == winner:
             continue
-        got = _pvp_match_chips(m, p, now)
-        if got and got > 0:
-            st = _pvp_chips_state(p)
-            st["chips"] += int(got)
-            print("[pvp] 结算筹码 %s +%d -> %d" % (p, got, st["chips"]), flush=True)
+        lst = _pvp_chips_state(p)
+        have = int(lst["chips"] or 0)
+        stolen = have * (100 - keep) // 100
+        if stolen <= 0:
+            continue
+        lst["chips"] = have - stolen
+        wst = _pvp_chips_state(winner)
+        wst["chips"] = int(wst["chips"] or 0) + stolen
+        print("[pvp] 夺走筹码 %s -%d -> %d ; %s +%d -> %d"
+              % (p, stolen, lst["chips"], winner, stolen, wst["chips"]), flush=True)
 
 
 def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
@@ -2155,10 +2233,18 @@ def _pvp_make_match(players, track=None, bot=False):
         "owner": {},
         # {track_id: 归属者拿到它的 unix 时间} —— 换主时重置，筹码累积速度随之重置
         "owner_at": {},
-        # {profile_id: 进这局时已有的筹码（结算基线，本实现恒 0）}
+        # {profile_id: 进这局时已有的筹码（结算基线，也是客户端显示的起点）}
         "chip_base": {},
         "bot": bool(bot),
     }
+    for p in players:
+        if not p:
+            continue
+        # ★ `chip_base` 必须是「这一局开始时此人已有的筹码余额」：
+        #   客户端画的那个数字是 `chip_base + 局内从占住赛道产的筹码`
+        #   （`_pvp_match_chips`），发 0 就等于每局都把对手的筹码清零
+        #   （用户 m04835：「这一把AI的筹码清零了」）。
+        _pvp_matches[mid]["chip_base"][p] = int(_pvp_chips_for(p) or 0)
     for p in players:
         if p and p != _pvp_bot_id():
             left = _pvp_consume_ticket(p)
