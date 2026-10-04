@@ -94,7 +94,9 @@
   },
 
   "//friends": "tr::OnlineFriends::onFriendlistRecieved 遍历 root->child->child 再读每项的 pid / nameOnPlatform / state。",
-  "//friends2": "形状必须是 {\"<任意键>\": [ {..}, .. ]}；返回空数组最安全（不会触发头像/资料查询）。",
+  "//friends2": "形状必须是 {\"<任意键>\": [ {..}, .. ]}；root 第一个成员就是好友数组。⚠ 别改成空数组或省略 —— 只影响显示，但真正的坑是下面这条：",
+  "//friends3": "⚠⚠ 本端点绝不能回空 body / `{}` / 非 JSON：cmd 0x50 分支 (0x5182a8) 没有 `cbz x21`，NULL 会进解析器，0x51cf18 `ldr x8,[x1,#0x10]` 直接读地址 0x10 ⇒ SIGSEGV；`{}` 同样崩（0x51cf1c 读 NULL+0x10，`cbz x28`@0x51cf20 只保护 x28）。另外三个值必须是字符串（不检查类型标签 +0x30，pid 直接进 strlen），且 `pid` 必须排在 `nameOnPlatform` **之前**（否则 strcmp(buf,\"0\")==0 整条被静默跳过）。pid ≥ 43 字节会让 addFriend 的 strcpy 堆溢出。",
+  "//friends4": "好友同步 POST /public/friends/v1/update 由 tf_server.py 的 h_friends_update 原样回显 uplay —— 回 {} / {\"data\":[]} 等于回 {\"uplay\":[]}，客户端会把本地好友**删光**。",
   "GET /v2/profiles/me/friends": {
     "status": 200,
     "headers": { "Content-Type": "application/json" },

@@ -767,6 +767,7 @@ def h_profiles_query(path, query, body, headers):
 FRIEND_NAMES = {
     "44444444-4444-4444-4444-444444444444": "GhostRider",
     "55555555-5555-5555-5555-555555555555": "TangoPro",
+    "66666666-6666-6666-6666-666666666666": "IronGear",
 }
 
 
@@ -968,6 +969,21 @@ def h_ghost(path, query, body, headers):
         return 200, {"Content-Type": "application/json"}, {"data": []}
 
     if tracking:
+        # ★ 排行榜上的对手行点「挑战」时客户端会把那一行的 player 带过来。
+        #   先按 pid→contentId 精确回**同一条**幽灵，榜上显示的时间和实际跑的
+        #   幽灵才对得上；匹配不上再退回原来的「该赛道随便挑一条」。
+        #   （对手表定义在本函数之后，调用时求值，没问题。）
+        players = [p.strip() for p in (q.get("players") or "").split(",") if p.strip()]
+        if players:
+            _, ghost_of = _opponent_entries()
+            board = "track%d" % tracking
+            for pid in players:
+                cid = (ghost_of.get(pid) or {}).get(board)
+                blob = acct.ghost_payload(cid) if cid else None
+                if blob:
+                    print("[ghost] %s 赛道 %s -> 对手 %s 的幽灵 cid=%s (%d 字节)"
+                          % (path, tracking, pid, cid, len(blob)), flush=True)
+                    return 200, {"Content-Type": "application/octet-stream"}, blob
         rec = acct.ghost_any_for_track(tracking)
         if rec:
             blob = acct.ghost_payload(rec.get("contentId"))
@@ -1115,6 +1131,14 @@ def _week_index():
 # `GET /public/playerstats/v1/ranking/track1041` 与 ghost_*_1041.bin。
 _WEEKLY_TRACK_ID = 1041
 
+# 奖杯序号（1..5）→ `calculateReward` 用来查 reward_config 那张 map 的键名。
+# 跳转表 @0xb91880（`sub w8,w20,#1; cmp w8,#4; b.hi` 越界直接跳过）已按跳转目标
+# 逐条解码（adrp 取页 + add 立即数，长度就是 memcpy 的第三个参数）：
+#   trophy 1 -> 0xb877f4 'platinum'(8)   trophy 2 -> 0xb877fd 'gold'(4)
+#   trophy 3 -> 0xb87802 'silver'(6)     trophy 4 -> 0xb87809 'bronze'(6)
+#   trophy 5 -> 0xb87810 'wood'(4)
+_WEEKLY_TROPHIES = ("platinum", "gold", "silver", "bronze", "wood")
+
 
 def h_liveevents_basic_info(path, query, body, headers):
     """GET|POST /public/liveevents/v1/weekly_track_system/basic_info —— 限时活动的「门」。
@@ -1189,14 +1213,29 @@ def h_liveevents_config(path, query, body, headers):
         },
         "challenge_settings": {
             "track_id": _WEEKLY_TRACK_ID,
-            "bike_id": 0,
+            # ⚠ bike_id 必须是 /conf/bikes.txt 里的合法车号（1..19，没有 0）。
+            # 真机实测 bike_id=0 必崩：`MenuzStateWeeklyChallenge::loadIntroState`
+            # 把这里的 bike_id 直接喂给
+            #   `MenuzComponentWeeklyChallengeBike::setBike(int,int)` @0x6cbee4
+            #     -> `UpgradeManager::getBike(unsigned short)` @0x62ac2c
+            # 该函数遍历 UpgradeManager 里由 `parseBikeData` @0x62a190 从
+            # /conf/bikes.txt 建出来的车表，逐个比对 `[bike+0x3e]`（uint16 车号），
+            # 查不到就 `mov x0,xzr; ret` 返回 NULL。调用方紧接着
+            #   `0x6cbf20  ldr w8,[x0,#0xb0]`
+            # 于是 SIGSEGV / SEGV_MAPERR，fault addr 0xb0，崩在 GLThread。
+            # （`getBikeIndexByID` @0x62a12c 就是 `sub w0,w1,#1`，佐证车号从 1 开始。
+            #  `/conf/bikes.txt` 恰好 19 台，1..19 连续，无 0。）
+            "bike_id": 1,
             "bike_skin": 0,
             "bike_upgrade": {"handle": 0, "engine": 0, "wheel": 0, "frame": 0},
-            # 0 = 用玩家自己的车；1 = 强制用上面那台（force_upgrade 只是个布尔）
+            # 0 = 不做强制改装；注意这不影响 bike_id：上面那台车永远会被
+            # setBike 拿去查表，所以 bike_id 必须合法，跟 force_upgrade 无关。
             "force_upgrade": 0,
-            # task 故意留空：skill 名字要靠 MissionDB 反查，填错名字有解引用空指针的
-            # 风险。等真机确认过合法 skill 名（.rodata 里疑似有 in_air_upsidedown /
-            # backwheel / fronflip / backflip @0xb86c28）再填。
+            # task 保持空：`parseChallengeConfiguration` @0x5058c8 只把数组元素
+            # 读成 {mt::String skill; int count;} 存进 cfg+0x38/0x40，解析期不查
+            # MissionDB、也没有解引用，填了也没人用——真正驱动周赛任务的是
+            # MissionDB 里写死的 3 个任务 451/452/453（`setUpWeeklyChallengeMissionTiming`
+            # @0x5c45f0 用午夜杯时间窗改写它们的 type-6 条件），纯客户端逻辑。
             "task": [],
         },
         "extra_settings": {
@@ -1229,19 +1268,42 @@ def h_liveevents_find_opponent(path, query, body, headers):
 
 
 def h_liveevents_reward_config(path, query, body, headers):
-    """GET /public/liveevents/v1/weekly_track_system/reward_config/<槽位数> —— 奖励表。
+    """GET /public/liveevents/v1/weekly_track_system/reward_config/<n> —— 奖励表。
 
     响应契约（cmd 0x79 @0x5051e8 → `parseRewardsSlot` @0x505d28）：
-    根对象的**每个成员**都被当成一个「奖励槽」，槽名 = 成员键，槽体交给
-    parseRewardsSlot 解析成 `vector<pair<int,int>>`（物品 id + 数量），最后塞进
-    `map<String, vector<pair<int,int>>>`。
-    槽体到底长什么样（对象里包一层 "reward"？还是 [[id,count],…]？）反汇编读下来
-    自相矛盾（配对的第二个 int 取的是**下一个成员**的子节点），所以先回空对象：
-    cmd 0x79 对空的第一个成员有 `cbz` 保护，不会崩，只是奖励界面空着。
-    真机跑通后再按实际需求补。
+      根对象的每个一级成员 = 一个奖杯槽；成员名必须是 `calculateReward` 查表用的
+      键（见 _WEEKLY_TROPHIES），成员值形如 `{"reward":[N,...], "<任意名>":[c,...]}`。
+      `reward` **必须是槽对象的第一个成员**（parseRewardsSlot 拿 first_child 的
+      key 去 strcmp("reward")），两个数组按 index 配成 pair(reward[i], sibling[i])。
+
+    pair 的语义（`getRewardItemForSlot` @0x635880）：
+      pair.first  → `snprintf("Reward_%d", first)` 查本地 /conf/wts_rewards.txt；
+      pair.second → 本地查不到时的后备编号（0x635b7c 分支）。
+    所以两个数都必须是 1..15 之间、本地表里真实存在的 Reward_N。
+
+    `Reward_<n>` 的排布 = 3 个轮换方案 × 5 个奖杯，已按内容核对：
+      Reward_{k*5+1} 赛道(23)   +2 服装(30)   +3 服装/摩托(8~12)
+      +4 宝石/金币/金券(14)     +5 同款但更少(14)
+    轮换方案 = URL 末段 % 3（末段是客户端传的 max(last_participated_week,0)，
+    同一周内稳定不变；0 取方案 0）。
+
+    ⚠ 槽对象只给一个成员会崩：parseRewardsSlot 在 0x505d7c 无条件执行
+      `ldr x25, [x8, #0x10]`，x8 = first_child->next，没有兄弟成员时那里是空指针。
+      所以每个槽固定给两个等长数组。
     """
-    print("[liveevent] reward_config %s -> {}" % path, flush=True)
-    return 200, {"Content-Type": "application/json"}, {}
+    try:
+        n = int(path.rstrip("/").rsplit("/", 1)[-1])
+    except (AttributeError, ValueError):
+        n = 0
+    variant = n % 3 if n > 0 else 0
+    payload = {}
+    for i, name in enumerate(_WEEKLY_TROPHIES):
+        reward = variant * 5 + i + 1
+        payload[name] = {"reward": [reward], "n": [reward]}
+    print("[liveevent] reward_config %s -> 方案 %d %s" %
+          (path, variant, " ".join("%s=Reward_%d" % (k, v["reward"][0])
+                                   for k, v in payload.items())), flush=True)
+    return 200, {"Content-Type": "application/json"}, payload
 
 
 def h_liveevents_accept(path, query, body, headers):
@@ -2649,7 +2711,31 @@ def h_ghost_upload(path, query, body, headers):
 
 
 def h_replay_id(path, query, body, headers):
-    """POST /public/resultservice/v1/replay_id —— 登记「谁在哪条赛道跑了多少」。"""
+    """POST /public/resultservice/v1/replay_id —— 登记「谁在哪条赛道跑了多少」。
+
+    ★★ 必须回 `{"replay_id": <int >= 1>}`，这是「比赛幽灵」按钮能点亮的关键。
+       链路（反汇编 tmp/libcmp/orig-libTrialsGo.so）：
+         tr::OnlineGhostManager::checkGhost @0x5070cc 发本条 POST
+           -> tr::GhostQueryObject::onNetworkDataReceived @0x508800
+              cmd 0x0e(14) 分支 @0x50895c：遍历响应根的孩子找整型键
+              "replay_id"@0xb87bc0，取 *(int*)(node+0x28) 存进 w20；
+              ★ `cmp w20,#1; b.lt 0x508a68` —— **小于 1 一律走失败分支**，
+              只有 >=1 才回调 listener->vtable[0x18](err=0, id=w20, name)。
+           -> tr::MenuzStateMap::onGhostQuery @0x77f900 把 w20 写进选中行的
+              `LeaderboardPlayerItem+0x84`。
+           -> 之后每次 tr::MenuzStateMap::setupRaceButton @0x77e01c 里
+              `ldr w8,[x21,#0x84]; cmn w8,#1; b.ne 0x77e288` —— **只有
+              +0x84 != -1 才跳过硬 disable 按钮的那一段**。
+       回 `{"data": []}`（本函数旧行为）⇒ 没有 replay_id 键 ⇒ w20=0 ⇒
+       按钮永远灰着、点不动。真机 31 次调用全被这条坑掉。
+
+    ★ 回的这个 id 会被 tr::OnlineGhostManager::getGhost @0x506e48 当成
+       **userstorage 的 contentId** 去取幽灵：
+         OnlineUserStorage::getData(listener, "ghost", id) @0x578780
+           -> GET %s/%s/userstorage/v2/content/ghost/%d     （元数据）
+           -> 拿到 contentId 后再取 .../<id>/payload        （二进制）
+       所以必须回幽灵库里**真实存在**的 contentId，不能瞎编。
+    """
     b = _json_body(body)
     client_ip = None
     try:
@@ -2659,10 +2745,35 @@ def h_replay_id(path, query, body, headers):
     rec = acct.ghost_record_replay(b.get("profile_id"), b.get("track_name"),
                                    b.get("drive_time"), b.get("faults"), b.get("bike"),
                                    client_ip)
-    print("[ghost] replay_id %s %s %s ms" % (rec.get("profile_id"),
-                                             rec.get("track_name"), rec.get("drive_time")),
+    pid = b.get("profile_id")
+    board = b.get("track_name")
+    if isinstance(board, (int, float)):
+        board = "track%d" % int(board)
+    elif board and not str(board).startswith("track"):
+        board = "track%s" % board
+    board = board or ""
+
+    _rows, ghost_of = _opponent_entries()
+    cid = (ghost_of.get(pid) or {}).get(board)
+    if not cid:
+        # 榜外的 pid（玩家自己）或没折成对手的赛道 —— 回该赛道任意一条兜底，
+        # 至少让按钮能点亮、能进「加载幽灵」界面。
+        try:
+            tid = int(str(board).replace("track", "") or 0)
+        except Exception:
+            tid = 0
+        g = acct.ghost_any_for_track(tid) if tid else None
+        cid = g.get("contentId") if g else None
+
+    if not cid:
+        print("[ghost] replay_id %s %s -> 库里没有可用幽灵，回失败形状"
+              % (pid, board), flush=True)
+        return 200, {"Content-Type": "application/json"}, {"data": []}
+
+    print("[ghost] replay_id %s %s %s ms -> replay_id=%d"
+          % (rec.get("profile_id"), rec.get("track_name"), rec.get("drive_time"), cid),
           flush=True)
-    return 200, {"Content-Type": "application/json"}, {"data": []}
+    return 200, {"Content-Type": "application/json"}, {"replay_id": int(cid)}
 
 
 def h_iap_verify(path, query, body, headers):
@@ -2709,6 +2820,62 @@ def h_iap_products(path, query, body, headers):
     """
     print("[iap] product/configuration 被请求", flush=True)
     return 200, {"Content-Type": "application/json"}, {"limited_purchases": []}
+
+
+def h_targeting_bundle_config(path, query, body, headers):
+    """礼包解锁白名单 —— ROADMAP 3「现时内购礼包」的真正开关。
+
+    反汇编依据 `OnlineProfileEligibilityManager::GetBundleConfig` @0x515f8c（cmd 0x85）
+    与解析器 `parseConfigData` @0x515dc8：
+      - **根必须是 JSON 数组**（0x515e34 `cmp w8,#2`），元素**必须是整数**
+        （0x515e58 `cmp w8,#4`，非整数静默跳过）。
+      - 每个整数 push 进 `OnlineProfileEligibilityManager+0x10` 的 std::vector<int>，
+        即「礼包 id 白名单」。
+      - 消费：`ProfileEligibilityManager::isBundleEligible(int)` @0x5955e8 线性查找，
+        唯一调用者是 `StoreItem::unlockConditionsOK` @0x609a20。
+      - bundle id 取值域 = 0..255（0x609a14 `ldrb w1,[x20,#0x208]` 是单字节）。
+
+    链路：MenuzStateMain::onBecomeTopmostState 0x76d128 → fetchConfig 0x595648
+    → GetBundleConfig 0x515f8c → parseConfigData 0x515dc8
+    → onReceivedBundleConfig 0x595634 → isBundleEligible ← unlockConditionsOK
+    → OfferManager::pushPopup 0x5ff750（礼包弹窗就是这么出来的）。
+
+    ⚠ 这里以前落到 rules.json 的 "*" 兜底 {"data": []} —— 那是个 **JSON 对象**，
+    根类型判等直接失败，白名单恒为空 ⇒ **礼包功能整体是死的**。
+    回 0..255 即「全部礼包有条件可选」；回 [] 是最小安全值。
+    """
+    q = dict(parse_qsl(query, keep_blank_values=True))
+    print("[targeting] condition_items type=%s" % q.get("type"), flush=True)
+    return 200, {"Content-Type": "application/json"}, list(range(256))
+
+
+def h_targeting_configuration(path, query, body, headers):
+    """在线配置包（GET getAnonymousConfiguration 0x4ee808 / POST getConfiguration
+    0x4ee544，两者共用 cmd 0x49，由 `OnlineConfiguration::parseJsonResponse`
+    @0x4eeb50 解析）。
+
+    识别的最完整形状（据 targeting-v1.md §3）：
+        {"limited_purchases": [{"name":..,"product_id":..,"limit":..,
+                                "counter":..,"fake_counter":..}],
+         "pay_times": N, "country": "CN", "update": 794,
+         "update_platform": {"google": 794}, "timestamp": 1700000000,
+         "login": {"enabled": 0, "access": 0}}
+
+    回 `{}` 是**明确安全的最小值**：root->first_child == NULL 时走 0x4eef3c
+    的默认值路径（w27 = -1），而 0x4eefd0 的 `cmn w27,#1; b.eq` 会**跳过整个
+    配置包下载**。这正是离线想要的。
+
+    ⚠ 永远**不要**发 `metadata`：它里面的 `downloadurl` 会让客户端对任意绝对
+    URL 发 GET 并 `SaveFile::writeSystemFile` 落盘（0x4ef250），随后触发
+    `GlobalData::onDataPacksUpdated()` —— 既污染本地状态又指向真实 S3。
+
+    ⚠ 唯一真实崩溃面在别处：0x4eed1c `str w9,[x8,#0x10]`（写 `login.access`）
+    **没有判 `OnlineCore::m_authentication+0x28` 是否为 NULL**。所以本端点要么
+    连带 `login` 一起省掉（现在这样），要么确保登录态已建立后再让它带 `login`。
+    """
+    print("[targeting] configuration body=%s"
+          % body[:200].decode("utf-8", "replace"), flush=True)
+    return 200, {"Content-Type": "application/json"}, {}
 
 
 def h_vip_registration(path, query, body, headers):
@@ -2787,6 +2954,36 @@ def h_vip_badge_option(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"badge_display": val}
 
 
+def h_friends_update(path, query, body, headers):
+    """好友同步回执 —— 必须**原样回显请求里的 `uplay` id**，否则好友被删。
+
+    反汇编依据 `tr::OnlineFriends::onNetworkDataReceived` @0x51d784（cmd 0x65）：
+      - `uplay` @0xb890d4 数组，元素必须是**字符串**；
+      - 客户端拿本地好友表的每个 pid（条目 +0x81）去回包里比对
+        （`0x51d844 json_strcmp([x21+0x28], x9+0x81)`）；
+      - **未匹配就把该条目的标志位清零**（`0x51d864 str wzr,[x9,#0xac]`），
+        收尾 `0x51da30 tbnz #3` 判定失败 ⇒ **好友被删除**。
+
+    所以「什么都不回」等于「回 `{"uplay":[]}`」＝ **清空好友列表**。
+    这里把请求的 id 原样回显，全部匹配，谁都不删。
+
+    触发链：登录 → `GET /v2/profiles/me/friends`（规则桩，见 rules.json:98）
+    → `OnlineFriends::onFriendlistRecieved` @0x51cee8 → 尾调用 `syncFriendList()`
+    @0x51d0ac（cmd 0x65）→ 本端点。
+
+    ⚠ 本端点走 `[OnlineCore+0x28]`（私服地址），而 `/v2/profiles/me/friends`
+    的 base 是**硬编码** `https://public-ubiservices.ubi.com` @0xb85565，
+    只能靠 DNS/hosts 劫持接管 —— 两者不是同一个 host。
+    """
+    try:
+        req = json.loads(body.decode("utf-8", "replace") or "{}")
+        uplay = [x for x in req.get("uplay") or [] if isinstance(x, str)]
+    except Exception:
+        uplay = []
+    print("[friends] update → echo %d uplay id(s)" % len(uplay), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"uplay": uplay}
+
+
 LEADERBOARD_PATH = os.path.join(HERE, "data", "leaderboards.json")
 LEADERBOARD_LOCK = threading.Lock()
 
@@ -2798,6 +2995,77 @@ def _load_leaderboards():
         return obj if isinstance(obj, dict) else {}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+
+# --------------------------------------------------------- 幽灵对手（排行榜）
+# ★ 为什么要有这一块：真机导出的**内置幽灵**（index.json 里 builtin=True / 带
+#   legacy_path，54 条、30+ 条赛道）owner 全是 `6f857655` —— 那是幽灵库里唯一
+#   来自「别人」的数据（其余的 owner 都是玩家自己上传的 `<player-profile-id>`，见
+#   server/data/ghosts/INDEX.md 的 owner 说明）。但排行榜是按 player pid 建行的，
+#   幽灵从来就没进过榜，于是「全球 / 所有玩家」里永远只有玩家自己一行，
+#   点进去也没有对手可以挑战。
+#   这里把内置幽灵折成对手行：同一赛道按 drive_time 升序分给 OPPONENT_PIDS 里的
+#   身份，drivetime 用幽灵自己的真实时间；pid→contentId 记在对手表里，
+#   h_ghost 优先按它回**同一条**幽灵 —— 榜上显示的时间和实际跑出来的幽灵一致。
+OPPONENT_PIDS = list(FRIEND_NAMES)          # 44444444 GhostRider / 55555555 TangoPro / 66666666 IronGear
+_OPPONENT_CACHE = None
+
+
+def _opponent_entries():
+    """扫幽灵库，返回 ({pid: {board: row}}, {pid: {board: contentId}})，只算一次。"""
+    global _OPPONENT_CACHE
+    if _OPPONENT_CACHE is not None:
+        return _OPPONENT_CACHE
+    rows, ghosts = {}, {}
+    try:
+        records = acct.ghost_list()
+    except Exception as exc:                 # 幽灵库坏了也不该把排行榜拖垮
+        print("[opponent] 幽灵库读取失败：%s" % exc, flush=True)
+        records = []
+    by_track = {}
+    for rec in records:
+        if not rec.get("builtin") and not rec.get("legacy_path"):
+            continue                         # 玩家自己上传的幽灵不是对手
+        if not (rec.get("stored") or rec.get("legacy_path")):
+            continue                         # 只有 metadata、没有二进制的容器不算
+        track = rec.get("track_id")
+        time_ms = rec.get("drive_time") or rec.get("payload_drive_time")
+        if not track or not time_ms:
+            continue
+        by_track.setdefault(int(track), []).append(rec)
+    for track, recs in by_track.items():
+        board = "track%d" % track
+        recs.sort(key=lambda r: (r.get("drive_time") or 0, r.get("contentId") or 0))
+        for pid, rec in zip(OPPONENT_PIDS, recs):
+            rows.setdefault(pid, {})[board] = {
+                "player": pid,
+                "drivetime": int(rec.get("drive_time") or 0),
+                "submittime": int(rec.get("created") or 0),
+                "data": 0,
+                "upgrades": 0,
+                "extradata": 0,
+                "updated": int(rec.get("updated") or 0),
+            }
+            ghosts.setdefault(pid, {})[board] = rec.get("contentId")
+    _OPPONENT_CACHE = (rows, ghosts)
+    print("[opponent] 内置幽灵折成 %d 个对手 / %d 条赛道" %
+          (len(rows), len(by_track)), flush=True)
+    return _OPPONENT_CACHE
+
+
+def _load_ranked_boards():
+    """真实榜单 + 幽灵对手行。
+
+    ★ 对手**不进** leaderboards.json：_record_result 走的是原始
+      _load_leaderboards()，_save_leaderboards 也就永远不会把对手固化到磁盘上，
+      改幽灵库后对手榜会自动跟着变。
+    """
+    db = _load_leaderboards()
+    rows, _ = _opponent_entries()
+    for pid, boards in rows.items():
+        for board, row in boards.items():
+            db.setdefault(board, {}).setdefault(pid, row)
+    return db
 
 
 def _save_leaderboards(obj):
@@ -2966,6 +3234,16 @@ def h_result_stats(path, query, body, headers):
               flush=True)
         return 200, {"Content-Type": "application/json"}, {"data": []}
 
+    if endpoint in GLOBAL_LEADERBOARDS:
+        # ★ 主界面总榜客户端**自己也会 POST 一份**上来（body 形状与 batch_update 相同，
+        #   但 stats 里只有 data/global_score/drivetime/upgrades/submittime，**没有 track**）。
+        #   以前它落到下面的 `track[0-9]+` 正则 → 400 invalid-track（实测 16 次全失败）。
+        #   总榜在本服务器是**实时聚合视图**、不落库（见 _aggregate_global_entries 与
+        #   _record_result 的 docstring），所以这份上传本来就无处可存：接受并丢弃。
+        #   丢弃是安全的——聚合完全由单赛道记录算出来，不依赖这条自报数据。
+        #   （GLOBAL_LEADERBOARDS 定义在本函数之后，函数体里引用它按调用时求值，没问题。）
+        return 200, {"Content-Type": "application/json"}, {"data": []}
+
     track = endpoint.strip()
     if not re.fullmatch(r"track[0-9]+", track):
         return 400, {"Content-Type": "application/json"}, {"error": "invalid-track"}
@@ -2991,7 +3269,7 @@ GLOBAL_LEADERBOARDS = {"global_stats", "global_stats_donkey"}
 def _aggregate_global_entries():
     """从真实单赛道记录计算主界面总榜；不为未跑赛道创建行。"""
     with LEADERBOARD_LOCK:
-        db = _load_leaderboards()
+        db = _load_ranked_boards()
     totals = {}
     for board, records in db.items():
         if board in GLOBAL_LEADERBOARDS or not board.startswith("track"):
@@ -3038,7 +3316,7 @@ def _stored_entries(board, requested_players=None, keep_total=False):
         rows = _aggregate_global_entries()
     else:
         with LEADERBOARD_LOCK:
-            rows = list((_load_leaderboards().get(board) or {}).values())
+            rows = list((_load_ranked_boards().get(board) or {}).values())
         rows.sort(key=lambda r: (int(r.get("drivetime", 0)), str(r.get("player", ""))))
         rows = [dict(row, rank=rank) for rank, row in enumerate(rows, 1)]
     total = len(rows)
@@ -3083,6 +3361,46 @@ def h_playerstats_stats(path, query, body, headers):
     }
 
 
+def h_gift(path, query, body, headers):
+    """礼物链 —— 反汇编见 `work/trials-frontier/notes/gift-v1.md`。
+
+    URL = `<base>/public/gift/v1/<op>`，op 与 cmd 一一对应
+    （`OnlineGifting::onNetworkDataReceived` 0x51f238 只认 0x3e..0x43）：
+
+      0x3e give_golden_ticket (POST) ┐
+      0x3f send_gifts         (POST) ├ 响应体客户端**一个字节都不解析**
+      0x41 claim?type=%s      (GET)  │ （0x51f2b0–0x51f2e8 只把 body 截断成
+      0x43 ad_reward          (POST) ┘   C 字符串就完事）→ 回 200 即可
+      0x40 get_gifts          (GET)  → `parseGiftArray` 0x51f784
+      0x42 gifts              (GET)  → `parseSentGifts` 0x51f888
+
+    两处与兜底 `{"data": []}` 不兼容、必须单独处理的地方：
+
+    1. **0x40 的响应根必须是 JSON 数组**。`parseGiftArray` 第一条指令
+       `ldr w8,[x1,#0x30]; cmp w8,#2; b.ne` 就是判「根节点 type tag == 2（数组）」，
+       回 `{"data": []}` 是个对象 → 第一跳就收工 → 永远「没有礼物」且静默无错。
+       （安全：不是数组只是返回空列表，不崩。）
+
+    2. **0x42 是唯一能写 `OnlineGifting+0x28`（server_time）的响应**。
+       `GiftingManager::isUptoDate()` 读的正是 +0x28，而 0x40 从不写它，
+       所以缺了 `server_time` 就会让
+       `MenuzStateWarRoom::updateGiftingIndicator` 0x73999c 的
+       `[m_appTicker] % 300 == 0`（300 帧 @56.4fps ≈ **5.32 秒**）
+       永远为真 —— 战争房间无限重发 get_gifts。
+       `gifts` / `config.types` 按 key 名查找，缺省只是空数组/空 map，一并给出更保险。
+    """
+    op = path.rstrip("/").rsplit("/", 1)[-1]
+    if op == "gifts":
+        return 200, {"Content-Type": "application/json"}, {
+            "server_time": int(time.time()),
+            "gifts": [],
+            "config": {"types": []},
+        }
+    if op == "get_gifts":
+        return 200, {"Content-Type": "application/json"}, []
+    return 200, {"Content-Type": "application/json"}, {}
+
+
 DYNAMIC_EXACT = [
     ("POST", "/public/resultservice/v1/enhancestats/batch_update", h_result_stats),
     ("POST", "/public/resultservice/v1/enhancestats/track", h_result_stats),
@@ -3113,6 +3431,13 @@ DYNAMIC_EXACT = [
     # 调用点，是虚表调用），所以两种方法都要支持。
     ("GET", "/public/targeting/v1/vip_badge_option", h_vip_badge_option),
     ("POST", "/public/targeting/v1/vip_badge_option", h_vip_badge_option),
+    # 礼包解锁白名单（ROADMAP 3「现时内购礼包」）。两个 configuration 变体共用
+    # cmd 0x49，所以 GET/POST 都指向同一个处理器。
+    ("GET", "/public/targeting/v1/condition_items", h_targeting_bundle_config),
+    ("GET", "/public/targeting/v1/configuration", h_targeting_configuration),
+    ("POST", "/public/targeting/v1/configuration", h_targeting_configuration),
+    # 好友同步回执（必须原样回显 uplay，否则客户端删好友）。
+    ("POST", "/public/friends/v1/update", h_friends_update),
 ]
 
 DYNAMIC = [
@@ -3168,6 +3493,11 @@ DYNAMIC = [
     ("POST", "/public/pvp_matches/v1/start_race", h_pvp_accept),
     ("POST", "/public/pvp_matches/v1/race", h_pvp_race),
     ("POST", "/public/pvp_matches/v1/increase_rewards", h_pvp_accept),
+    # --- 礼物 / 战争房间 ------------------------------------------------------
+    # URL 末段是 op（get_gifts / gifts / claim?type= / give_golden_ticket /
+    # send_gifts / ad_reward），只能前缀匹配；GET 与 POST 都要注册。
+    ("GET", "/public/gift/v1/", h_gift),
+    ("POST", "/public/gift/v1/", h_gift),
     ("POST", "/public/pvp_matches/v1/chips", h_pvp_chips),
 ]
 

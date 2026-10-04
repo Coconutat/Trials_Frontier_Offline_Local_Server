@@ -12,7 +12,7 @@
 | 1 | 修复 APK 启动 BUG（联网闪退） | ✅ **已修复并实机验证（m14/m15）** | 100% |
 | 2 | 修复账号管理（注册 / 登录分离） | ✅ **已实现并 curl 实测（含内置注册页）** | 85% |
 | 2b | VIP 下发（买了 VIP 就激活 VIP 事件） | ✅ **已实机验证（m16）** | 100% |
-| 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **排行榜 + 幽灵已通；限时活动/碉堡/午夜杯待做** | 55% |
+| 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟢 **第 3 条列出的全部支线均已落地并真机复验：排行榜 / 幽灵 / 碉堡 / 午夜杯 / 礼物链 / 好友链 / 限时内购礼包（targeting）** | 95% |
 | 4 | WebUI 管理界面 | 🟡 **已起头：`/__ui` 注册页 + `/__api/*`** | 15% |
 | 5 | 一键开服打包成 exe | ⚪ 未开始 | 0% |
 | 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
@@ -268,6 +268,8 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
 - **广告**：native 侧 `AdInterface::initAndroid()` 短路，Tapjoy/AdMob/Flurry/AdColony 全部不加载；
   logcat 实测广告相关 0 条。服务端遥测也已打桩。
 - **反作弊**：`tr::AntiCheating::isValid()` 恒返回 true；`MenuzStateMain::isUserBlackListed()` 恒 0。
+- **内置幽灵已折成「对手榜」（2026-10-05 落地）**：见下面 §3.3。修好了
+  「库里有 44 个幽灵、全球榜上却只有玩家自己一行、点进去没有对手可挑战」。
 
 ### 缺口
 - **幽灵的 `userstorage/v2/*` 链已实现**（2026-10-04 补）：
@@ -309,9 +311,127 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
   - 新增诊断端点 `GET /__leaderboards`：可直接看到落库的每条赛道记录与总榜聚合结果。
   - 回归测试 `REGRESSION PASS`：批量同步不入库；`track100` 依次提交 30000 / 35000 / 28000 后
     只剩 28000 一条；未提交的 `track999` 保持空榜；总榜聚合出 `tracks=2`。
-- 好友位仍是写死的 `GhostRider` / `TangoPro`，但它们没有真实成绩，
-  因此不会出现在任何榜单里 —— 这是刻意的（旧版给它们塞假成绩正是报障根源）。
-- **限时活动 / 赛季**：`liveevents/v1/*` 未构造真实数据；很多现时内购礼包需要服务器触发。
+- **好友链（`friends`）✅ 2026-10-05 已落地**：
+  - 端点族归 `tr::OnlineFriends`（`POST /public/friends/v1/update`，cmd 0x65）与
+    `tr::OnlineUbiservices`（`GET /v2/profiles/me/friends` cmd 0x50、
+    `GET /v1/profiles?idOnPlatform=` cmd 0x4b）。
+  - **`friends/v1/update` 必须原样回显请求里的 `uplay` id 数组**（`h_friends_update`）。
+    客户端遍历**本地**好友表的每个 pid 去回包里比对（`0x51d844 json_strcmp([x21+0x28], x9+0x81)`），
+    **未匹配就清零该条目标志位**（`0x51d864 str wzr,[x9,#0xac]`），收尾 `0x51da30 tbnz #3`
+    判定失败 ⇒ **好友被删**。所以原来落 `*` 兜底的 `{"data": []}` 等于回 `{"uplay":[]}`，
+    会把好友列表清空。
+  - `GET /v2/profiles/me/friends` 由 `rules.json:98` 的桩提供（`GhostRider` / `TangoPro`）。
+    这个桩的**形状是对的**，但有三个隐含硬约束（已写进 `rules.json` 的 `//friends2~4` 注释）：
+    ① cmd 0x50 分支 `0x5182a8` **没有 `cbz x21`**，空 body / 非法 JSON 会让 NULL 进解析器，
+    `0x51cf18 ldr x8,[x1,#0x10]` 直接读地址 `0x10` ⇒ **SIGSEGV**；`{}` 同样崩
+    （`0x51cf1c` 读 NULL+0x10，`cbz x28`@0x51cf20 只保护 x28）。
+    ② 不检查 JSON 类型标签 `+0x30`，`pid`/`nameOnPlatform`/`state` 必须是**字符串**，否则进 `strlen` 崩。
+    ③ **`pid` 必须排在 `nameOnPlatform` 之前**，否则 `strcmp(buf,"0")==0` 整条被静默跳过。
+    另：`pid` ≥ 43 字节会让 `addFriend` 的 `strcpy(x20+0x81,key)` 堆溢出。
+  - ⚠ 部署要点：`/v2/profiles/me/friends` 与 `/v1/profiles` 的 base 是**硬编码字面量**
+    `https://public-ubiservices.ubi.com` @`0xb85565`，**不走** `[OnlineCore+0x28]`，
+    只能靠 DNS/hosts 劫持接管；只有 `friends/v1/update` 走可变的私服地址。两者不是同一 host。
+  - 好友位仍没有真实成绩，因此不会出现在任何榜单里 —— 这是刻意的
+    （旧版给它们塞假成绩正是报障根源）。
+  - 完整反汇编报告：`work/trials-frontier/notes/friends-v1.md`（745 行）。
+- **「现时内购礼包」/ targeting ✅ 2026-10-05 已落地**（ROADMAP 第 3 条的最后一条支线）：
+  - **`GET /public/targeting/v1/condition_items?type=bundles`（cmd 0x85）就是礼包开关。**
+    解析器 `parseConfigData`@`0x515dc8`：**根必须是 JSON 数组**（`0x515e34 cmp w8,#2`）、
+    元素**必须是整数**（`0x515e58 cmp w8,#4`，非整数静默跳过）；这份整数列表就是
+    `OnlineProfileEligibilityManager+0x10` 里的**礼包 id 白名单**，bundle id 是**单字节（0..255）**。
+    消费方 `ProfileEligibilityManager::isBundleEligible`@`0x5955e8`，唯一调用者是
+    `StoreItem::unlockConditionsOK`@`0x609a20` ⇒ `OfferManager::pushPopup`@`0x5ff750`（礼包弹窗）。
+    以前落 `*` 兜底的 `{"data": []}` 是个 **JSON 对象**，根类型判等直接失败
+    ⇒ 白名单恒为空 ⇒ **礼包功能整体是死的（且静默无错）**。现 `h_targeting_bundle_config`
+    回 `[0..255]`（全开）；回 `[]` 是最小安全值。
+  - `GET`/`POST /public/targeting/v1/configuration`（两者共用 cmd 0x49）
+    现由 `h_targeting_configuration` 回 **`{}`** —— 这是文档化的安全最小值：
+    `root->first_child == NULL` 走 `0x4eef3c` 默认值路径（`w27 = -1`），
+    而 `0x4eefd0 cmn w27,#1; b.eq` 会**跳过整个配置包下载**，正是离线想要的。
+  - ⚠ 永远**不要**发 `metadata`：`downloadurl` 会让客户端对任意绝对 URL 发 GET 并
+    `SaveFile::writeSystemFile` 落盘（`0x4ef250`），随后 `GlobalData::onDataPacksUpdated()`
+    —— 既污染本地状态又指向真实 S3。
+  - ⚠ 唯一真实崩溃面在别处：`0x4eed1c str w9,[x8,#0x10]`（写 `login.access`）
+    **未判 `OnlineCore::m_authentication+0x28` 是否为 NULL**。所以本端点暂不返回 `login`。
+  - **本次改动没有引入崩溃面**：`tr::json_strcmp`@`0x569138`（仅 20 字节）对 NULL 安全
+    （`cbz x0/x1 → mov w0,#-1; ret`），两个解析器共 10 处显式 `cbz`/类型检查 ——
+    这与本项目 `reward_config` 那个「缺 key 就无条件解引用」的 bug 性质不同。
+  - 商店商品表其实来自**另一个端点** `receiptvalidation/v1/product/configuration`（cmd 0x19），
+    但 `limited_purchases` 表从**两个端点任一**都会被同一次
+    `StoreManager::parseStoreConfiguration`@`0x57b30c` 解析（元素结构 `ServerStoreItemData` 步长 **0x20**）。
+  - ✅ **真机已命中**：2026-10-05 00:30:25 三个端点全部走新处理器
+    （`condition_items` → `[0,1,2,…]`、`configuration` GET/POST → `{}`），游戏无崩溃。
+  - 完整反汇编报告：`work/trials-frontier/notes/targeting-v1.md`（770 行）。
+  - **遗留未闭环**：bundle id ↔ 具体礼包的映射表**不在 `.so` 里**
+    （`StoreManager+0xd0` 只存 `product_id` 字符串），必须从游戏数据包或运行时 dump 得到；
+    应急做法是回 `[0..255]` 全量。另外 `limited_purchases` 目前仍是 `[]` —— 那是真钱 IAP 商品，
+    `product_id` 必须匹配客户端本地商品表才有意义，尚无可靠来源。
+- **礼物链（`gift/v1/*`）✅ 2026-10-05 已落地**：
+  - 端点族属 `tr::OnlineGifting`（网络层）/ `tr::GiftingManager`（UI），共 6 个 op：
+    GET `get_gifts`(0x40) / `gifts`(0x42) / `claim?type=`(0x41)，
+    POST `give_golden_ticket`(0x3e) / `send_gifts`(0x3f) / `ad_reward`(0x43)。
+  - **两个必须特判的地方**（都已实现于 `h_gift`）：
+    1. `get_gifts` 的响应**根必须是 JSON 数组** —— `parseGiftArray`@0x51f784 第一条指令
+       就是 `ldr w8,[x1,#0x30]; cmp w8,#2; b.ne`（type tag 2 = 数组）。
+       以前回 `{"data": []}` 是对象 ⇒ 第一跳收工 ⇒ 永远「没有礼物」，且**静默无错**。
+    2. `gifts` 是**唯一**能写 `OnlineGifting+0x28`（server_time）的响应，
+       而 `GiftingManager::isUptoDate()` 读的正是它 ⇒ 缺了它，
+       `MenuzStateWarRoom::updateGiftingIndicator`@0x73999c 的
+       `[m_appTicker] % 300 == 0`（300 帧 @56.4fps ≈ **5.32 秒**）永远为真，
+       战争房间无限重发 `get_gifts`（实测 **6 小时 581 次**，日志里最大的一条噪声源）。
+  - POST 与 `claim` 的响应体客户端**一个字节都不解析**，回 200 即可。
+  - 完整反汇编报告：`work/trials-frontier/notes/gift-v1.md`。
+  - ✅ **真机复验通过（2026-10-05 00:22 重启后）**，三步证据链：
+    1. **`gifts`(0x42) 只有一个调用点** = `OnlineCore::onAuthenticationComplete` @`0x56c2b0`
+       —— 即**每次登录只发一次**。所以轮询修复**必须重启游戏才生效**，改完服务端不重启客户端是看不出差别的。
+    2. **解析器同时写两个字段**（`parseJsonResponse` 0x42 分支，逐指令核对）：
+       ```
+       0x51f638  add  x20, x20, #0x95c      ; x20 = 0xb8695c "server_time"
+       0x51f644  bl   json_strcmp
+       0x51f648  cbz  w0, #0x51f658         ; 命中 → 0x51f658
+       0x51f64c  ldr  x21, [x21, #8]        ; 否则找下一个兄弟
+       0x51f654  b    #0x51f668             ; 没找到也落到 0x51f668
+       0x51f658  ldr  w8, [x21, #0x28]      ; 命中：取整数值
+       0x51f65c  str  w8, [x19, #0x28]      ; this->server_time = w8
+       0x51f668  bl   mt::time::Time::getTimeOfDay()
+       0x51f66c  str  w0, [x19, #0x2c]      ; this->localTime —— 两条路径都会写
+       ```
+       ⇒ `isUptoDate()` 的 `w0 = (w9 != 0) && (w8 != 0)`（`/0x59b020`）里
+       `+0x2c` 恒非零、`+0x28` 以前恒为零 ⇒ **修复前必然 false**；现在 `+0x28` 有值 ⇒ **true**。
+    3. **实测**：00:22:28 登录拿到 `{"server_time": 1791130948, ...}`；00:24:55 进硲堡/战争房间
+       （`pvp_matches/v1/matches` + `/players` 同时出现，`MenuzStateWarRoom::transitionEnter`
+       @`0x73a44c` 触发一次 `requestUpdate` → 1 次 `get_gifts`）；**随后 172 秒零 `get_gifts`**
+       （00:24:55 → 00:27:47），期间 00:26:59 / 00:27:07 仍在房间内发 `pvp_matches`。
+       **修复前同样时长 = 约 32 次**（5.3 秒一次）。⇒ 轮询已消除，只剩进房间那一次。
+  - **定位方法（可复用）**：5.32 秒轮询只发生在**硲堡/战争房间界面**。用
+    `server-log.jsonl` 找 `get_gifts` 的「间隔 < 8 秒的连发段」（本次 14 段全部落在
+    10-04 21:00–23:15），再看同一时间窗内的其它请求 —— 441 次 `pvp_matches` 与 524 次
+    `get_gifts` 完全重叠，即可确认是 `MenuzStateWarRoom` 在刷。
+- **排行榜 `global_stats` 400 已修（2026-10-05）**：客户端除按赛道上报外，还会把自己的
+  **总榜行** `POST` 到 `/public/resultservice/v1/enhancestats/global_stats`。该 body 与
+  `batch_update` 同形，但 `stats` 里**没有 `track`**（只有
+  `data/global_score/drivetime/upgrades/submittime`），于是掉进 `h_result_stats` 的
+  `track[0-9]+` 正则 ⇒ **400 invalid-track（实测 16 次 100% 失败）**。
+  现在 `endpoint in GLOBAL_LEADERBOARDS` 直接回 200 并丢弃：总榜在本服务器是
+  **实时聚合视图**（`_aggregate_global_entries`），本来就无处可存，丢弃是安全的。
+  - ✅ **真机复验通过（2026-10-05 00:15:56 重启后）**：修复前那次 `end_race`（00:11:19）
+    触发了一串**每 11 秒一次的重试风暴** —— 00:11:19 / 00:11:30 / 00:11:41 / 00:11:52 /
+    00:12:03 / 00:12:14 / 00:12:25 / 00:12:36 / 00:12:47 / 00:12:58 / 00:13:09 共 **11 次全 400**，
+    直到玩家手动离开；第二场 00:14:21 `end_race` 后又是 10 次全 400。重启用 200 之后
+    **同一个 11 秒风暴立刻消失**，且 `global_stats_donkey`、`track1041` 仍 200（未回归）。
+    ⇒ 这个 400 不是无害噪音，它每场比赛都白烧 10~11 次请求 + 一次 11 秒的重试循环。
+- **碉堡 / 午夜杯：主链已通**（详见上面「碉堡筹码」与 §3.2 午夜杯两条）；
+  剩余的是**真机整链复验**，不是服务端缺口。
+  - ✅ **真机整链复验通过（2026-10-05 00:10:47 起）**：修复后玩家连跑两场，
+    `GET config/0`(00:09:52 / 00:10:37) → `POST start_race`(00:10:47) → `POST end_race`(00:11:19)
+    → `POST start_race`(00:13:47) → `POST end_race`(00:14:21) 全部 200，
+    随后 `POST /public/userstorage/v2/content/ghost` + `PUT .../ghost/58(/payload)`(00:16:05)
+    成功上传幽灵。全程 logcat **零 `libTrialsGo` / 零 SIGSEGV**（见下面「midnight cup 验证」）。
+- **⚠ 设备侧无关噪音，别再当成本项目的 bug**：这台 Xiaomi（sdm845）的指纹 HAL
+  `/vendor/bin/hw/android.hardware.biometrics.fingerprint-service.xiaomi` **每 ~6.6 秒**
+  就 `abort()` 一次（栈：`synaFpDeviceOpen` → `CSynaFpImpl::DevUninit` → `palMutexFree` →
+  `HandleUsingDestroyedMutex` → `__fortify_fatal`），整夜不停，与本游戏毫无关系。
+  **后果**：logcat 抓取必须用 `*:F` 而不是 `*:E`，否则这条噪音会把有用日志冲掉。
 - **碉堡筹码（2026-10-04 第二次修正，用户 m04710 / m04835）**：
   - 让客户端那个「赢家头像下慢慢填充的圆环」动起来，靠的是 `season.chip_equation_x/y`
     （`PVPManager::getNumChipsTotal` @0x5e1838 = `pow(t,x)*y`；`PVPMatch::getChipProgress`
@@ -329,7 +449,185 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
   - 人机成绩 = 玩家成绩 × `matchmaking.bot_time_margin_pct` + `bot_time_margin_ms`
     （默认 +1.8% + 400ms），`_pvp_bot_time` 强制夹到 ≥ 1.0 —— 用户 m04710：「跑完以后
     幽灵比我快……默认真人赢」。
-- **碉堡 / 午夜杯**：未做。
+### 3.2 午夜杯 / 周挑战（`weekly_track_system`）—— 主链已通
+
+服务端实现（`server/tf_server.py`，全部有反汇编契约注释）：
+
+| 端点 | 处理器 | 响应契约 |
+| --- | --- | --- |
+| `basic_info`（GET + POST） | `h_liveevents_basic_info` | 入口；POST 变体还顺带覆盖 `postLastWeekData`（cmd 0x7f，同一 URL，见 0x503800 `add x2,x2,#0x16c`） |
+| `config/<n>`（GET + POST） | `h_liveevents_config` | `parseChallengeConfiguration` @0x5055f0 |
+| `reward_config/<n>` | `h_liveevents_reward_config` | `parseRewardsSlot` @0x505d28 |
+| `find_opponent` | `h_liveevents_find_opponent` | `{"opponent","replay_id"}` |
+| `start_race`/`end_race`/`skip_cooldown`/`refill_retry_count` | `h_liveevents_accept` | 响应 **0 字节被解析**，回 200 即可 |
+
+**★ bike_id 必须 ≥ 1（真机崩溃根因，2026-10-05 修复）**
+玩家点「进入场地」**必崩**，logcat：
+```
+F/libc: Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0xb0
+#00 pc 0x6cbf20 libTrialsGo.so (tr::MenuzComponentWeeklyChallengeBike::setBike(int, int)+60)
+#01 pc 0x7b454c libTrialsGo.so (tr::MenuzStateWeeklyChallenge::loadIntroState()+944)
+```
+机制（逐条对齐）：`setBike` @0x6cbee4 把服务端给的 bike_id 直接喂给
+`UpgradeManager::getBike(unsigned short)` @0x62ac2c，后者遍历由 `parseBikeData` @0x62a190
+从 `/conf/bikes.txt` 建出的车表（**19 台、1..19 连续、无 0**），查不到就 `mov x0,xzr; ret`；
+调用方紧接着 `0x6cbf20 ldr w8,[x0,#0xb0]` ⇒ 空指针，**fault addr 0xb0 与崩溃地址完全吻合**。
+佐证：`getBikeIndexByID` @0x62a12c = `sub w0,w1,#1`（车号 1-based）。
+**修法**：`server/tf_server.py` 的 `h_liveevents_config` 里 `"bike_id": 0` → **`1`**
+（1 是碉堡 PVP 链早已在用的值，且 `tf_server.py:2119` 本就有 `bike < 1 ⇒ 1` 护栏）。
+⚠ 客户端**把周挑战 config 缓存在本地**（崩溃发生在 `config/0` 拉取之前的 00:04:45，
+而拉到 config 是 00:04:52），所以改服务端后**必须重新拉一次 config** 才生效。
+
+**✅ 真机验证（2026-10-05 00:10:47，修复生效后重跑）**
+- 服务端实测 `GET /public/liveevents/v1/weekly_track_system/config/0` 返回
+  `..."challenge_settings": {"track_id": 1041, "bike_id": 1, ...}` —— 新增的两个字段
+  `week_index: 2961` 与 `track_id: 1041` 也在（`find_opponent` / 排行榜按此对齐）。
+- 真机请求链（全部 200，**中间没有任何一次崩溃**）：
+  `config/0`(00:09:52) → `config/0`(00:10:37) → `start_race`(00:10:47) → `end_race`(00:11:19)
+  → `start_race`(00:13:47) → `end_race`(00:14:21) → `replaydata` + `ghost` 上传(00:16:05)。
+- **`logcat-mdnt.txt` 全文 grep `TrialsGo|alsfrontier|SIGSEGV` = 0 命中**；
+  该文件里唯一的 `F/DEBUG` tombstone 全部来自指纹 HAL（见上面的噪音条）。
+  ⇒ **「进入场地」崩溃已彻底修复，两场完整比赛 + 幽灵上传走通。**
+
+**其余要点**
+- `reward_config` 的 `reward` **必须是槽对象的第一个成员**（`parseRewardsSlot` 拿
+  first_child 的 key 去 `strcmp("reward")`），且**槽对象只给一个成员会崩**：
+  0x505d7c 无条件 `ldr x25,[x8,#0x10]`（x8 = first_child->next）⇒ 每个槽固定给两个等长数组。
+  奖励本身由**客户端**按 `Reward_<n>` 查本地 `/conf/wts_rewards.txt` 发放，服务端不下发物品。
+- 周赛任务的真正驱动是 `MissionDB` 里写死的 3 个任务 451/452/453
+  （`setUpWeeklyChallengeMissionTiming` @0x5c45f0 用午夜杯时间窗改写其 type-6 条件），
+  **纯客户端逻辑**，所以 `challenge_settings.task` 保持空数组是对的。
+- 诊断：`GET /__leaderboards`、服务器 stdout 的 `[liveevent]` 行。
+
+### 3.3 幽灵对手榜（2026-10-05 落地）—— 「榜上只有我自己」
+> 用户反馈（原话）：「我们拿了这么多幽灵数据，但是全球排行榜上一个没有。我也无法挑战自己，因为无法点击开始」
+
+**根因**：排行榜是按 `player`(pid) 建行的，而幽灵库里的条目 owner 是 onlineId 哈希，
+两者之间**没有任何桥**。`server/data/leaderboards.json` 里 36 个榜每个只有 1 行
+（全是玩家 `<player-profile-id>`），所以 `playerCount` 恒为 1。
+
+**数据澄清（重要，别再把幽灵数当对手数）**：`server/data/ghosts/index.json` 里
+**内置幽灵**（`builtin=True` / 带 `legacy_path`，54 条、30 条赛道）owner 全是
+`6f857655` —— 那是库里**唯一来自「别人」**的数据；其余 owner 是玩家自己的 pid
+（运行期上传）。`server/data/ghosts/INDEX.md` 里那张表的 owner 列**已过时**
+（它写 `99511744`/`0`，是 `ghost_sync_legacy` 改写 owner 之前的旧值），
+**以 `index.json` 为准**。
+
+**实现**（`server/tf_server.py`）：
+- `OPPONENT_PIDS = list(FRIEND_NAMES)` = `44444444-…`(GhostRider) / `55555555-…`(TangoPro) /
+  `66666666-…`(IronGear，本轮新增到 `FRIEND_NAMES`)。
+- `def _opponent_entries()`：扫 `acct.ghost_list()`，只收 `builtin`/`legacy_path` 条目，
+  按赛道分组、按 `drive_time` 升序 `zip(OPPONENT_PIDS, recs)` —— 第 1 个身份拿该赛道
+  最快的内置幽灵，第 2 个拿次快，第 3 个再下一个。`drivetime` 用幽灵**自己的真实时间**，
+  同时记 `{pid: {board: contentId}}`。结果缓存在 `_OPPONENT_CACHE`。
+- `def _load_ranked_boards()`：`_load_leaderboards()` 的浅拷贝再 `setdefault` 合并对手行。
+  ★ 对手**不落盘**：`_record_result` 走的是原始 `_load_leaderboards()`，所以
+  `_save_leaderboards` 永远不会把对手固化进 `leaderboards.json`，改幽灵库后对手榜自动跟着变。
+  `_stored_entries` / `_aggregate_global_entries` 已改用 `_load_ranked_boards()`。
+- `h_ghost`：在原来「该赛道随便挑一条」之前，先按请求里的 `players=<csv>` 查
+  `{pid: {board: contentId}}`，命中就回**那一条**幽灵 —— 榜上显示的时间与实际跑的幽灵一致
+  （`[ghost] … 对手 <pid> 的幽灵 cid=N`）。
+
+**实测**（`GET /public/playerstats/v1/ranking/…`）：
+| 请求 | 修复前 | 修复后 |
+|---|---|---|
+| `track1062?players=<我>,44444444,55555555` | 1 行 | **3 行**（GhostRider 24776 / 我 24776 / TangoPro 27357），`playerCount=3` |
+| `track1062?around=<我>,20` | 1 行 | 3 行 |
+| `global_stats?players=…` | 1 行 | **4 行**（我 843423 / GhostRider 708933 / TangoPro 335671） |
+| `GET /public/resultservice/v1/ghost?track_id=1062&players=44444444-…` | 1857 B（任意） | 1857 B `cid=19`（榜上 24776 那条） |
+| 同上 `players=55555555-…` | 1857 B（同一份） | **2020 B `cid=18`**（榜上 27357 那条） |
+
+⇒ 客户端那两条查询形状**都**被覆盖了：`players=`（好友页：自己 + 两个好友 pid）能拿到 3 行，
+`around=`（全球页，服务端本来就不过滤）能拿到全部行。
+
+**仍未闭环**：`66666666-…`(IronGear) 只拿到 1 条赛道（要第 3 条内置幽灵的赛道才有），
+且它**不在 `rules.json` 的好友桩里**，所以只在「全球 / around」页可见。
+若要让它是常驻对手，把 `server/rules.json:100` 的 `friends` 数组补一条即可。
+
+### 3.4 「比赛幽灵」按钮永远是灰的（2026-10-05 修复）—— `replay_id` 响应缺键
+> 用户反馈（原话）：「我想挑战这个幽灵，但是呢，比赛幽灵按钮是灰色的」
+
+**结论一句话**：`POST /public/resultservice/v1/replay_id` 必须回
+`{"replay_id": <int ≥ 1>}`，而旧实现回的是 `{"data": []}`。
+
+**逐指令链路**（`tmp/libcmp/orig-libTrialsGo.so`）：
+
+1. `tr::MenuzStateMap::setupRaceButton(bool doGhost, LeaderboardPlayerItem const* item)`
+   @`0x77e01c`（世界地图上那颗按钮；比赛内的同名函数是
+   `tr::IngameStateLeaderboard::setupRaceButton` @`0x6fa2c8`）：
+   ```asm
+   0x77e150  ldr  w8, [x21, #0x84]
+   0x77e154  cmn  w8, #1            ; item->ghost_id == -1 ?
+   0x77e158  b.ne 0x77e288          ; != -1 -> 跳过硬 disable 的那一段
+   ...       bl   OnlineGhostManager::checkGhost(...)
+             bl   MenuzComponentButtonImage::disable()   ; 首帧必然置灰
+   ```
+   +0x84 只在 `onGhostQuery` 回调里被写过，所以**它是唯一开关**。
+2. `tr::OnlineGhostManager::checkGhost(OnlineGhostManagerListener*, int leaderboardId,
+   char const* profile_id, int drive_time, int faults, int bike)` @`0x5070cc`
+   → `OnlineCore::postJson(obj+8, url, body, cmd=0x0e /*14*/, 1)`；
+   URL = `%s/%s/resultservice/v1/replay_id` @`0xb87ba9`，
+   body = `{"profile_id":"%s","track_name":"track%d","drive_time":%d,"faults":%d,"bike":%d}`
+   @`0xb87b58`（`drive_time/faults/bike` 直接来自榜上那一行，所以**回的时间必须与榜行一致**）。
+3. `tr::GhostQueryObject::onNetworkDataReceived` @`0x508800`，jump table @`0xb879b0`
+   （只认 cmd 13..19）；**cmd 14 → @`0x50895c`**：
+   ```asm
+   0x5089b4  strb wzr, [x20, w8]        ; 截断 body
+   0x5089bc  ldr  x24, [x0, #0x10]      ; root 的第一个孩子
+   0x5089a8  add  x21, x21, #0xbc0      ; "replay_id" @0xb87bc0
+   ...       json_strcmp(node->[0x20], "replay_id") -> w20 = *(int*)(node+0x28)
+   0x5089d8  cmp  w20, #1
+   0x5089dc  b.lt 0x508a68              ; ★ < 1 一律走失败分支（err=7）
+   0x5089e0  ldr  x8, [x0]              ; 成功：listener->vtable[0x18](err=0, id=w20, name)
+   ```
+   `{"data": []}` ⇒ 没有 `replay_id` 键 ⇒ `w20 = 0` ⇒ 走失败分支 ⇒ 死循环置灰。
+4. `listener->vtable[+0x18]` 经 `.data.rel.ro` 取证确认就是
+   **`_ZThn392_N2tr13MenuzStateMap12onGhostQuery(TR_ONLINE_ERROR, int, char const*)`**
+   @`0x77f97c` —— 该子对象位于 `MenuzStateMap+0x188`，它的 vtable **address point = `0xdedbb8`**
+   （`_ZTV` 头两槽在 `0xdedba8`/`0xdedbb0`：offset-to-top = 0、typeinfo = `_ZTIN2tr13MenuzStateMapE`）：
+   `+0x00` onGhostMetaDataReceived / `+0x08` onGhostReceived / `+0x10` onGhostSent /
+   **`+0x18` onGhostQuery**（前三槽是基类默认桩 `0x4ffc94` / `0x4ffe14` / `0x4ffe18`，
+   即 `0xdedbb8`/`0xdedbc0`/`0xdedbc8`；`+0x18` 落在 `0xdedbd0`）。
+   `tr::MenuzStateMap::onGhostQuery` @`0x77f900` 做的事：
+   `strncmp(getSelectedData()->profile_id, name, 0x28)` 相等且 `err != -1` 时
+   **`selected->[0x84] = id`**，然后 `MenuzStateMap::enableStartButtonIfPossible()`。
+   ⇒ 下一次 `setupRaceButton` 看到 `[0x84] != -1` 就不再 `disable()`，**按钮点亮**。
+5. 点下去 → `tr::MenuzStateMap::loadLeaderboardGhost()` @`0x77c77c`
+   → `tr::PopupStateLoadGhost::setupLeaderboardGhost(item, leaderboardId, listener)` @`0x811248`
+   → `tr::OnlineGhostManager::getGhost(listener, item->[0x84], leaderboardId, item->[0x6c])` @`0x506e48`
+   → `tr::OnlineUserStorage::getData(listener, "ghost", id)` @`0x578780`
+   → `GET %s/%s/userstorage/v2/content/ghost/%d/payload` @`0xb8c6f4`（**直接取二进制**）。
+   ★ 这条 URL 早就由 `h_userstorage` 正确服务，所以**回对 replay_id 就够了**。
+
+**`LeaderboardPlayerItem` 布局**（推出，供以后参考）：
+`+0x00 char[0x28]` profile_id / `+0x60 int drive_time` / `+0x64 int faults` /
+`+0x6c int bike` / `+0x84 int ghost_id`（初值 -1）。
+
+**修复**（`server/tf_server.py` 的 `h_replay_id`，@`server/tf_server.py:2713`）：
+- 照旧 `acct.ghost_record_replay(...)` 登记，然后按 `profile_id` + `track_name`
+  查 `_opponent_entries()` 的 `{pid: {board: contentId}}`，命中就回
+  **`{"replay_id": <该 contentId>}`**；榜外的 pid（玩家自己）回退到
+  `acct.ghost_any_for_track(track)`；两者都查不到才回 `{"data": []}` 的失败形状。
+- 回的是**真实存在且带二进制**的 contentId，正好能被上面第 5 步的 `/payload` 取走。
+
+**实测（HTTP，`server/tf_server.py` 重启后 PID 31132 / :8000）**：
+| 请求 body | 响应 |
+|---|---|
+| `{"profile_id":"44444444-…","track_name":"track100","drive_time":10509,…}` | `{"replay_id": 6}` |
+| `{"profile_id":"55555555-…","track_name":"track100","drive_time":11014,…}` | `{"replay_id": 5}` |
+| `{"profile_id":"<player-profile-id>","track_name":"track1041","drive_time":25656,…}` | `{"replay_id": 54}`（兜底） |
+
+`GET /public/userstorage/v2/content/ghost/5/payload` → **937 B**、`/ghost/6/payload` → **905 B**，
+首 4 字节都是 `03 00 00 00`（幽灵容器头）；
+`track100` 榜行 `#1 GhostRider 10509 / #2 我 10509 / #3 TangoPro 11014` ——
+与客户端 body 里带的时间**逐条对得上**。
+
+**真机坐实的旧行为**：`server-log.jsonl` 里 31 次 `POST …/replay_id` 全部 `{"data": []}`；
+其中 `00:44:16–00:45:44` 的 13 次带对手 pid（`track100` 两次分别是 GhostRider 10509 /
+TangoPro 11014，`track1087` 若干），正是用户反复点那颗灰按钮的痕迹。
+
+**仍未闭环**：`track1236` / `track66772` 这类赛道 `playerCount=0`（库里本来就没有
+内置幽灵），点了不会出现对手行 —— 要补对手得先往幽灵库里放数据。
 
 ### 3.1 真钱内购破解结论（重要，别再走弯路）
 - ❌ **靠服务器回成功响应不行**：`StoreManager::onNetworkDataReceived` @`0x0057b0cc` 的

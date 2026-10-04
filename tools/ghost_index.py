@@ -49,7 +49,7 @@ def main():
 
     out = []
     out.append("# 幽灵清单（server/data/ghosts/）\n")
-    out.append("本文件由 `tmp/ghost_index.py` 生成，列出仓库里所有静态幽灵文件。\n")
+    out.append("本文件由 `tools/ghost_index.py` 生成，列出仓库里所有静态幽灵文件。\n")
     out.append("格式：`[track, drive_time, frames, size]`，`drive_time` 单位毫秒。\n")
     out.append("| 赛道 | owner | 文件 | drive_time | frames | size | 解压 | tag | 校验 |")
     out.append("|---:|---|---|---:|---:|---:|---:|---|---|")

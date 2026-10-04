@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """扫描 .so 的 .text，找出所有 `adrp Xn, <page>; ldr Xn, [Xn, #<off>]` 形式的全局引用。
 
-用法: python tmp/gref_global.py <so> <page_hex> <offset_hex>
-例:   python tmp/gref_global.py tmp/libcmp/orig-libTrialsGo.so 0xe20000 0x420
+用法: python tools/gref_global.py <so> <page_hex> <offset_hex>
+例:   python tools/gref_global.py tmp/libcmp/orig-libTrialsGo.so 0xe20000 0x420
 """
 import struct
 import sys

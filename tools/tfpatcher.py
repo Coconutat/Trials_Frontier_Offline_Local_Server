@@ -3,7 +3,10 @@
 """Trials Frontier（特技摩托前线）离线化 patcher。
 
 把用户自备的**原版** APK 变成可离线游玩的改好版本。全程只做定点字节修改，
-不引入任何第三方依赖（只用 Python 标准库 + Android SDK 的 zipalign/apksigner）。
+不重编译 smali、不重新编码 dex。
+
+依赖：Python 3.8+ 标准库、`pyelftools`（patch_urls.py 解析 ELF 节表时用）、
+以及 Android SDK 的 zipalign / apksigner（没有 SDK 时可用 --no-sign 出未签名包）。
 
 用法:
     python tools/tfpatcher.py --apk 原版.apk --out 改好.apk
@@ -18,8 +21,8 @@
     --keep-v7a                保留 armeabi-v7a 的库（不推荐，见下）
     --force                   跳过原版 .so 的 SHA256 校验
 
-做了什么（详见 work/trials-frontier/README.md）:
-  1. libTrialsGo.so 上 7 处定点补丁：
+做了什么（逐条依据见 tools/README.md 与 work/trials-frontier/notes/）:
+  1. libTrialsGo.so 上 17 处定点字节补丁（每处都校验原始字节，对不上就退出）：
        AntiCheating::isValid()            -> 恒 true（关掉反作弊时钟校验）
        ConsumableManager::isUnlimitedFuel -> 恒 true（无限燃油）
        OfferData::isBlackListed           -> 恒 false（不拉黑任何 offer）
@@ -27,6 +30,14 @@
        DLContentManager::isDLReady()      -> 恒 true（内容包视为就绪）
        MenuzStateMain::isUserBlackListed()-> 恒 false（不弹"警报！"）
        AdInterface::initAndroid()         -> 提前返回（原生广告永不初始化）
+       —— 真钱内购（2 处）——
+       StoreManager::onPurchaseFailed     -> 尾调用 onPurchaseComplete（失败直接发奖）
+       StoreManager::onPurchaseCancel     -> 尾调用 onPurchaseComplete（取消直接发奖）
+       —— VIP / 骑士俱乐部（8 处，其中 3 处写进代码洞）——
+       VIPManager::getPlayerMembership()+0x78/+0x7C/+0x80/+0xF4/+0xF8
+                                          -> 插 NULL 保护：修掉开屏闪退，同时保留真实 VIP 上报
+       OfferManager::findVIPOffers        -> IAP 查询跳进代码洞，返回伪造 IAPItemInfo
+                                            （离线也能出现 VIP 档位 → 触发服务器下发 VIP）
   1b. classes.dex 里 6 处改写（Java 侧广告 + 遥测）：
        CustomNativeActivity.initAdMobRewardedVideoAds -> return-void（不再初始化 Google Mobile Ads）
        CustomNativeActivity.tapjoyInit               -> return-void（不再连接 Tapjoy 广告网络）
@@ -220,15 +231,15 @@ def main():
         else:
             log("    !! APK 里没有 classes.dex，Java 侧广告补丁将跳过")
 
-    # ---------- 2. libTrialsGo.so: 7 处定点补丁 ----------
+    # ---------- 2. libTrialsGo.so: 17 处定点补丁 ----------
     ltg = os.path.join(work, "libTrialsGo.1.so")
     run([sys.executable, script("patch_native.py"),
          "--so", src["libTrialsGo.so"], "--out", ltg,
          "--report", os.path.join(work, "native-report.json")],
-        "给 libTrialsGo.so 打 7 处定点补丁")
+        "给 libTrialsGo.so 打 17 处定点补丁")
 
     # ---------- 3. 服务器地址：注入 DT_INIT 运行期改写 ----------
-    log("\n[3/6] 注入服务器地址钩子（运行期读 tf_server.txt）")
+    log("\n[3/7] 注入服务器地址钩子（运行期读 tf_server.txt）")
     ltg2 = os.path.join(work, "libTrialsGo.2.so")
     run([sys.executable, script("patch_dynaddr.py"),
          "--so", ltg, "--out", ltg2, "--base", args.host],

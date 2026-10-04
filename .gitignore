@@ -3,10 +3,26 @@
 
 # workspace（构建中间产物 / 反编译输出 / 交付包）
 tmp
-work
 dist/*
 # 交付包里的说明文档值得入库，其余（APK、patcher、server 副本）不入库
 !dist/README.md
+
+# ── work/：默认全部忽略，只放行逆向笔记 ────────────────────────
+# work/trials-frontier/ 是 reverse-skill 的工作区，其中：
+#   notes/*.md                            逆向笔记 = 项目知识库，ROADMAP_STATUS.md 的 §3.x 逐条引用，必须入库
+#   README/scope/timeline/workitems.md    案子元数据（授权门禁的 scope.md 也在这里），入库
+#   src/ evidence/ report/ keystore/ .apktool-framework/ 以及 notes/ 下的日志与原始导出，全部不入库
+#
+# ★ 必须写 `work/*` 而不是 `work`：git 规定「父目录被排除时，其下的文件无法再被放行」，
+#   目录级排除会让下面所有 `!` 规则失效。排除「目录内容」才能逐层放行。
+#   （`dist/*` + `!dist/README.md` 是同一个范式。）
+work/*
+!work/trials-frontier/
+work/trials-frontier/*
+!work/trials-frontier/*.md
+!work/trials-frontier/notes/
+work/trials-frontier/notes/*
+!work/trials-frontier/notes/*.md
 
 # 历史遗留：误展开的变量目录（$t/ANDROID.RSA）
 /$t/
