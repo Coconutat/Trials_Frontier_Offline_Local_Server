@@ -119,6 +119,17 @@ _TF_CONFIG_DEFAULTS = {
         #   （给黄金参赛票 item id 0x87=135 重定价），其余 product_id 在
         #   UpgradeItemData 注册表里查不到就被静默忽略 —— 所以这里只放确定存在的 id。
         "product_list": [{"product_id": "chip_shop.goldentickets", "amount": 3}],
+        # ★ 筹码曲线（`pvp_match_settings.chip_equation_x/y`）。
+        #   客户端 `PVPManager::getNumChipsTotal(t)` @0x5e1838 = `pow(t, x) * y`，
+        #   t = `now - PVPTrack+0x20`（owner_change_time，unix 秒）。
+        #   同一曲线既决定**筹码枚数**，也决定**圆环填充进度**
+        #   （`PVPMatch::getChipProgress` @0x5ed8c4 返回它的小数部分）。
+        #   x=0.5 / y=0.5：占住 t 秒产 floor(0.5*sqrt(t)) 枚 ——
+        #   4 秒第一枚、16 秒第二枚、36 秒第三枚、1 小时约 30 枚、6 小时约 73 枚，
+        #   符合用户 m04404 转述的「前期累积快，然后慢慢变慢」。
+        #   发 0/0 会让圆环永远空着（m04710 的真机症状），**绝对不要回退成 0**。
+        "chip_equation_x": 0.5,
+        "chip_equation_y": 0.5,
         # ★ `current_season.rewards` @0xb8d6de —— `parseSeasonData` @0x4fe4f4 的
         #   天梯奖励栏契约：数组，每项 `{"rank": int, "item_id": int, "amount": int}`
         #   （按 `rank` 归组进外层 vector，同一 rank 可给多个 (item_id, amount)；
@@ -151,16 +162,17 @@ _TF_CONFIG_DEFAULTS = {
     # —— 每拥有一条赛道上就跑一条产线，定期产出一枚筹码；天梯最低（25 级）
     # 起步是 0，升到某个等级才额外给一点。
     #
-    # 客户端的筹码公式（`PVPManager::getNumChipsTotal` @0x5e1838）是
-    #     pow(now - PVPTrack+0x20, PVPManager+0xb0) * PVPManager+0xb4
-    # 而 `PVPTrack+0x20` 同时被 `PVPManager::onStartRaceSent` 当成**车种 ID**
-    # 写进 `GameWorld+0x1efc`，两个语义撞在同一个字段上。所以这里把
-    # `chip_equation_x` / `chip_equation_y` 都发 0（= 客户端自己永不产筹码），
-    # 产筹码这件事整个搬到服务器算，客户端只显示 `player_info.chips` 这个总额。
+    # ★ 局内筹码曲线在 `season.chip_equation_x/y`（客户端与服务端共用同一条曲线，
+    #   客户端还会拿它画赢家头像上那个顺时针填充的圆环 —— 见 `_chip_curve` 与
+    #   `_pvp_season` 的注释）。早期的「PVPTrack+0x20 同时是车种 ID、所以只能发
+    #   0/0」结论是把 `PVPTrack+0x24`(bike) 与 `PVPTrack+0x20`(owner_change_time)
+    #   搞混了，已在 m04710 修正。
     "chips": {
         # 起步筹码（用户规则：最低天梯 0）。
         "start": 0,
         # 每条已拥有赛道每隔这么多秒产 1 枚（0 或负数 = 不产）。
+        # ⚠ 这条「赛道产线」是**账号级**的长期产出（`_pvp_chips_for`），
+        #   与局内的 `chip_equation` 曲线是两回事，别混。
         "per_track_seconds": 3600,
         # 上限（0 = 不限）。★ 别再用 200：筹码商店里最贵的一条赛道 63000 筹码，
         # 顶到 200 会让商店永久锁死。
@@ -168,12 +180,7 @@ _TF_CONFIG_DEFAULTS = {
         # ── 局内筹码（用户 m04404 引同服玩家 Assassins-Cry 的实测规则）：
         #   拿到这条赛道就开始累积，**前期快、后面越来越慢**；对手把赛道抢回去 →
         #   累积速度重置，又从快开始变慢；整局跑完才结算成 `chips` 余额。
-        #   曲线取 sqrt：占着 t 秒产 `int(sqrt(t) / match_tick_sqrt)` 枚。
-        #   默认 2 → 4 秒 1 枚、9 秒 2 枚、16 秒 3 枚…（前 10 秒就有 3 枚，肉眼能看到
-        #   「每几秒生成一个」，之后明显变慢 —— 与用户的观感一致）。
-        "match_tick_sqrt": 2,
-        # 单条赛道在一局里最多产多少枚（别让挂机刷爆）。
-        "match_max_per_track": 12,
+        #   曲线见 `season.chip_equation_x/y`（`_pvp_match_chips` 用的就是它）。
     },
     # 赛后奖励。比赛 JSON 的 `rewards` 是**数组**，parseMatch @0x4fd9d0 只读前 3 个整数
     # （`cmp w9,#2; b.gt`，见 0x4fdd78），然后拼成 PVPMatch+0x170 上的
@@ -1385,10 +1392,24 @@ def _pvp_season(banner_url=""):
         rewards @0xb8d6de（= 天梯奖励栏，`[{"rank","item_id","amount"}]`，
         见 `_pvp_season_rewards`）/ rank @0xb869b5。
     ⚠ `banner_url` 留空字符串：非空会触发一次 `getSeasonBanner`（cmd 0x32）去下图。
-    ⚠ `chip_equation_x/y` 必须发 0/0：`PVPManager::getNumChipsTotal` @0x5e1838 是
-      `pow(t, x) * y`，而 t 的基准 `PVPTrack+0x20` 同时被 `onStartRaceSent` @0x5e59ec
-      当成车种 ID（发的是 1），所以一旦 y != 0，客户端会算出 `pow(now-1, x)*y`
-      这种天文数字。筹码改由服务器记账（`_pvp_chips_for`），客户端只做展示。
+    ⚠ `chip_equation_x/y` 是**筹码曲线的系数**，客户端拿它自己算筹码与「圆环填充进度」：
+      `PVPManager::getNumChipsTotal(double t)` @0x5e1838 = `pow(t, x) * y`
+      （x = [+0xb0], y = [+0xb4]，见 `ldp s2, s1, [x8, #0xb0]`）。
+      `PVPMatch::getChipProgress(int i, double)` @0x5ed8c4 返回
+      `frac(getNumChipsTotal(now - PVPTrack+0x20))` —— 就是赢家头像上那个
+      **顺时针填充的圆环**（`MenuzComponentPVPTrackWidget::updateChipProgress` @0x714a68
+      → 填充值下降时调 `animateChips()` @0x714b08 产出一枚筹码）。
+      ★ 以前这里发 0/0 是错的（当时的判断是「t 的基准 PVPTrack+0x20 被当成车种 ID」，
+        见下方历史备注）。真机 m04710 的实际症状就是**圆环永远不填充**。
+      ★ 真相（`PVPTrack::setOwner` @0x5ddfa4 = `str w1,[x0,#4]; str w2,[x0,#0x20]`）：
+        `PVPTrack+0x04` = owner，`PVPTrack+0x20` = **owner_change_time（unix 秒）**，
+        `PVPTrack+0x24` = **车种 ID**（`onStartRaceSent` @0x5e59ec 读的是 `[track+0x24]`，
+        x20 是 PVPTrack* 而不是 PVPMatch*，所以那个「车种 ID」结论属于另一个偏移）。
+        两者互不冲突，可以同时发对。
+      ⇒ 服务器必须发**真时间戳**的 `owner_change_time`（见 `_pvp_track_json`），
+        并且 `_pvp_match_chips` 用**同一条曲线**算 `server_time` 时刻的筹码快照，
+        客户端再把它从 `server_time` 外推到 `now`（`getPlayerChips` @0x5ed6f8 的
+        `- floor(f(server_time)) + floor(f(now))`）。
     """
     now = int(time.time())
     week_start, _wi = _week_index()
@@ -1396,13 +1417,14 @@ def _pvp_season(banner_url=""):
     ftk_max = cfg_int("matchmaking", "free_tickets_max", default=3)
     ftk_init = cfg_int("matchmaking", "free_tickets_initial", default=ftk_max)
     ftk_iv = cfg_int("matchmaking", "free_tickets_interval_seconds", default=3600)
+    _cx, _cy = _chip_curve()
     settings = {
         "free_tickets_interval": ftk_iv if ftk_iv > 0 else 3600,
         "Pvp_skill_counter": 0,
         "free_tickets_max": ftk_max if ftk_max > 0 else 3,
         "free_tickets_initial": ftk_init,
-        "chip_equation_x": 0,
-        "chip_equation_y": 0,
+        "chip_equation_x": _cx,
+        "chip_equation_y": _cy,
         "winner_chip_heritage": 100,
         "loser_chip_heritage": 50,
         "ranked_match_duration": cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600,
@@ -1793,22 +1815,40 @@ def _pvp_side_score(m, who, tid):
         return 0
 
 
-def _pvp_bot_time(m, tid):
-    """人机在这条赛道上的用时（ms）。
+def _pvp_bot_time(m, tid, my_ms=None):
+    """人机在这条赛道上的用时（ms）—— **永远比玩家慢，默认真人赢**。
 
-    就是这条赛道幽灵库那条幽灵的真实 `drive_time` —— 因为紧接着经
-    `/pvp_replaydata` 下发给玩家「对手幽灵」的正是同一条，两边必须一致，
-    否则玩家会看到「显示的时间」和「跑出来的幽灵」对不上。
+    用户 m04710（verbatim）：
+      「跑完以后幽灵比我快。一般来说 PVP 的人机根本不跑图。默认真人赢。」
+
+    所以人机这一条成绩只起两个作用：① 让这条赛道有个「可被挑战的记录」，
+    ② 让 `/start_race` 的 `PVPTrack+0x0C != 0` 闸门通过、对手幽灵能下发。
+    它**绝不能比玩家快**，否则 `parseMatch` 0x4fe0dc 的 score 比较会把赛道判给
+    人机（真机症状：3 条赛道里 2 条显示 `+0:01.660` 是红色的，玩家跑完还是输）。
+
+    以前这里是幽灵库那条幽灵的真实 `drive_time` —— 真机跑下来幽灵比玩家快，
+    于是「跑完以后幽灵比我快」。现在改成「玩家成绩 + 一点余量」。
     """
-    return _pvp_ghost_time(tid)
+    base = 0
+    try:
+        base = int(my_ms or 0)
+    except (TypeError, ValueError):
+        base = 0
+    if base <= 0:
+        # 理论上走不到（只有玩家先交成绩才会叫人机跑），留个兜底免得算出 0。
+        base = _pvp_ghost_time(tid)
+    # +1.8% + 400ms：大约慢 1~3 秒，视觉上像「差一点点」而不是被吊打。
+    t = int(base * 1.018) + 400
+    return max(1, min(3599000, t))
 
 
-def _pvp_bot_runs(m, tid, now=None):
+def _pvp_bot_runs(m, tid, now=None, my_ms=None):
     """让这一局的人机「跑一次」这条赛道（玩家交完成绩后由 `h_pvp_race` 调用）。
 
     用户 m04586 描述的机制就是这样：谁跑了谁才有数据。玩家先跑 → 人机再跑 →
     两条成绩一比自己算归属（`parseMatch` 0x4fe0dc 的 score 比较），
     玩家想再抢回来时才会去下对手幽灵（`/start_race` 的 PVPTrack+0x0C 闸门）。
+    `my_ms` 是玩家刚交的用时，用来把人机的成绩压在玩家之后（见 `_pvp_bot_time`）。
     """
     if not m or not tid:
         return
@@ -1818,13 +1858,14 @@ def _pvp_bot_runs(m, tid, now=None):
     tid = int(tid)
     if tid in by:
         return
+    bt = _pvp_bot_time(m, tid, my_ms)
     by[tid] = {
-        "score": _pvp_score_int(_pvp_bot_time(m, tid), 0),
+        "score": _pvp_score_int(bt, 0),
         "additional_score": 0,
         "bike_data": cfg_int("matchmaking", "bike_id", default=1) or 1,
         "at": int(now or time.time()),
     }
-    print("[pvp] 人机跑了赛道 %s -> %s ms" % (tid, _pvp_bot_time(m, tid)), flush=True)
+    print("[pvp] 人机跑了赛道 %s -> %s ms" % (tid, bt), flush=True)
 
 
 def _pvp_owner_of(m, tid):
@@ -1855,6 +1896,39 @@ def _pvp_match_won(m, who):
     return owners.get(who, 0) >= 2
 
 
+def _chip_curve():
+    """`(chip_equation_x, chip_equation_y)` —— 全局唯一的筹码曲线系数。
+
+    客户端与服务端**必须用同一条曲线**：客户端拿它把服务器给的筹码快照
+    从 `server_time` 外推到 `now`（`PVPMatch::getPlayerChips` @0x5ed6f8 的
+    `- floor(f(server_time)) + floor(f(now))`），并画那个顺时针填充的圆环。
+    """
+    def _f(key, dflt):
+        v = cfg("season", key, default=dflt)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return dflt
+    x = _f("chip_equation_x", 0.5)
+    y = _f("chip_equation_y", 0.5)
+    if x <= 0 or y <= 0:  # 发 0 → 圆环永不填充，见 _TF_CONFIG_DEFAULTS 的注释
+        x, y = 0.5, 0.5
+    return x, y
+
+
+def _chips_at(seconds, x=None, y=None):
+    """`pow(t, x) * y` 的整数部分 —— 与客户端 `getNumChipsTotal` 一致。"""
+    if x is None or y is None:
+        x, y = _chip_curve()
+    t = float(seconds)
+    if t < 0:
+        return 0
+    try:
+        return int((t ** float(x)) * float(y))
+    except (OverflowError, ValueError):
+        return 0
+
+
 def _pvp_match_chips(m, who, now=None):
     """本局 `who` 从「自己占着的赛道」上产出的筹码；`m` 为空时返回 None。
 
@@ -1862,17 +1936,14 @@ def _pvp_match_chips(m, who, now=None):
       * 拿到这条赛道就开始累积，**前期快、后面越来越慢**；
       * 对手把赛道抢回去 → 累积速度**重置**，又从快开始变慢；
       * 整局跑完才结算成筹码余额（见 `_pvp_bank_match_chips`）。
-    曲线取 sqrt：占着 t 秒产 `int(sqrt(t)/k)` 枚 —— 几秒就出第一枚，之后越来越慢。
+
+    ★ 数值必须与客户端用同一条曲线（`_chip_curve`），否则赢家头像上那个
+      圆环与数字会对不上（m04710）。
     """
     if not m or not who:
         return None
     now = int(now or time.time())
-    try:
-        k = int(cfg_int("chips", "match_tick_sqrt", default=2) or 2)
-    except (TypeError, ValueError):
-        k = 2
-    k = max(1, k)
-    cap = cfg_int("chips", "match_max_per_track", default=12) or 12
+    x, y = _chip_curve()
     total = int((m.get("chip_base") or {}).get(who) or 0)
     at_map = m.get("owner_at") or {}
     start = int(m.get("start") or now)
@@ -1884,7 +1955,7 @@ def _pvp_match_chips(m, who, now=None):
         if at is None:
             at = at_map.get(str(tid))
         dt = max(0, now - int(at if at else start))
-        total += min(cap, int((dt ** 0.5) / float(k)))
+        total += _chips_at(dt, x, y)
     return total
 
 
@@ -1971,14 +2042,32 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
           那时两条成绩都在，玩家再跑这条赛道才会拿到对手幽灵。
         """
         tid = int(tid)
+        # ★ `owner_change_time` = **「当前归属者是什么时候拿到这条赛道的」unix 秒**
+        #   （`PVPTrack::setOwner` @0x5ddfa4 = `str w1,[x0,#4]; str w2,[x0,#0x20]`
+        #     ⇒ +0x04 = owner、+0x20 = owner_change_time）。
+        #   客户端 `PVPMatch::getChipProgress` @0x5ed8c4 / `getPlayerChips` @0x5ed6f8
+        #   都拿它当时间基准：`now - owner_change_time` 才是筹码累积的秒数。
+        #   `getChipProgress` 还要求 owner != -1 且该值 != 0，否则直接返回 0
+        #   ⇒ **无主赛道必须发 0**（这样圆环不画，与「谁都没跑过」一致）。
+        #   ⚠ 曾经这里发的是车种 ID（=1）：那是把 `PVPTrack+0x24`（bike）和
+        #     `PVPTrack+0x20`（owner_change_time）搞混了 —— `onStartRaceSent`
+        #     @0x5e59ec 读的 `[x20+0x24]` 里 x20 是 **PVPTrack***，所以它取的是 bike。
+        #     两个字段互不冲突，可以同时发对。
+        oc = 0
+        if _pvp_owner_of(_m, tid) is not None:
+            raw = (_m.get("owner_at") or {}).get(tid)
+            if raw is None:
+                raw = (_m.get("owner_at") or {}).get(str(tid))
+            try:
+                oc = int(raw or 0)
+            except (TypeError, ValueError):
+                oc = 0
         out = {
             "track": tid,
             "bike": bike,
-            # ★ `owner_change_time` 就是车种 ID：onStartRaceSent @0x5e59ec 读
-            #   PVPMatch+0x24（= 第 0 条轨道的 +0x20，即 setOwner 的第二个参数）
-            #   写进 GameWorld+0x1efc；填 0 → UpgradeManager::getBike(0) 为 NULL →
-            #   加载关卡时崩。
-            "owner_change_time": bike,
+            # ★ 车种 ID：onStartRaceSent @0x5e59ec 把它写进 GameWorld+0x1efc；
+            #   填 0 → UpgradeManager::getBike(0) 为 NULL → 加载关卡时崩。
+            "owner_change_time": oc,
         }
         for slot, pid in (("result_p1", profile_id), ("result_p2", opponent_id)):
             rec = ((_m.get("results") or {}).get(pid) or {}).get(tid) or {}
@@ -2363,7 +2452,9 @@ def h_pvp_race(path, query, body, headers):
                 }
             # ★ 人机「跑」同一条赛道（用户 m04586：谁跑了谁才有数据；一局开始谁都没有
             #   记录，玩家跑完人机才有一条自己的成绩，两条一比自己算归属）。
-            _pvp_bot_runs(m, tid)
+            #   人机成绩被压在玩家之后（`_pvp_bot_time`）—— 用户 m04710：
+            #   「一般来说 PVP 的人机根本不跑图，默认真人赢」。
+            _pvp_bot_runs(m, tid, my_ms=_pvp_time_of_score(score))
             # 归属变了 → 重置这条赛道的筹码累积起点
             # （用户 m04404：对手拿回赛道后，筹码累积速度重置，又从快开始变慢）。
             _who = _pvp_owner_of(m, tid)

@@ -167,7 +167,9 @@
         "item_id": 29,
         "amount": 2
       }
-    ]
+    ],
+    "chip_equation_x": 0.5,
+    "chip_equation_y": 0.5
   },
   "weekly": {
     "track_id": 1041,
@@ -189,11 +191,9 @@
     ]
   },
   "chips": {
-    "_note": "筹码。客户端自己的产币公式（chip_equation_x/y）已被服务器发 0 关掉，产币完全由服务端记账：每条已解锁赛道 per_track_seconds 秒产 1 枚。max=0 表示不限（筹码商店最贵的赛道 63000）。局内筹码（用户 m04404 引同服玩家实测规则）：拿到这条赛道就开始累积，前期快、后面越来越慢（sqrt 曲线，match_tick_sqrt=2 → 2 秒第一枚、8 秒 2 枚、18 秒 3 枚），对手抢回去就重置累积速度，整局跑完才结算进余额；单条赛道一局最多 match_max_per_track 枚。",
+    "_note": "筹码。start/per_track_seconds/max 是账号级的长期产出（_pvp_chips_for）；局内筹码曲线在 season.chip_equation_x/y（客户端用它画赢家头像的填充圆环）。",
     "start": 0,
     "per_track_seconds": 3600,
-    "max": 0,
-    "match_tick_sqrt": 2,
-    "match_max_per_track": 12
+    "max": 0
   }
 }
