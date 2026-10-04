@@ -1,0 +1,28 @@
+{
+  "_note": "Trials Frontier 本地服务器的运营参数。改完存盘即生效（服务器按 mtime 热加载，不用重启），也可以 GET/POST http://<host>:8000/__config 读写。未来 WebUI 就管理这个文件。",
+  "matchmaking": {
+    "enabled": true,
+    "bot_wait_seconds": 60,
+    "active_window_seconds": 300,
+    "search_ttl_seconds": 1800,
+    "track_id": 1041,
+    "bot_profile_id": "44444444-4444-4444-4444-444444444444",
+    "bot_name": "GhostRider",
+    "match_duration_seconds": 3600
+  },
+  "season": {
+    "track_id": 1041,
+    "title_text": "Trials Frontier",
+    "banner_path": "/pvp_banner/season.png",
+    "duration_days": 30,
+    "star_array": [],
+    "product_list": [],
+    "rewards": []
+  },
+  "weekly": {
+    "track_id": 1041,
+    "left_retry_times": 3,
+    "window_hours": 24,
+    "task": []
+  }
+}

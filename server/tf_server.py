@@ -42,6 +42,136 @@ ROOT = os.path.dirname(HERE)
 LOG_PATH = os.path.join(ROOT, "work", "trials-frontier", "notes", "server-log.jsonl")
 RULES_PATH = os.path.join(HERE, "rules.json")
 
+# ------------------------------------------------------------------ 可调参数
+# 匹配/赛季这些「运营参数」不写死在代码里，集中放 server/data/tf_config.json。
+# 按 mtime 热加载：WebUI（未来）或人手改完存盘即可生效，不用重启服务器。
+CONFIG_PATH = os.path.join(HERE, "data", "tf_config.json")
+
+# 内置默认值 = 发布版 tf_config.json 的内容；文件缺失/写坏时兜底，保证服务器照常起。
+_TF_CONFIG_DEFAULTS = {
+    "matchmaking": {
+        "enabled": True,
+        # 服务器上还有别的真人「在线」（见 active_window_seconds）但没有排队时，
+        # 最多等这么久再发人机；没有别的真人时立刻发人机，不等。
+        "bot_wait_seconds": 60,
+        "active_window_seconds": 300,
+        # 查询队列/对局的过期时间，防止玩家强杀进程后留下僵尸队列。
+        "search_ttl_seconds": 1800,
+        # 人机对局用的赛道（幽灵库里必须存在这一条赛道）。
+        "track_id": 1041,
+        "bot_profile_id": "44444444-4444-4444-4444-444444444444",
+        "bot_name": "GhostRider",
+        # 对局时长（秒）——PVPMatch+0x198，客户端用 start_time+该值 算剩余时间。
+        "match_duration_seconds": 3600,
+    },
+    "season": {
+        "track_id": 1041,
+        "title_text": "Trials Frontier",
+        "banner_path": "/pvp_banner/season.png",
+        "duration_days": 30,
+        "star_array": [],
+        "product_list": [],
+        "rewards": [],
+    },
+    "weekly": {
+        "track_id": 1041,
+        "left_retry_times": 3,
+        "window_hours": 24,
+        "task": [],
+    },
+}
+
+_CONFIG_LOCK = threading.Lock()
+_CONFIG_CACHE = {"mtime": None, "data": None}
+
+# profileId -> 最近一次带认证请求的时间戳。用来判断「服务器上到底有没有别的真人」。
+ACTIVE_PLAYERS = {}
+
+
+def _deep_merge(base, over):
+    out = dict(base)
+    for key, val in (over or {}).items():
+        if isinstance(val, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], val)
+        else:
+            out[key] = val
+    return out
+
+
+def tf_config():
+    """读 server/data/tf_config.json（mtime 变了才重读），缺项用内置默认值补齐。"""
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        mtime = None
+    with _CONFIG_LOCK:
+        if _CONFIG_CACHE["data"] is not None and _CONFIG_CACHE["mtime"] == mtime:
+            return _CONFIG_CACHE["data"]
+        raw = {}
+        if mtime is not None:
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+                    raw = json.load(fp)
+            except Exception as exc:
+                print("[cfg] %s 读不了，先用内置默认值：%r" % (CONFIG_PATH, exc), flush=True)
+                raw = {}
+        data = _deep_merge(_TF_CONFIG_DEFAULTS, raw if isinstance(raw, dict) else {})
+        _CONFIG_CACHE["mtime"] = mtime
+        _CONFIG_CACHE["data"] = data
+        return data
+
+
+def cfg(*path, **kw):
+    """按路径取配置项：cfg("matchmaking", "bot_wait_seconds", default=60)。"""
+    node = tf_config()
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return kw.get("default")
+        node = node[key]
+    return node
+
+
+def cfg_int(*path, **kw):
+    """取整数配置项；值非法（写了个字符串之类）时回退默认值。"""
+    default = kw.get("default", 0)
+    try:
+        return int(cfg(*path, default=default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def cfg_set(path, value):
+    """就地改配置并落盘——留给未来的 WebUI。path 是键列表。"""
+    if not isinstance(path, (list, tuple)) or not path:
+        raise ValueError("path 不能为空")
+    path = [str(k) for k in path]
+    with _CONFIG_LOCK:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            if not isinstance(raw, dict):
+                raw = {}
+        except Exception:
+            raw = {}
+        node = raw
+        for key in path[:-1]:
+            nxt = node.get(key)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[key] = nxt
+            node = nxt
+        node[path[-1]] = value
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(raw, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+        os.replace(tmp, CONFIG_PATH)
+        _CONFIG_CACHE["mtime"] = None      # 下次访问强制重读
+        _CONFIG_CACHE["data"] = None
+    return value
+
+
 # ★ Windows 控制台默认是 GBK，而二进制上传（幽灵 payload）被解码成含 U+FFFD 的
 # 字符串后 print 会抛 UnicodeEncodeError —— 虽然响应已经发出去了，但那条日志会
 # 丢掉，控制台还会刷一堆 Traceback。统一把标准流改成 UTF-8 + errors="replace"。
@@ -157,6 +287,14 @@ def h_placeholder_image(path, query, body, headers):
 _BANNER_PATH = "/pvp_banner/season.png"
 
 
+def _banner_path():
+    """横幅在服务器上的路径（可被 season.banner_path 覆盖）。
+
+    路由按 `/pvp_banner/` 前缀注册，所以改名（仍在这个前缀下）不用改代码。
+    """
+    return cfg("season", "banner_path", default=None) or _BANNER_PATH
+
+
 def _req_host(headers):
     """从请求头取 Host —— 它就是客户端的 base URL（设备侧靠 adb reverse）。
 
@@ -171,7 +309,8 @@ def _req_host(headers):
 
 
 def _banner_url(headers):
-    return "http://%s%s" % (_req_host(headers), _BANNER_PATH)
+    # 路径走配置（season.banner_path），方便以后把横幅换成自己的图。
+    return "http://%s%s" % (_req_host(headers), _banner_path())
 
 
 def _placeholder_banner_png():
@@ -523,7 +662,12 @@ def _ghost_caller(headers):
     except Exception:
         info = None
     if isinstance(info, dict):
-        return info.get("profileId")
+        pid = info.get("profileId")
+        # 顺手记「这台服务器上最近还有谁在活动」——匹配逻辑靠它判断
+        # 「有没有别的真人」。放这里最省事：所有带认证的请求都会经过。
+        if pid:
+            ACTIVE_PLAYERS[pid] = int(time.time())
+        return pid
     return None
 
 
@@ -845,10 +989,10 @@ def h_liveevents_basic_info(path, query, body, headers):
         "weeK_end": week_start + _WEEK_SECONDS,   # ★大写 K
         "last_participated_week": 0,
         "last_participated_week_lb": 0,
-        "left_retry_times": 3,
-        # 午夜杯先给一个常开窗口（1 小时前 ~ 24 小时后），保证能点进去
+        "left_retry_times": cfg_int("weekly", "left_retry_times", default=3),
+        # 午夜杯先给一个常开窗口（1 小时前 ~ N 小时后），保证能点进去
         "midnight_circuit_start_time": now - 3600,
-        "midnight_circuit_end_time": now + 24 * 3600,
+        "midnight_circuit_end_time": now + max(1, cfg_int("weekly", "window_hours", default=24)) * 3600,
         "last_attempt_time": 0,
     }
     print("[liveevent] basic_info week_index=%s" % payload["week_index"], flush=True)
@@ -1044,6 +1188,7 @@ def _pvp_season(banner_url=""):
     """
     now = int(time.time())
     week_start, _wi = _week_index()
+    days = cfg_int("season", "duration_days", default=30) or 30
     return {
         "pvp_match_settings": {
             "free_tickets_interval": 3600,
@@ -1054,7 +1199,7 @@ def _pvp_season(banner_url=""):
             "chip_equation_y": 1,
             "winner_chip_heritage": 100,
             "loser_chip_heritage": 50,
-            "ranked_match_duration": 3600,
+            "ranked_match_duration": cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600,
             "friendly_match_duration": 3600,
             "ranked_match_slots": 3,
             "ranked_match_limit": 10,
@@ -1068,8 +1213,8 @@ def _pvp_season(banner_url=""):
             "match_price_factor": 1,
         },
         "current_season": {
-            "end_time": max(now, week_start + _WEEK_SECONDS),
-            "title_text": "Trials Frontier",
+            "end_time": max(now + days * 24 * 3600, week_start + _WEEK_SECONDS),
+            "title_text": cfg("season", "title_text", default=None) or "Trials Frontier",
             "banner_url": banner_url,
             "rank": 0,
         },
@@ -1082,16 +1227,91 @@ def _pvp_season(banner_url=""):
 #   → Time::getTimeOfDay()
 #   → OnlinePVP::queryMatches(listener, vector<PVPMatch>*)   cmd 0x2a = matches
 # 也就是说 new_ranked 只负责「下单」，客户端真正拿来当对手的是紧随其后的
-# matches。所以两边都实现：new_ranked 记一次「搜索中」，matches 在搜索有效期内
-# 回一条合成对局。
-_PVP_TRACK = 1041                     # 幽灵库和真机都跑过，直接拿它当对手赛道
-_PVP_ROBOT_ID = "44444444-4444-4444-4444-444444444444"   # = FRIEND_NAMES 的 GhostRider
-_PVP_SEARCH_TTL = 1800                # 秒；超过就当没在搜索
-_pvp_search = {}                      # profileId -> 搜索开始时间（时间戳）
+# matches（cmd 0x28 解析完 `b 0x4fc864`，压根不回调 listener）。
+#
+# 规则（用户 m02663 指定，参数全部走 tf_config.json，留给未来 WebUI 调）：
+#   ① 队列里有别的真人 → 立刻配对，两边共用一条 match id（各自视角 player1=自己）
+#   ② 服务器上没有别的真人在活动 → 100% 发人机，不等
+#   ③ 有别的真人在活动但没排队 → 等 matchmaking.bot_wait_seconds 秒，超时发人机
+# 客户端在搜索阶段短促重试（真机日志：2 秒内 new_ranked+matches 各 4 次），
+# 所以「等 60 秒」只能由服务端记状态：等待期间回空列表，超时后下一次 matches
+# 调用直接给人机。
 _PVP_MATCH_RE = re.compile(r"^/public/pvp_matches/v1/matches/(\d+)$")
+_PVP_ROBOT_ID = "44444444-4444-4444-4444-444444444444"   # = FRIEND_NAMES 的 GhostRider
+_PVP_QUEUE_TTL = 1800                 # 队列/对局的墙钟过期（秒）；也可由配置覆盖
+_pvp_search = {}                      # profileId -> {"at": 下单时刻, "match_id": id|None}
+_pvp_matches = {}                     # match_id -> {"players":[pid, …], "at", "track", "bot"}
+_pvp_id_lock = threading.Lock()
+_pvp_next_id = [1]                    # 用列表包一层，方便就地自增
 
 
-def _pvp_match_json(profile_id, match_id=1):
+def _pvp_track():
+    return cfg_int("matchmaking", "track_id", default=1041) or 1041
+
+
+def _pvp_bot_id():
+    return cfg("matchmaking", "bot_profile_id", default=None) or _PVP_ROBOT_ID
+
+
+def _pvp_entry(pid):
+    """队列项统一成 dict（旧版本存的是裸时间戳，兼容一下）。"""
+    e = _pvp_search.get(pid)
+    if isinstance(e, dict):
+        return e
+    if e is None:
+        return None
+    return {"at": int(e), "match_id": None}
+
+
+def _pvp_new_id():
+    with _pvp_id_lock:
+        mid = _pvp_next_id[0]
+        _pvp_next_id[0] = mid + 1
+        return mid
+
+
+def _pvp_prune(now):
+    """清掉过期的队列项与对局，免得玩家强杀进程后留下僵尸队列。"""
+    ttl = cfg_int("matchmaking", "search_ttl_seconds", default=_PVP_QUEUE_TTL) or _PVP_QUEUE_TTL
+    for pid in list(_pvp_search):
+        e = _pvp_search.get(pid)
+        at = e.get("at", 0) if isinstance(e, dict) else int(e or 0)
+        if now - at > ttl:
+            _pvp_search.pop(pid, None)
+    for mid in list(_pvp_matches):
+        if now - _pvp_matches[mid].get("at", 0) > ttl:
+            _pvp_matches.pop(mid, None)
+
+
+def _pvp_real_players():
+    """服务器上真实注册过的 profileId（人机、假好友都不在 accounts.json 里）。"""
+    try:
+        return {a.get("profileId") for a in acct.list_accounts_public() if a.get("profileId")}
+    except Exception:
+        return set()
+
+
+def _pvp_online_others(pid):
+    """除自己外，最近 active_window_seconds 秒内还在发请求的真人。"""
+    now = int(time.time())
+    win = cfg_int("matchmaking", "active_window_seconds", default=300) or 300
+    return [p for p, ts in list(ACTIVE_PLAYERS.items()) if p != pid and now - ts <= win]
+
+
+def _pvp_view(pid, mid):
+    """把内部对局渲染成 pid 视角的扁平对局对象。"""
+    m = _pvp_matches.get(mid)
+    if not m:
+        return None
+    opp = None
+    for p in m.get("players") or []:
+        if p != pid:
+            opp = p
+            break
+    return _pvp_match_json(pid, mid, opp or _pvp_bot_id(), m.get("track"))
+
+
+def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     """一条合成对局——根对象契约来自 `OnlinePVP::parseMatch` @0x4fd9d0。
 
     第一遍遍历根成员读 `id` @0xb86c8a / `server_time` @0xb8695c /
@@ -1102,36 +1322,122 @@ def _pvp_match_json(profile_id, match_id=1):
     拷的就是「对手」那个槽的 profile_id，`rank`/`chips` 那些一旦类型发错就会
     被当位域用，所以宁可不发。
     ⚠ `PVPMatch+0x00` 就是 match id，`parseMatches` 用它查重，所以 id 要稳定。
+
+    ★ `total_time` @0xb86979 是**对局时长（秒）**，不是已用时间！parseMatch 用它算
+      `match+0x1a4 = 1 + (server_time - start_time >= total_time)`，而出参 1/2 的语义是
+      「进行中 / 已结束」（`PVPManager::canStartNewRankedMatch` @0x5e3978 要求它 ∈{1,2}，
+      `PVPMatch::getRemainingTime` @0x5ed1e4 算的是 `start_time + total_time - now`）。
+      早先发 0 → server_time==start_time 时判定 0>=0 → `+0x1a4 = 2`＝「已结束」，
+      这就是「匹配上对手立马就结束」的另一半原因。
     """
     now = int(time.time())
+    dur = cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600
     return {
         "id": match_id,
         "server_time": now,
-        "total_time": 0,
-        "player1": {"profile_id": profile_id or _PVP_ROBOT_ID},
-        "player2": {"profile_id": _PVP_ROBOT_ID},
+        "total_time": dur,
+        "player1": {"profile_id": profile_id or _pvp_bot_id()},
+        "player2": {"profile_id": opponent_id or _pvp_bot_id()},
         "start_time": now,
-        "tracks": [{"track": _PVP_TRACK, "bike": 0, "owner_change_time": 0}],
+        "tracks": [{"track": track or _pvp_track(), "bike": 0, "owner_change_time": 0}],
     }
 
 
-def _pvp_match_info(profile_id=None):
+def _pvp_make_match(players, track=None, bot=False):
+    """建一条对局并登记，返回 match id。"""
+    mid = _pvp_new_id()
+    _pvp_matches[mid] = {
+        "players": list(players),
+        "at": int(time.time()),
+        "track": track or _pvp_track(),
+        "bot": bool(bot),
+    }
+    return mid
+
+
+def _pvp_pair_with_human(pid, now):
+    """队列里有没有别的真人可以立刻配；有就建共享对局并回 id。"""
+    real = _pvp_real_players()
+    for other in list(_pvp_search):
+        if other == pid or other not in real:
+            continue
+        e = _pvp_entry(other)
+        if not e or e.get("match_id"):
+            continue
+        if now - e.get("at", 0) > cfg_int("matchmaking", "search_ttl_seconds", default=_PVP_QUEUE_TTL):
+            continue
+        mid = _pvp_make_match([other, pid], bot=False)
+        e["match_id"] = mid
+        entry = _pvp_entry(pid) or {"at": now}
+        entry["match_id"] = mid
+        _pvp_search[pid] = entry
+        print("[pvp] 真人配对 match=%d %s <-> %s" % (mid, other, pid), flush=True)
+        return mid
+    return None
+
+
+def _pvp_give_bot(pid, now, reason=""):
+    entry = _pvp_entry(pid) or {"at": now}
+    mid = _pvp_make_match([pid, _pvp_bot_id()], bot=True)
+    entry["match_id"] = mid
+    _pvp_search[pid] = entry
+    print("[pvp] 发人机 match=%d pid=%s (%s)" % (mid, pid, reason), flush=True)
+    return mid
+
+
+def _pvp_match_info(profile_id=None, allow_create=False):
     """`parseMatches` @0x4fcad0 的响应契约。
 
     根对象两个键（已反汇编确认）：`waiting_requests` @0xb8695c（int）、
     `matches` @0xb86562（**JSON 数组**，每个元素交给 `parseMatch` @0x4fd9d0，
     元素结构体 `PVPMatch` 大小 0x1d8）。
     没有对局时回**空数组**——`parseMatches` 对空数组走的是纯清理分支。
-    搜索有效期内给一条合成对局：`PVPManager::validateMatches()` @0x5e3e20 会把
-    每条对局的 `+0x1ac` 置 1（`parseMatch` 恒置 0），置 1 之后
-    `isAllMatchesValid()` 才认它对局有效。
+    给出对局后 `PVPManager::validateMatches()` @0x5e3e20 会把每条对局的
+    `+0x1ac` 置 1（`parseMatch` 恒置 0），置 1 之后 `isAllMatchesValid()` 才认它有效。
+
+    `allow_create=False`（pvp_init 用）：只汇报已有对局，不主动开新局——
+    免得玩家刚进碉堡、还没点「全新对决」就被塞一条对局。
     """
+    if not profile_id:
+        return {"matches": [], "waiting_requests": 0}
     now = int(time.time())
-    for pid in [p for p, ts in _pvp_search.items() if now - ts > _PVP_SEARCH_TTL]:
-        _pvp_search.pop(pid, None)
-    if profile_id and profile_id in _pvp_search:
-        return {"matches": [_pvp_match_json(profile_id)], "waiting_requests": 0}
-    return {"matches": [], "waiting_requests": 0}
+    _pvp_prune(now)
+
+    entry = _pvp_entry(profile_id)
+    if entry and entry.get("match_id"):
+        view = _pvp_view(profile_id, entry["match_id"])
+        if view:
+            return {"matches": [view], "waiting_requests": 0}
+        entry["match_id"] = None
+
+    if not allow_create or not entry:
+        # 没在搜索（或不允许开新局）→ 空列表
+        return {"matches": [], "waiting_requests": 0}
+
+    if not (cfg("matchmaking", "enabled", default=True) is not False):
+        return {"matches": [], "waiting_requests": 0}
+
+    mid = _pvp_pair_with_human(profile_id, now)
+    if mid:
+        return {"matches": [_pvp_view(profile_id, mid)], "waiting_requests": 0}
+
+    # ② 服务器上没有别的真人在活动 → 100% 人机，不等
+    others = _pvp_online_others(profile_id)
+    if not others:
+        mid = _pvp_give_bot(profile_id, now, "no-other-human")
+        return {"matches": [_pvp_view(profile_id, mid)], "waiting_requests": 0}
+
+    # ③ 有真人在活动但没排队 → 等 bot_wait_seconds，超时转人机
+    wait = cfg_int("matchmaking", "bot_wait_seconds", default=60)
+    if wait < 0:
+        wait = 0
+    if now - entry.get("at", now) >= wait:
+        mid = _pvp_give_bot(profile_id, now, "timeout %ds, %d other(s) online" % (wait, len(others)))
+        return {"matches": [_pvp_view(profile_id, mid)], "waiting_requests": 0}
+
+    print("[pvp] 等待真人 pid=%s 已等 %ds/%ds，在线他人 %d"
+          % (profile_id, now - entry.get("at", now), wait, len(others)), flush=True)
+    return {"matches": [], "waiting_requests": 1}
 
 
 def h_pvp_new_ranked(path, query, body, headers):
@@ -1142,12 +1448,14 @@ def h_pvp_new_ranked(path, query, body, headers):
     对象**（`parseRankingData(x1=成员节点, x2=…+0x18)` 直接吃它；内层那个
     `profile_id` 比较没有分支，是编译器产物）。
     ⚠ cmd 0x28 解析完 `b 0x4fc864` **不回调 listener**，所以「匹配到人」这件事
-    必须在随后的 matches 里体现——这里只记一次搜索状态。
+    必须在随后的 matches 里体现——这里只负责「下单」：把队列里的时刻重置成现在，
+    顺带清掉上一轮的 match_id（重新匹配＝开新局）。
     """
     pid = _ghost_caller(headers)
     print("[pvp] new_ranked pid=%s q=%s" % (pid, query), flush=True)
     if pid:
-        _pvp_search[pid] = int(time.time())
+        _pvp_prune(int(time.time()))
+        _pvp_search[pid] = {"at": int(time.time()), "match_id": None}
     info = _pvp_player_info()
     return 200, {"Content-Type": "application/json"}, {
         "self": dict(info),
@@ -1160,12 +1468,13 @@ def h_pvp_init(path, query, body, headers):
 
     请求体（真机实测）：{"tracks":"1024,2,4,…","bikes":521227,"lang":"zh_Hans"}。
     我们只需要回上面那三个成员。返回前不落盘：PVP 对局状态还没做持久化。
+    ⚠ 这里 `allow_create=False`：刚进碉堡只汇报已有对局，不主动开新局。
     """
     b = _json_body(body)
     print("[pvp] pvp_init <- %s" % (b,), flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "player_info": _pvp_player_info(),
-        "match_info": _pvp_match_info(_ghost_caller(headers)),
+        "match_info": _pvp_match_info(_ghost_caller(headers), allow_create=False),
         "pvp_config": _pvp_season(_banner_url(headers)),
     }
 
@@ -1187,10 +1496,17 @@ def h_pvp_matches(path, query, body, headers):
     pid = _ghost_caller(headers)
     m = _PVP_MATCH_RE.match(path)
     if m:
-        print("[pvp] match/%s pid=%s" % (m.group(1), pid), flush=True)
-        return 200, {"Content-Type": "application/json"}, _pvp_match_json(pid, int(m.group(1)))
+        mid = int(m.group(1))
+        print("[pvp] match/%s pid=%s" % (mid, pid), flush=True)
+        view = _pvp_view(pid, mid)
+        if view:
+            return 200, {"Content-Type": "application/json"}, view
+        # 服务器重启过 / 队列过期：客户端手上那条对局我们没记录，就按同 id 补一条
+        _pvp_matches[mid] = {"players": [pid, _pvp_bot_id()], "at": int(time.time()),
+                             "track": _pvp_track(), "bot": True}
+        return 200, {"Content-Type": "application/json"}, _pvp_view(pid, mid)
     print("[pvp] matches pid=%s" % (pid,), flush=True)
-    return 200, {"Content-Type": "application/json"}, _pvp_match_info(pid)
+    return 200, {"Content-Type": "application/json"}, _pvp_match_info(pid, allow_create=True)
 
 
 def h_pvp_player(path, query, body, headers):
@@ -1765,7 +2081,8 @@ DYNAMIC = [
     # 匹配下单（cmd 0x28）——见 h_pvp_new_ranked 上方注释：真正出对手的是 matches。
     ("GET", "/public/pvp_matches/v1/new_ranked", h_pvp_new_ranked),
     # 赛季横幅：注意它还要在 pick_dynamic 的「图片通配」之前判一次，见那里的注释。
-    ("GET", _BANNER_PATH, h_pvp_banner),
+    # 按前缀注册，改名（season.banner_path）不用改代码。
+    ("GET", "/pvp_banner/", h_pvp_banner),
     # ⚠ 顺序有讲究：`players?profiles=` 的 path 是 /…/players，
     # 它是 /…/player/ 的前缀，必须排在前面，否则会被 h_pvp_player 抢走。
     ("GET", "/public/pvp_matches/v1/players", h_pvp_accept),
@@ -1788,7 +2105,7 @@ def pick_dynamic(method, path):
     # 赛季横幅必须抢在下面那条「图片通配」前面：它的路径以 .png 结尾，
     # 否则会被 h_placeholder_image 吃掉，客户端下到的是 256x256 的占位方块，
     # 而且 2868 字节超过了 SaveFile 的 0x800（2048）上限。
-    if method == "GET" and path == _BANNER_PATH:
+    if method == "GET" and path.startswith("/pvp_banner/"):
         return h_pvp_banner, "dyn:pvp-banner"
     # 图片与好友头像：<base>/<pid>/picture?width=..&height=..（见 .rodata @0xb887cc）
     if method == "GET" and (path.lower().endswith(_IMAGE_EXT) or path.endswith("/picture")):
@@ -2149,6 +2466,44 @@ class Handler(BaseHTTPRequestHandler):
             return js({"ghosts": out, "store": store,
                        "replays": acct.ghost_replays()[-20:],
                        "note": "ghosts=<赛道>/内置文件；store=客户端上传的内容仓库"})
+        if path == "/__config":
+            # 运营参数（匹配/赛季/限时活动）都住在这里。GET 看、POST 改——
+            # 未来 WebUI 直接调这两个就够，不用重启服务器（mtime 热加载）。
+            if self.command == "POST":
+                try:
+                    payload = json.loads((body or b"{}").decode("utf-8"))
+                except Exception as exc:
+                    return js({"ok": False, "error": "body 不是 JSON: %r" % (exc,)}, 400)
+                key_path = payload.get("path")
+                if isinstance(key_path, str):
+                    key_path = [key_path]
+                if not isinstance(key_path, list) or not key_path:
+                    return js({"ok": False, "error": "path 必须是键列表，如 [\"matchmaking\",\"bot_wait_seconds\"]"}, 400)
+                if "value" not in payload:
+                    return js({"ok": False, "error": "缺少 value"}, 400)
+                try:
+                    cfg_set(key_path, payload["value"])
+                except Exception as exc:
+                    return js({"ok": False, "error": repr(exc)}, 400)
+                print("[cfg] %s = %r" % (".".join(key_path), payload["value"]), flush=True)
+                return js({"ok": True, "path": key_path, "value": payload["value"],
+                           "config": tf_config()})
+            now = int(time.time())
+            win = cfg_int("matchmaking", "active_window_seconds", default=300) or 300
+            rt = {
+                "queue": [{"profileId": p,
+                           "waited": now - (e.get("at", now) if isinstance(e, dict) else int(e or now)),
+                           "match_id": e.get("match_id") if isinstance(e, dict) else None}
+                          for p, e in _pvp_search.items()],
+                "matches": [{"id": mid, "players": m.get("players"), "track": m.get("track"),
+                             "bot": m.get("bot"), "age": now - m.get("at", now)}
+                            for mid, m in sorted(_pvp_matches.items())],
+                "active_players": [{"profileId": p, "seen_ago": now - ts}
+                                   for p, ts in sorted(ACTIVE_PLAYERS.items()) if now - ts <= win],
+                "config_path": CONFIG_PATH,
+            }
+            return js({"config": tf_config(), "runtime": rt,
+                       "note": "POST /__config {path:[…],value:…} 即改即生效（mtime 热加载）"})
         if path == "/__help":
             return js({"endpoints": ["/__ping", "/__log", "/__accounts", "/__devices",
                                      "/__sessions", "/__saves", "/__save?profile=<pid>",
@@ -2156,6 +2511,7 @@ class Handler(BaseHTTPRequestHandler):
                                      "/__restore?profile=<pid>&ts=<时间戳|latest>",
                                      "/__ghosts（内置幽灵文件 + 上传的幽灵仓库 + replay_id 登记）",
                                      "/__leaderboards（排行榜落库与主榜聚合）",
+                                     "/__config（匹配/赛季运营参数；POST {path,value} 即改即生效）",
                                      "/__register（注册网页，也可用 /__ui）",
                                      "POST /__api/register {username,password,nameOnPlatform}",
                                      "POST /__api/login {username,password}",
