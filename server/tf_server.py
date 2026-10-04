@@ -1945,8 +1945,10 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     info = _pvp_player_info()
     # 赛后奖励：整局跑完（3 条赛道都交过成绩）才算，且只有占住 ≥2 条赛道才给「赢」那一档。
     # 以前只要 POST 过一次 race 就算赢，跑一条也发 win 档（用户 m04404 的规则是 3 局 2 胜）。
+    # ★ 这里**不要**再挂 `or not _m.get("results")` 之类的兜底：那会让「跑完但没占住任何
+    #   赛道」也发 win 档。没占住就是 default，见 m04404 的规则。
     _rw = []
-    if _m.get("finished") and (_pvp_match_won(_m, profile_id) or not _m.get("results")):
+    if _m.get("finished") and _pvp_match_won(_m, profile_id):
         _rw = cfg("rewards", "win", default=[]) or []
     if not _rw:
         _rw = cfg("rewards", "default", default=[100, 0, 0])
