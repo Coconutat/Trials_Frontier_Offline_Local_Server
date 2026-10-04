@@ -83,6 +83,25 @@ _TF_CONFIG_DEFAULTS = {
         "product_list": [],
         "rewards": [],
     },
+    # 筹码（chips）。
+    # 用户 m03154 的规则：筹码不是开局白送的 200，是「按赛道定期生成的硬件」
+    # —— 每拥有一条赛道上就跑一条产线，定期产出一枚筹码；天梯最低（25 级）
+    # 起步是 0，升到某个等级才额外给一点。
+    #
+    # 客户端的筹码公式（`PVPManager::getNumChipsTotal` @0x5e1838）是
+    #     pow(now - PVPTrack+0x20, PVPManager+0xb0) * PVPManager+0xb4
+    # 而 `PVPTrack+0x20` 同时被 `PVPManager::onStartRaceSent` 当成**车种 ID**
+    # 写进 `GameWorld+0x1efc`，两个语义撞在同一个字段上。所以这里把
+    # `chip_equation_x` / `chip_equation_y` 都发 0（= 客户端自己永不产筹码），
+    # 产筹码这件事整个搬到服务器算，客户端只显示 `player_info.chips` 这个总额。
+    "chips": {
+        # 起步筹码（用户规则：最低天梯 0）。
+        "start": 0,
+        # 每条已拥有赛道每隔这么多秒产 1 枚（0 或负数 = 不产）。
+        "per_track_seconds": 3600,
+        # 上限（0 = 不限）。
+        "max": 200,
+    },
     "weekly": {
         "track_id": 1041,
         "left_retry_times": 3,
@@ -1154,7 +1173,7 @@ def h_liveevents_accept(path, query, body, headers):
 # ---------------------------------------------------------------------------
 
 
-def _pvp_player_info(chips=200, tickets=3):
+def _pvp_player_info(chips=None, tickets=3):
     """`parseRankingData` @0x4fc918 的响应契约（键地址已逐个确认）。
 
     +0x00 `rank`(0xb869b5) / +0x04 `star`(0xb86947) / +0x08 `elo_rank`(0xb869b1)
@@ -1162,7 +1181,10 @@ def _pvp_player_info(chips=200, tickets=3):
     / +0x14 `chips`(0xb49233) / +0x18 `win_streak`(0xb86a12)。
     ⚠ 另有一个键 `elo`(0xb86a0e) 走 `ldr d0,[node+0x28]; fcvtzs`，即**值是 double**。
       它和 `elo_rank` 写同一个字段（+0x08），所以我们只发整数版的 `elo_rank`。
+    `chips=None` 时取服务器记的余额（见 `_pvp_chips_for`）。
     """
+    if chips is None:
+        chips = cfg_int("chips", "start", default=0)
     return {
         "rank": 0,
         "star": 0,
@@ -1208,8 +1230,8 @@ def _pvp_season(banner_url=""):
             "Pvp_skill_counter": 0,
             "free_tickets_max": ftk_max if ftk_max > 0 else 3,
             "free_tickets_initial": ftk_init,
-            "chip_equation_x": 1,
-            "chip_equation_y": 1,
+            "chip_equation_x": 0,
+            "chip_equation_y": 0,
             "winner_chip_heritage": 100,
             "loser_chip_heritage": 50,
             "ranked_match_duration": cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600,
@@ -1257,6 +1279,7 @@ _pvp_matches = {}                     # match_id -> {"players":[pid, …], "at",
 _pvp_id_lock = threading.Lock()
 _pvp_next_id = [1]                    # 用列表包一层，方便就地自增
 _pvp_tickets = {}                     # profileId -> {"tickets": n, "ts": 回票基准时刻(0=已满)}
+_pvp_chips = {}                       # profileId -> {"chips": n, "ts": 上次结算时刻, "acc": 余数, "tracks": [赛道 id]}
 
 
 # --- 局内票（免费票）--------------------------------------------------------
@@ -1330,6 +1353,71 @@ def _pvp_consume_ticket(pid):
 
 def _pvp_track():
     return cfg_int("matchmaking", "track_id", default=1041) or 1041
+
+
+def _pvp_chips_state(pid):
+    st = _pvp_chips.get(pid)
+    if st is None:
+        st = {
+            "chips": max(0, cfg_int("chips", "start", default=0) or 0),
+            "ts": int(time.time()),
+            "acc": 0,
+            "tracks": [],
+        }
+        _pvp_chips[pid] = st
+    return st
+
+
+def _pvp_set_tracks(pid, ids):
+    """记下这个玩家已解锁的赛道清单（来自 pvp_init 的 body），筹码按条数产。"""
+    if not pid:
+        return
+    st = _pvp_chips_state(pid)
+    st["tracks"] = list(ids or [])
+
+
+def _pvp_chips_for(pid):
+    """返回该玩家的筹码余额。
+
+    产筹码完全在服务端：`chips.per_track_seconds` 秒 / 每一条已解锁赛道 / 1 枚。
+    用户 m03154：「筹码是硬件定期生成的，比如我赢了一局，这条赛道定期生成一个筹码」。
+    客户端那边的公式已被 `chip_equation_x/y = 0` 关掉，所以它只会显示这个总额。
+    """
+    if not pid or pid == _pvp_bot_id():
+        # 人机没有账号，也不该显示余额倒计时。
+        return 0
+    st = _pvp_chips_state(pid)
+    now = int(time.time())
+    period = cfg_int("chips", "per_track_seconds", default=3600)
+    ntrack = len(st.get("tracks") or [])
+    if period and period > 0 and ntrack > 0:
+        st["acc"] += max(0, now - st["ts"]) * ntrack
+        st["ts"] = now
+        if st["acc"] >= period:
+            gained = st["acc"] // period
+            st["acc"] -= gained * period
+            top = cfg_int("chips", "max", default=0)
+            st["chips"] += gained
+            if top and top > 0 and st["chips"] > top:
+                st["chips"] = top
+    else:
+        st["ts"] = now
+    return st["chips"]
+
+
+def _pvp_spend_chips(pid, amount):
+    """`POST /chips`（cmd 0x34）用：扣筹码，返回扣完的余额。"""
+    if not pid:
+        return 0
+    st = _pvp_chips_state(pid)
+    _pvp_chips_for(pid)
+    try:
+        amount = int(amount or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if amount > 0:
+        st["chips"] = max(0, st["chips"] - amount)
+    return st["chips"]
 
 
 def _pvp_bot_id():
@@ -1428,7 +1516,7 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
             "profile_id": pid,
             "tickets": tickets,
             "ticket_increased": ticket_ts,
-            "chips": info["chips"],
+            "chips": _pvp_chips_for(pid),
             "rank": info["rank"],
             "elo_rank": info["elo_rank"],
             "outfit": 0,
@@ -1581,9 +1669,19 @@ def h_pvp_init(path, query, body, headers):
     """
     b = _json_body(body)
     print("[pvp] pvp_init <- %s" % (b,), flush=True)
+    pid = _ghost_caller(headers)
+    if isinstance(b, dict) and isinstance(b.get("tracks"), str):
+        # "1024,2,4,…" —— 玩家已解锁的赛道清单，筹码按条数产（见 _pvp_chips_for）。
+        ids = []
+        for part in b["tracks"].split(","):
+            part = part.strip()
+            if part.isdigit():
+                ids.append(int(part))
+        if ids:
+            _pvp_set_tracks(pid, ids)
     return 200, {"Content-Type": "application/json"}, {
-        "player_info": _pvp_player_info(),
-        "match_info": _pvp_match_info(_ghost_caller(headers), allow_create=False),
+        "player_info": _pvp_player_info(_pvp_chips_for(pid)),
+        "match_info": _pvp_match_info(pid, allow_create=False),
         "pvp_config": _pvp_season(_banner_url(headers)),
     }
 
@@ -1626,7 +1724,8 @@ def h_pvp_player(path, query, body, headers):
     `OnlineUbiservices::getPlayerProfile` + `OnlineGhostManager::getPVPGhost`。
     """
     print("[pvp] player %s" % path, flush=True)
-    return 200, {"Content-Type": "application/json"}, _pvp_player_info()
+    who = path.rstrip("/").rsplit("/", 1)[-1]
+    return 200, {"Content-Type": "application/json"}, _pvp_player_info(_pvp_chips_for(who))
 
 
 def h_pvp_config(path, query, body, headers):
@@ -1672,6 +1771,42 @@ def h_pvp_accept(path, query, body, headers):
     """
     print("[pvp] %s <- %s -> data:[]" % (path, _json_body(body)), flush=True)
     return 200, {"Content-Type": "application/json"}, {"data": []}
+
+
+def h_pvp_chips(path, query, body, headers):
+    """POST /public/pvp_matches/v1/chips —— 花筹码（cmd 0x34）。
+
+    `OnlinePVP::parseJsonResponse` 的 0x34 分支 @0x4fc5a8 遍历根对象成员，
+    只认键 `chips` @0xb49233（int），取到后回调
+    `listener->vtable[0x58]`（= `PVPManager::onChipsSpent(err, chips)` @0x5e6fdc）。
+    ⇒ 响应体**必须**是 `{"chips": <剩余筹码>}`，回 `{"data": []}` 会让余额变 0。
+    请求体形状未逆完，这里把常见键名都当成要扣的数量。
+    """
+    pid = _ghost_caller(headers)
+    b = _json_body(body)
+    amount = 0
+    if isinstance(b, dict):
+        for key in ("chips", "amount", "num", "value", "price"):
+            try:
+                amount = int(b.get(key) or 0)
+            except (TypeError, ValueError):
+                amount = 0
+            if amount:
+                break
+        if not amount:
+            # body 形如 {"items":[{"price":N},…]} / {"products":[…]} 时兜底累加
+            for key in ("items", "products", "chip_store_items"):
+                lst = b.get(key)
+                if isinstance(lst, list):
+                    for it in lst:
+                        if isinstance(it, dict):
+                            try:
+                                amount += int(it.get("price") or it.get("amount") or 0)
+                            except (TypeError, ValueError):
+                                pass
+    left = _pvp_spend_chips(pid, amount)
+    print("[pvp] chips <- %s 扣 %d -> %d" % (b, amount, left), flush=True)
+    return 200, {"Content-Type": "application/json"}, {"chips": left}
 
 
 def h_ghost_upload(path, query, body, headers):
@@ -2206,7 +2341,7 @@ DYNAMIC = [
     ("POST", "/public/pvp_matches/v1/start_race", h_pvp_accept),
     ("POST", "/public/pvp_matches/v1/race", h_pvp_accept),
     ("POST", "/public/pvp_matches/v1/increase_rewards", h_pvp_accept),
-    ("POST", "/public/pvp_matches/v1/chips", h_pvp_accept),
+    ("POST", "/public/pvp_matches/v1/chips", h_pvp_chips),
 ]
 
 
@@ -2613,6 +2748,11 @@ class Handler(BaseHTTPRequestHandler):
                              "next_in": max(0, st.get("ts", 0) + (_pvp_ticket_limits()[1]) - now)
                              if st.get("ts") else 0}
                             for p, st in sorted(_pvp_tickets.items())],
+                "chips": [{"profileId": p, "chips": _pvp_chips_for(p),
+                           "tracks": len(st.get("tracks") or []),
+                           "next_in": max(0, (cfg_int("chips", "per_track_seconds", default=3600) or 3600)
+                                          - st.get("acc", 0))}
+                          for p, st in sorted(_pvp_chips.items())],
                 "config_path": CONFIG_PATH,
             }
             return js({"config": tf_config(), "runtime": rt,

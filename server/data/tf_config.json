@@ -28,5 +28,11 @@
     "left_retry_times": 3,
     "window_hours": 24,
     "task": []
+  },
+  "chips": {
+    "_note": "筹码。客户端自己的产币公式（chip_equation_x/y）已被服务器发 0 关掉，产币完全由服务端记账：每条已解锁赛道 per_track_seconds 秒产 1 枚。",
+    "start": 0,
+    "per_track_seconds": 3600,
+    "max": 200
   }
 }
