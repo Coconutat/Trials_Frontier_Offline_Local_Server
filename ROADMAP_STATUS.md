@@ -364,12 +364,37 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
 
 ---
 
-## 6. 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>`（`files/` 已挪出私有目录）
+## 6. 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` —— ⛔ 已放弃并回滚
 
-> 用户要求（2026-10-04）：**「现在游戏所有数据都在 `/data/data/包名`，我们能不能让他重定向到 `/sdcard/Android/data/包名`。」**
+> 用户要求（2026-10-04，m03625）：**「现在游戏所有数据都在 `/data/data/包名`，我们能不能让他重定向到 `/sdcard/Android/data/包名`。」**
 > 目的：存档 / 幽灵 / 下载内容包放到用户可访问的共享目录，方便备份、换机、用文件管理器直接改。
 
-### ✅ 已完成并实机验证（含 `adb reboot` 后自动恢复）
+**结论：技术上做得到（绑定挂载 + `adb reboot` 后自动恢复都实测通过），但它必须依赖 root**
+（KernelSU 的 `post-fs-data.d` / `service.d` 开机钩子 + `mount --bind`），**不适合作为离线包的交付形态**。
+用户 2026-10-04 决定放弃（m04281：「如果重定向依靠root，那没必要了。把存档恢复即可。」），
+**设备侧已完整回滚，`tools/tf_redirect_mount.sh` / `tools/tf_redirect_unmount.sh` 仅作技术参考保留。**
+
+### 回滚记录（2026-10-04 已完成，游戏正常）
+
+```sh
+sh tools/tf_redirect_unmount.sh     # umount 3 处 + 把游戏数据搬回 /data/data/$PKG/files
+rm -f /data/adb/post-fs-data.d/tf_files_bind.sh /data/adb/service.d/tf_files_bind.sh
+```
+
+- `mv` 遇到**已存在的目录**（`.Fabric`）会报 `bad '.Fabric': Directory not empty` 而跳过 ⇒ 要手工
+  `cp -rn $SRC/.Fabric/. $DST/.Fabric/ && rm -rf $SRC/.Fabric` 合并（两边的 crashlytics 日志取并集）。
+- **搬回来的文件 SELinux 标签会留在 `media_rw_data_file:s0`**：`restorecon -R` 对这些路径
+  **找不到规则**（干跑 `restorecon -Rnv` 无任何输出），必须手工
+  `chcon -R u:object_r:app_data_file:s0:c512,c768 /data/data/$PKG/files`
+  （目录本身会自动是 `app_data_file`，只有搬过去的老文件需要重标）。
+- 回滚后复核：`/proc/mounts` 已无 trialsfrontier 条目、私有目录 135 项、
+  属主 `u0_a296 u0_a296`（10296:10296）、标签全部 `app_data_file:s0:c512,c768`；
+  游戏启动正常（进程存活、**无 `avc: denied`、无崩溃**），村庄 HUD 完整
+  （456/456 汽油、**16,748,033** 金币、**9,066,302** 钻石、13 星）。
+- 注：私有目录条目数 136 → 135，少的是游戏自己会删/重建的临时文件
+  （`AppEventsLogger.persistedevents`、`screenshot.jpg`），非游戏数据。
+
+### 方案（技术参考）：ext4 绑定挂载
 
 **方案：ext4 绑定挂载**（**不是**软链接）
 
@@ -412,7 +437,7 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 > 教训：**在这个游戏上改动 `files/` 的落盘位置，唯一可行的是绑定挂载到真正的 ext4 目录。**
 > 任何把访问重定向到 sdcardfs 的方案（软链接、bind 到 `/sdcard/...`）都会让启动段错误。
 
-### 持久化：KernelSU 开机钩子（重启实测通过）
+### 持久化：KernelSU 开机钩子（重启实测通过；**回滚时已删除**）
 - 设备有 `/data/adb/service.d/` 与 `/data/adb/modules/`，但**原本没有 `/data/adb/post-fs-data.d/`**，已新建。
 - `tf_files_bind.sh` 同时装到 **`/data/adb/post-fs-data.d/tf_files_bind.sh`** 与 **`/data/adb/service.d/tf_files_bind.sh`**（`chmod 0755`），
   内容即幂等调用 `tools/tf_redirect_mount.sh`。
@@ -426,7 +451,7 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 - logcat 里**没有任何涉及 `media_rw_data_file` 的 `avc: denied`** ⇒ `untrusted_app` 读写 `media_rw_data_file` 是被允许的。
 - 目录属主 `u0_a296 sdcard_rw`（10296:1015），与重定向前一致。
 
-### 验证证据
+### 重定向期间的验证证据（已回滚，仅作记录）
 - 重定向后游戏正常启动（进程存活），并在 `/sdcard/Android/data/$PKG/files` 里看到**新的写入**：
   `player.bin`（4015 B）、`pvp_ghost_1_1041_328389155.bin`（1888 B）。
   后者**顺带真机证实了 §3 的「PVP 对手幽灵下发」真的落地了**。
