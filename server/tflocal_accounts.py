@@ -912,6 +912,27 @@ GHOST_REPLAYS = os.path.join(GHOST_DIR, "replays.json")
 # 实测客户端会给 players 发 "0" 表示「不限玩家」。
 GHOST_ANY_PLAYERS = ("", "0", "-1", "any", "all", "null")
 
+# 客户端会在赛道 ID 上叠高位标志位，幽灵库里必须一律按裸 ID 存：
+#   | 0x800000 (8388608)  PVP 对手幽灵（OnlinePVP::parseJsonResponse cmd 0x2c 分支
+#                        `orr w2,w8,#0x800000` → getPVPGhost() →
+#                        resultservice/v1/pvp_replaydata?track_id=8389649&player=…&pvp_id=…）
+#   | 0x10000  (65536)    排行榜（周赛）变体，如 track66633 = 65536 + 1097
+#   | 0x100000 (1048576)  排行榜（另一套）变体，如 track1049609 = 1048576 + 1033
+# 真实赛道 ID 目前最大 1438，掩到 0xFFFF 足够。★ 掩码必须在**存储边界**做：
+# 以前只在查询侧掩、写入侧原样存，于是 index.json 里 51:8389649 与 1:1041 混存，
+# 查询掩完变成 track1097 却永远对不上 track66633 那条记录 —— 精确匹配全 miss。
+TRACK_MASK = 0xFFFF
+
+
+def mask_track(track_id):
+    """把客户端赛道 ID 掩成裸 ID；不是整数就返回 None。"""
+    if track_id is None:
+        return None
+    try:
+        return int(track_id) & TRACK_MASK
+    except (TypeError, ValueError):
+        return None
+
 
 def ghost_dir(track_id):
     return os.path.join(GHOST_DIR, str(track_id))
@@ -1001,6 +1022,44 @@ def _legacy_ghost_files():
     return out
 
 
+def _migrate_ghost_records(obj):
+    """一次性把 index.json 里带标志位的 track_id 掩回裸 ID，并补上缺的 `size`。
+
+    ★ 两者都是客户端硬要求：
+      * 掩码：查询侧早就在掩，写入侧没掩 ⇒ `track66633` 与 `track1097` 对不上（见 TRACK_MASK）。
+      * `size`：`GhostQueryObject::onQueryCompleted` @0x508288 的 type-3 分支
+        （`0x5083b8 str w8,[sp,#0x14]` 读键 `size`@0xb4317f）**`size < 1` 直接判定失败**，
+        而内置幽灵只有 metadata、从来没写过 size —— 排行榜挑战永远拿不到幽灵。
+    """
+    changed = 0
+    for rec in obj["items"].values():
+        raw = rec.get("track_id")
+        bare = mask_track(raw)
+        if bare is not None and bare != raw:
+            rec["track_id"] = bare
+            changed += 1
+        md = rec.get("metadata")
+        if isinstance(md, dict):
+            mraw = md.get("track_id")
+            mbare = mask_track(mraw)
+            if mbare is not None and mbare != mraw:
+                md["track_id"] = mbare
+                changed += 1
+        if not rec.get("size"):
+            n = None
+            p = os.path.join(GHOST_STORE, "%s.bin" % rec.get("contentId"))
+            if os.path.isfile(p):
+                n = os.path.getsize(p)
+            elif rec.get("legacy_path"):
+                q = os.path.join(DATA, str(rec["legacy_path"]).replace("/", os.sep))
+                if os.path.isfile(q):
+                    n = os.path.getsize(q)
+            if n:
+                rec["size"] = n
+                changed += 1
+    return changed
+
+
 def ghost_sync_legacy():
     """把老目录里的内置幽灵登记进新仓库（只登记一次，用 relpath 记录来源）。"""
     with _LOCK:
@@ -1024,10 +1083,10 @@ def ghost_sync_legacy():
             obj["next_id"] = cid + 1
             items[str(cid)] = {
                 "contentId": cid,
-                "track_id": track,
+                "track_id": mask_track(track),
                 "owner": "6f857655",
                 "metadata": {
-                    "track_id": track,
+                    "track_id": mask_track(track),
                     "drive_time": drive_time or 0,
                     "checksum": tag or 0,
                     "version": 79401,
@@ -1039,12 +1098,17 @@ def ghost_sync_legacy():
                 "updated": int(time.time()),
                 "legacy_path": rel,
                 "frames": frames,
+                "size": len(blob),
                 "builtin": True,
             }
             added += 1
-        if added:
+        fixed = _migrate_ghost_records(obj)
+        if added or fixed:
             _save_ghosts(obj)
-            print("[ghost] 登记内置幽灵 %d 个" % added, flush=True)
+            if added:
+                print("[ghost] 登记内置幽灵 %d 个" % added, flush=True)
+            if fixed:
+                print("[ghost] 迁移幽灵记录 %d 处（赛道掩码 / 补 size）" % fixed, flush=True)
         return added
 
 
@@ -1061,10 +1125,12 @@ def ghost_create(track_id, owner, metadata):
     """建幽灵容器，返回分配到的 contentId（必须回给客户端）。"""
     md = dict(metadata) if isinstance(metadata, dict) else {}
     if track_id is None:
-        try:
-            track_id = int(md.get("track_id"))
-        except Exception:
-            track_id = None
+        track_id = md.get("track_id")
+    # ★ 存入前掩码（见 TRACK_MASK）：客户端 create 时发的 track_id 可能带
+    #   |0x800000 / |0x10000 / |0x100000 标志位，原样存下来查询就永远对不上。
+    track_id = mask_track(track_id)
+    if track_id is not None:
+        md["track_id"] = track_id
     now = int(time.time())
     with _LOCK:
         obj = _load_ghosts()
@@ -1112,10 +1178,10 @@ def ghost_update(cid, metadata, owner=None):
         merged.update(md)
         rec["metadata"] = merged
         if merged.get("track_id") is not None:
-            try:
-                rec["track_id"] = int(merged["track_id"])
-            except Exception:
-                pass
+            bare = mask_track(merged["track_id"])
+            if bare is not None:
+                rec["track_id"] = bare
+                merged["track_id"] = bare
         for key in ("drive_time", "checksum", "version", "pvpid"):
             val = _as_int(merged.get(key))
             if val is not None:
@@ -1190,14 +1256,22 @@ def ghost_delete(cid):
     return rec
 
 
-def ghost_search(track_id=None, players=None, limit=1, drive_time=None):
+def ghost_search(track_id=None, players=None, limit=1, drive_time=None,
+                 pvpid=None, owner=None):
     """幽灵检索。返回按「该优先给谁」排好序的记录列表。
 
     排序口径：请求方点名的玩家排前面，其次按时间接近度（给了 drive_time）
     或按成绩快慢；内置幽灵垫后。`players` 一个都没命中时**回落到全部**——
     单机离线只有自己一个人，严格过滤会导致永远查不到幽灵。
+
+    `pvpid`：PVP 专用的对手位（`get_pvp_ghost?…&pvpid=%d`，真机只见 1 和 2）。
+      ⚠ 以前完全不读它，于是 pvpid=1 与 pvpid=2 拿到同一批幽灵。
+    `owner`：只认某个人自己的幽灵（上传链路用它查「我这条赛道传过没有」）。
+      ⚠ 注意 `get_pvp_ghost` 的 `players` 参数是**请求者自己**的 pid，
+      不能拿去做 owner 过滤 —— 那会把 named 变成永远空集、静默回落到全部。
     """
     ghost_sync_legacy()
+    track_id = mask_track(track_id)
     wanted = set()
     if players:
         for p in str(players).split(","):
@@ -1211,6 +1285,10 @@ def ghost_search(track_id=None, players=None, limit=1, drive_time=None):
             continue
         if not (rec.get("stored") or rec.get("legacy_path")):
             continue          # 只有 metadata、没有二进制的容器不算
+        if pvpid is not None and _as_int(rec.get("pvpid")) != int(pvpid):
+            continue
+        if owner is not None and str(rec.get("owner") or "") != str(owner):
+            continue
         cands.append(rec)
     if not cands:
         return []
@@ -1249,6 +1327,26 @@ def ghost_any_for_track(track_id):
     """给 resultservice 那几个「回原始字节」的端点用：挑该赛道最好的一个。"""
     rows = ghost_search(track_id=track_id, limit=1)
     return rows[0] if rows else None
+
+
+def ghost_any():
+    """库里任意一条**有二进制**的幽灵（不分赛道）。
+
+    ★ 用于 resultservice 那些「回原始字节」的端点兜底。客户端这三个 cmd
+      （15/16/18，分支都在 `0x508854`）都带 `cmp w8,#0x65; b.lo 0x5089fc`：
+      **响应体小于 101 字节就判 err=7**，而空响应 `{"data": []}` 只有 12 字节
+      —— 于是「检索对手中…」永远卡住。幽灵 blob 里不含赛道号
+      （`03 00 00 00 | u32 checksum | u32 frames | u32 0 | zlib`），
+      所以真的一条都没有时，跨赛道下发在结构上客户端发现不了。
+    """
+    ghost_sync_legacy()
+    obj = _load_ghosts()
+    rows = [r for r in obj["items"].values()
+            if r.get("stored") or r.get("legacy_path")]
+    if not rows:
+        return None
+    rows.sort(key=lambda r: (r.get("drive_time") or 0, r.get("contentId") or 0))
+    return rows[0]
 
 
 # ------------------------------------------------------------ 回放登记（replay_id）

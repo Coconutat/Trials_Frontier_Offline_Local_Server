@@ -174,10 +174,9 @@
     "chip_equation_y": 0.5
   },
   "weekly": {
+    "_note": "午夜杯 = 周赛。窗口不在这里配：它按 epoch 周钉死为 week_start ~ week_start+604800（与客户端 updateLastWeekIndex 的周号算法一致），否则存档里的物品 1165/1166（= getItemCount(233,0/1)）会每次存档往后滑，倒计时永不减少。track_id = 本周挑战赛道；left_retry_times 恒为 3（服务端不递减，见 h_liveevents_basic_info 的说明）。",
     "track_id": 1041,
-    "left_retry_times": 3,
-    "window_hours": 24,
-    "task": []
+    "left_retry_times": 3
   },
   "rewards": {
     "_note": "赛后奖励，对应比赛 JSON 的 rewards 数组 = [金币, 钻石, 特殊奖励等级]。客户端 parseMatch 把它变成 PVPMatch+0x170 的 {(1,金币),(2,钻石),(145,特殊奖励等级)}，赛后界面直接显示。不发这个键 → 打完一局金币/钻石留空、特殊奖励空。",
@@ -193,11 +192,12 @@
     ]
   },
   "chips": {
-    "_note": "筹码。start/per_track_seconds/max 是账号级的长期产出（_pvp_chips_for）；局内筹码曲线在 season.chip_equation_x/y（客户端用它画赢家头像的填充圆环）。bot_start = 人机已有的筹码（客户端把它画成对手头像下的红筹码）；match_loser_keeps_pct = 整局结算时输家保住的比例（%），其余被赢家夺走。",
+    "_note": "筹码。start/per_track_seconds/max 是账号级的长期产出（_pvp_chips_for）；局内筹码曲线在 season.chip_equation_x/y（客户端用它画赢家头像的填充圆环）。bot_start = 人机已有的筹码（客户端把它画成对手头像下的红筹码）；match_loser_keeps_pct = 整局结算时输家保住的比例（%），其余被赢家夺走。bonus = 一次性补偿筹码，每个账号只发一次（发过记 bonus_done 一起落盘）；余额和局内票现在都会存 server/data/pvp_state.json，重启不再归零。",
     "start": 0,
     "per_track_seconds": 3600,
     "max": 0,
     "bot_start": 500,
-    "match_loser_keeps_pct": 50
+    "match_loser_keeps_pct": 50,
+    "bonus": 114514
   }
 }

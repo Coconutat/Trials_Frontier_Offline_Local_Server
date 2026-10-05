@@ -26,6 +26,7 @@ Trials Frontier 本地服务器（本地存档/离线后端）
 """
 
 import argparse
+import atexit
 import hashlib
 import json
 import os
@@ -197,6 +198,11 @@ _TF_CONFIG_DEFAULTS = {
         # ★ 客户端 `getChipHeritage` @0x5dec48 里那两个系数是硬编码的 0.5/0.1，
         #   只影响赛后界面文案，真正的转移比例由这里决定。
         "match_loser_keeps_pct": 50,
+        # 一次性补偿筹码。旧服务器把 `_pvp_chips` 放在纯内存 dict 里，重启就归零
+        # （用户 m02863：「总量不会保存，还会从 0 增长到 1 或者 3」），已经攒下的
+        # 筹码全丢了。这里给每个账号补一次；发过就记 `bonus_done` 一起落盘，
+        # 不会因为重启再发第二遍。
+        "bonus": 114514,
     },
     # 赛后奖励。比赛 JSON 的 `rewards` 是**数组**，parseMatch @0x4fd9d0 只读前 3 个整数
     # （`cmp w9,#2; b.gt`，见 0x4fdd78），然后拼成 PVPMatch+0x170 上的
@@ -223,8 +229,6 @@ _TF_CONFIG_DEFAULTS = {
     "weekly": {
         "track_id": 1041,
         "left_retry_times": 3,
-        "window_hours": 24,
-        "task": [],
     },
 }
 
@@ -835,6 +839,34 @@ def _ghost_metadata(body):
     return {}
 
 
+def _ghost_meta_out(rec, drive_time=None):
+    """把幽灵记录拼成客户端要的 `metadata` 对象。
+
+    ★ `size` **必须有且 >= 1**：`tr::GhostQueryObject::onQueryCompleted` @0x508288
+      的 type 3 分支 `0x5083b8 str w8,[sp,#0x14]` 读键 `size`@0xb4317f，
+      `size < 1` 直接判失败。内置幽灵以前只有 metadata、从来没写过 size，
+      所以排行榜上点「挑战」永远取不到幽灵。
+    ★ `drive_time` 必须与请求方期望的一致：紧接着 `0x508594` 会比对，
+      不等就打 `GHOST DRIVE TIME DOES NOT MATCH: %d vs %d`@0xb87d5b 并失败。
+      `get_ghost_timed?…&drive_time=N` / `checkGhost(…, drive_time, …)` 传的
+      就是排行榜那一行显示的成绩，所以直接把请求值回显即可。
+    """
+    md = dict(rec.get("metadata") or {})
+    if md.get("track_id") is None:
+        md["track_id"] = rec.get("track_id")
+    if not md.get("size"):
+        n = rec.get("size") or 0
+        if not n:
+            blob = acct.ghost_payload(rec.get("contentId"))
+            n = len(blob) if blob else 0
+        md["size"] = int(n or 0)
+    if md.get("pvpid") is None and rec.get("pvpid") is not None:
+        md["pvpid"] = rec.get("pvpid")
+    if drive_time:
+        md["drive_time"] = int(drive_time)
+    return md
+
+
 def h_userstorage(method, path, query, body, headers):
     """userstorage v2 的幽灵内容仓库（客户端上传/检索自己的幽灵走这条）。"""
     m = _USERSTORAGE_RE.match(path)
@@ -888,7 +920,12 @@ def h_userstorage(method, path, query, body, headers):
             if blob:
                 print("[ghost] 下发幽灵 id=%d (%d 字节)" % (cid, len(blob)), flush=True)
                 return 200, {"Content-Type": "application/octet-stream"}, blob
-            return 200, {"Content-Type": "application/json"}, {"data": []}
+            # ★ 千万不要回 JSON 兜底：cmd 29（`OnlineUserStorage::onNetworkDataReceived`
+            #   @0x5789e0 → vptr[3] = `GhostQueryObject::onDataReceived` @0x507fb8）
+            #   **没有任何长度/魔数校验**，12 字节的 `{"data": []}` 会被当成幽灵数据
+            #   直接喂给引擎。留空体比喂垃圾安全。
+            print("[ghost] payload id=%d 不存在 -> 404" % cid, flush=True)
+            return 404, {"Content-Type": "application/octet-stream"}, b""
 
         # PUT /content/ghost/<id> —— 更新 metadata（body 里没有 track_id，靠合并）
         if method == "PUT" and not tail:
@@ -910,9 +947,15 @@ def h_userstorage(method, path, query, body, headers):
         # GET /content/ghost/<id> —— 取 metadata
         rec = acct.ghost_get(cid)
         if rec:
+            # 形状（`GhostQueryObject::onMetaDataReceived` @0x50802c，**扁平**对象）：
+            #   顶层 `"profileId"`@0xb8546e 字符串 + 顶层 `"metadata"`@0xb85860 对象，
+            #   后者子键 `track_id`@0xb87757 / `pvpid`@0xb87ce5 / `size`@0xb4317f。
+            #   消费方 `OnlineStateGhost::onGhostMetaDataReceived` @0x7c8f58 把 track_id
+            #   存进 [this+0x184] 并拿它做下一跳 getGhost(…, track=track_id, …)@0x7c8fa4。
             return 200, {"Content-Type": "application/json"}, {
                 "contentId": cid,
-                "metadata": rec.get("metadata") or {},
+                "profileId": rec.get("owner") or "",
+                "metadata": _ghost_meta_out(rec),
             }
         return 200, {"Content-Type": "application/json"}, {"data": []}
 
@@ -927,13 +970,23 @@ def h_userstorage(method, path, query, body, headers):
     track = _num("track_id")
     limit = _num("limit", 1)
     drive_time = _num("drive_time")
-    rows = acct.ghost_search(track_id=track, players=q.get("players"),
-                             limit=limit, drive_time=drive_time)
-    print("[ghost] search %s 赛道 %s players=%s -> %d 个"
-          % (tag, track, q.get("players"), len(rows)), flush=True)
+    # ★ PVP 专用对手位：`get_pvp_ghost?track_id=%d&players=%s&limit=1&pvpid=%d`@0xb87af4。
+    #   以前完全不读它 ⇒ pvpid=1 和 pvpid=2 拿到同一批幽灵。
+    pvpid = _num("pvpid")
+    if pvpid is None:
+        pvpid = _num("pvp_id")
+    # ★ 但 `players` 在 PVP 查询里是**请求者自己**的 pid（真机实测），
+    #   拿去当 owner 过滤等于把 named 变成永远空集、静默回落到全部。
+    #   只有 `get_ghost[_timed]` 这两个按名检索的变体才该用 players 过滤 owner。
+    named_query = "pvp" not in tag
+    rows = acct.ghost_search(track_id=track,
+                             players=(q.get("players") if named_query else None),
+                             limit=limit, drive_time=drive_time, pvpid=pvpid)
+    print("[ghost] search %s 赛道 %s players=%s pvpid=%s -> %d 个"
+          % (tag, track, q.get("players"), pvpid, len(rows)), flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "contents": [{"contentId": r.get("contentId"),
-                      "metadata": r.get("metadata") or {}} for r in rows]
+                      "metadata": _ghost_meta_out(r, drive_time)} for r in rows]
     }
 
 
@@ -966,15 +1019,37 @@ def h_ghost(path, query, body, headers):
         tracking &= 0xFFFF
 
     if "/replaydata" in path and not seg.isdigit() and q.get("track_id"):
+        # ★ 客户端 cmd 13（`tr::GhostQueryObject::onNetworkDataReceived` @0x5088a8）
+        #   读的是 **snake_case** 的 `"content_id"`@0xb87d85：
+        #     >= 1 → `OnlineUserStorage::sendData`（PUT payload 到那个 id = 更新已有）
+        #     < 1  → `createMetaData` + `OnlineUserStorage::addData`（POST 新建）
+        #   以前这里永远回 `{"data": []}`（本意是「问有没有，说没有才会老实上传」），
+        #   结果每跑一场就 +1 条新记录：真机 23/23 次全空，index.json 里同一玩家
+        #   攒了 20 条（cid 47–66）。答「有」才能收敛到一条、客户端才学得到自己的 id。
+        mine = None
+        pid = _ghost_caller(headers)
+        if pid and tracking:
+            rows = acct.ghost_search(track_id=tracking, owner=pid, limit=1)
+            if rows:
+                mine = rows[0].get("contentId")
+        if mine:
+            print("[ghost] replaydata 赛道 %s 已有本人幽灵 cid=%s，让客户端更新"
+                  % (tracking, mine), flush=True)
+            return 200, {"Content-Type": "application/json"}, {"content_id": int(mine)}
         return 200, {"Content-Type": "application/json"}, {"data": []}
 
     if tracking:
-        # ★ 排行榜上的对手行点「挑战」时客户端会把那一行的 player 带过来。
-        #   先按 pid→contentId 精确回**同一条**幽灵，榜上显示的时间和实际跑的
-        #   幽灵才对得上；匹配不上再退回原来的「该赛道随便挑一条」。
-        #   （对手表定义在本函数之后，调用时求值，没问题。）
-        players = [p.strip() for p in (q.get("players") or "").split(",") if p.strip()]
+        # ★ 二进制幽灵端点发的是 **`player`（单数）**，只有 userstorage 的 search
+        #   家族才用 `players`。真机实测：
+        #     /resultservice/v1/pvp_replaydata    {track_id, player, pvp_id}  13 次
+        #     /resultservice/v1/robot_replaydata  {track_id, time, player}    35 次
+        #   以前只读 players ⇒ 对手 pid / 对手名 / time / pvp_id 全被丢掉，
+        #   永远落到下面「该赛道随便挑一条」的兜底。
+        who = q.get("players") or q.get("player") or ""
+        players = [p.strip() for p in str(who).split(",") if p.strip()]
         if players:
+            # 排行榜上的对手行点「挑战」时客户端会把那一行的 player 带过来。
+            # 先按 pid→contentId 精确回**同一条**幽灵，榜上显示的时间才跑得对。
             _, ghost_of = _opponent_entries()
             board = "track%d" % tracking
             for pid in players:
@@ -984,13 +1059,34 @@ def h_ghost(path, query, body, headers):
                     print("[ghost] %s 赛道 %s -> 对手 %s 的幽灵 cid=%s (%d 字节)"
                           % (path, tracking, pid, cid, len(blob)), flush=True)
                     return 200, {"Content-Type": "application/octet-stream"}, blob
-        rec = acct.ghost_any_for_track(tracking)
+        pvpid = q.get("pvpid") if q.get("pvpid") is not None else q.get("pvp_id")
+        want = q.get("time") if q.get("time") is not None else q.get("drive_time")
+        try:
+            pvpid = int(pvpid) if pvpid is not None else None
+        except (TypeError, ValueError):
+            pvpid = None
+        try:
+            want = int(want) if want is not None else None
+        except (TypeError, ValueError):
+            want = None
+        rows = acct.ghost_search(track_id=tracking, limit=1,
+                                 drive_time=want, pvpid=pvpid)
+        rec = rows[0] if rows else None
+        if rec is None:
+            # ★ 该赛道一条都没有时**必须**跨赛道兜底，不能回 12 字节的
+            #   `{"data": []}`：cmd 15/16/18 的分支（都在 0x508854）带
+            #   `cmp w8,#0x65; b.lo 0x5089fc` —— 响应体小于 101 字节就判 err=7，
+            #   于是「检索对手中…」永远卡住、幽灵缺失。幽灵 blob 里不含赛道号，
+            #   跨赛道下发在结构上客户端发现不了。
+            rec = acct.ghost_any()
         if rec:
             blob = acct.ghost_payload(rec.get("contentId"))
             if blob:
                 print("[ghost] %s 赛道 %s -> contentId=%s (%d 字节)"
                       % (path, tracking, rec.get("contentId"), len(blob)), flush=True)
                 return 200, {"Content-Type": "application/octet-stream"}, blob
+        print("[ghost] %s 赛道 %s 库里一条可用幽灵都没有" % (path, tracking), flush=True)
+        return 404, {"Content-Type": "application/octet-stream"}, b""
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
 
@@ -1126,10 +1222,12 @@ def _week_index():
     return week_start, (week_start // _WEEK_SECONDS) & 0xFFFFFF
 
 
-# 本周挑战的赛道。必须挑一条游戏真能加载、且玩家跑过的赛道：1041 在幽灵库里
-# （owner 0 / 6f857655 / 99511744 都有它的幽灵），真机日志里也出现过
-# `GET /public/playerstats/v1/ranking/track1041` 与 ghost_*_1041.bin。
-_WEEKLY_TRACK_ID = 1041
+def _weekly_track_id():
+    """本周挑战的赛道，可在 `server/data/tf_config.json` 的 `weekly.track_id` 里改
+    （热加载，所以每次读）。默认 1041：必须挑一条游戏真能加载、且玩家跑过的赛道，
+    1041 在幽灵库里（owner 0 / 6f857655 / 99511744 都有它的幽灵），真机日志里也出现过
+    `GET /public/playerstats/v1/ranking/track1041` 与 ghost_*_1041.bin。"""
+    return cfg_int("weekly", "track_id", default=1041) or 1041
 
 # 奖杯序号（1..5）→ `calculateReward` 用来查 reward_config 那张 map 的键名。
 # 跳转表 @0xb91880（`sub w8,w20,#1; cmp w8,#4; b.hi` 越界直接跳过）已按跳转目标
@@ -1140,42 +1238,73 @@ _WEEKLY_TRACK_ID = 1041
 _WEEKLY_TROPHIES = ("platinum", "gold", "silver", "bronze", "wood")
 
 
+# 周赛的「上周成绩」是本玩家上一次打完那周留下的，服务端不产生它，只是**记住客户端
+# 报上来的值再原样还回去**。为什么必须记：
+#   `updateLastWeekIndex` @0x6335cc 用 `last_participated_week` 决定要不要再发 POST
+#   （`w8 < 1` → 发；`w8 == week_index` → 不发）。一直回 0 就永远满足 `w8 < 1`，
+#   客户端每次进游戏都重发一次 `submitLastWeekData`（真机日志里成百上千次），
+#   而且 `reward_config` 的轮换方案锁死在方案 0。
+# 不落盘：客户端自己会把值存进存档，服务重启后它重报一次即可自愈。
+_WEEKLY_LAST = {}          # profile_id -> (last_participated_week, last_participated_week_lb)
+
+
 def h_liveevents_basic_info(path, query, body, headers):
     """GET|POST /public/liveevents/v1/weekly_track_system/basic_info —— 限时活动的「门」。
 
     ⚠ 同一个 URL 服务两条命令，响应形状共用：
-      · GET  → cmd **0x76**：客户端逐个解析下面的键，回调
-        `vtable[3](err=0, week_index, week_start, weeK_end, last_participated_week,
+      · GET  → cmd **0x76**（`requestWeekIndex` → `GET …/basic_info`）：客户端逐个
+        解析下面的键，回调 `vtable[3]` → `OnlineWeeklyChallenge::onReceivedWeekIndex`
+        @0x633674`(err, week_index, week_start, weeK_end, last_participated_week,
          last_participated_week_lb, left_retry_times, midnight_circuit_start_time,
          midnight_circuit_end_time, last_attempt_time)`。
-      · POST → cmd **0x7f**（`postLastWeekData`，body `{"last_participated_week":%d,
-        "last_participated_week_lb":%d,"additional_retry":%d}`，反汇编 0x503800 确认
-        它也是拼 basic_info）：只取 `last_participated_week` /
-        `last_participated_week_lb` / `left_retry_times`，然后回调 vtable[3] 与 vtable[7]。
-      （POST 的 cmd 由 `OnlineCore::postJson` 的第 4 个参数带进去，不是 URL 决定的。）
+      · POST → cmd **0x7f**（`postLastWeekData` / `submitLastWeekData`，URL 同样是
+        basic_info，只是走 postJson —— cmd 由 `OnlineCore::postJson` 的第 4 个参数
+        带进去，不是 URL 决定的）：客户端报上它的「上周成绩」。回调走
+        `vtable[7]` → `onReceivedLastWeekSetup` @0x633970，**只读三个键**：
+        `last_participated_week` / `last_participated_week_lb` / `left_retry_times`
+        （解析点 @0x505258，`x8=[x8,#0x38]` 即 vtable 下标 7）。
+      POST 的 body 有**两种**形状，都要接（.rodata 常量已确认）：
+        `{"additional_retry":%d}`                                  @0xb87596
+        `{"last_participated_week":%d,"last_participated_week_lb":%d,"additional_retry":%d}`
+                                                                    @0xb87465
+        `additional_retry` 是客户端本地装扮加成（`getCurrentChallengeRetryBonus`
+        @0x58281c，本机算出 256），**不可信、也不该计入**，直接丢弃。
 
     客户端契约（`OnlineWeeklyChallenge::parseJsonResponse` cmd 0x76 @0x504f7c）：
     根对象成员逐个 json_strcmp，命中后取值，最后一次性回调上面那个函数。
+    所有数值字段都必须是 JSON **整数**（客户端逐个判 `[node+0x30] == 4`）。
 
     ⚠ 两个坑：
-      1. 键名是 `weeK_end`（**大写 K**，.rodata @0xb8763a 就是这么拼的）。
+      1. 键名是 `weeK_end`（**大写 K**，.rodata @0xb8763a 就是这么拼的，全库唯一）。
          写成 `week_end` 客户端收不到；`week_end` 那个拼法只出现在 config 里
          （@0xb876f0）。
       2. `midnight_circuit_start_time` / `midnight_circuit_end_time` 是**午夜杯**
-         （Midnight Circuit）的时间窗，留 0 等于「永不开放」。
+         （Midnight Circuit）的时间窗，留 0 等于「永不开放」。而且**必须按周钉死**：
+         客户端会把这对时间戳写进自己的物品表（真机存档实测 = 物品 **1165 / 1166**，
+         `setUpWeeklyChallengeMissionTiming` @0x5c45f0 再把它们读回来当那三个周赛
+         任务 451/452/453 的 type-6（ON_CUSTOM_TIME）条件）。以前这里给的是
+         `now-3600 ~ now+24h` 的**滑动**窗口，于是每存一次档 1166 就往后挪一点
+         （存档 history 里 `1166 - 1165` 恒为 90000 且两端一起前进），倒计时永远不减少。
     """
-    now = int(time.time())
     week_start, week_index = _week_index()
+    pid = _caller_profile(headers)
+    parsed = _json_body(body) or {}
+    if parsed.get("last_participated_week") is not None:
+        _WEEKLY_LAST[pid] = (int(parsed.get("last_participated_week") or 0),
+                             int(parsed.get("last_participated_week_lb") or 0))
+        print("[liveevent] 记录上周成绩 pid=%s last=%d lb=%d" % ((pid,) + _WEEKLY_LAST[pid]),
+              flush=True)
+    last, last_lb = _WEEKLY_LAST.get(pid, (0, 0))
     payload = {
         "week_index": week_index,
         "week_start": week_start,
         "weeK_end": week_start + _WEEK_SECONDS,   # ★大写 K
-        "last_participated_week": 0,
-        "last_participated_week_lb": 0,
+        "last_participated_week": last,
+        "last_participated_week_lb": last_lb,
         "left_retry_times": cfg_int("weekly", "left_retry_times", default=3),
-        # 午夜杯先给一个常开窗口（1 小时前 ~ N 小时后），保证能点进去
-        "midnight_circuit_start_time": now - 3600,
-        "midnight_circuit_end_time": now + max(1, cfg_int("weekly", "window_hours", default=24)) * 3600,
+        # 午夜杯 = 周赛：窗口 = 本周（week_start ~ week_end），一周内恒定。
+        "midnight_circuit_start_time": week_start,
+        "midnight_circuit_end_time": week_start + _WEEK_SECONDS,
         "last_attempt_time": 0,
     }
     print("[liveevent] basic_info week_index=%s" % payload["week_index"], flush=True)
@@ -1212,7 +1341,7 @@ def h_liveevents_config(path, query, body, headers):
             "global_gem_amount": 1,
         },
         "challenge_settings": {
-            "track_id": _WEEKLY_TRACK_ID,
+            "track_id": _weekly_track_id(),
             # ⚠ bike_id 必须是 /conf/bikes.txt 里的合法车号（1..19，没有 0）。
             # 真机实测 bike_id=0 必崩：`MenuzStateWeeklyChallenge::loadIntroState`
             # 把这里的 bike_id 直接喂给
@@ -1244,7 +1373,7 @@ def h_liveevents_config(path, query, body, headers):
         },
         "retry_pool": [{"retry": 1, "gems": 1}],
     }
-    print("[liveevent] config -> 赛道 %d 周号 %d" % (_WEEKLY_TRACK_ID, week_index), flush=True)
+    print("[liveevent] config -> 赛道 %d 周号 %d" % (_weekly_track_id(), week_index), flush=True)
     return 200, {"Content-Type": "application/json"}, payload
 
 
@@ -1259,7 +1388,7 @@ def h_liveevents_find_opponent(path, query, body, headers):
       别被字符串搜索误导成独立常量。
     名字必须对同一周稳定：客户端会拿它去查头像和幽灵。
     """
-    name, drive, rec = _robot_opponent(_WEEKLY_TRACK_ID)
+    name, drive, rec = _robot_opponent(_weekly_track_id())
     print("[liveevent] find_opponent -> %s (%d ms)" % (name, drive), flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "opponent": name,
@@ -1562,6 +1691,63 @@ _pvp_tickets = {}                     # profileId -> {"tickets": n, "ts": 回票
 _pvp_chips = {}                       # profileId -> {"chips": n, "ts": 上次结算时刻, "acc": 余数, "tracks": [赛道 id]}
 _pvp_reward_data = {}                 # profileId -> 客户端最近一次 increase_rewards 上报的 reward_data
 
+# 筹码/局内票的落盘文件。★ 这两个 dict 原先只在内存里，服务器一重启就回
+# `chips.start`（=0）再从头慢慢长，用户看到的就是「总量不会保存，还会从 0 增长
+# 到 1 或者 3」（m02863）。整局结算夺走的筹码同理也会凭空回滚。
+PVP_STATE_PATH = os.path.join(HERE, "data", "pvp_state.json")
+_pvp_state_lock = threading.Lock()
+_pvp_dirty = [False]                  # 有待落盘的改动
+_pvp_saved_at = [0.0]                 # 上次落盘时刻（节流用）
+_PVP_SAVE_MIN_INTERVAL = 10           # 客户端每 1–3 秒轮询一次，不能每问一次就写盘
+
+
+def _pvp_mark_dirty():
+    _pvp_dirty[0] = True
+
+
+def _pvp_state_load():
+    """把筹码/票从磁盘读回内存。文件缺失或读坏都当空，不影响服务器起。"""
+    try:
+        with open(PVP_STATE_PATH, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+    except Exception:
+        return
+    if not isinstance(blob, dict):
+        return
+    for key, dst in (("chips", _pvp_chips), ("tickets", _pvp_tickets)):
+        got = blob.get(key)
+        if isinstance(got, dict):
+            dst.update({str(p): v for p, v in got.items() if isinstance(v, dict)})
+    print("[pvp] 筹码/票已恢复：%d 个账号" % len(_pvp_chips), flush=True)
+
+
+def _pvp_state_save(force=False):
+    """节流落盘。写失败就保留 dirty 标志，等下一次调用重试。"""
+    now = time.time()
+    if not _pvp_dirty[0]:
+        return
+    if not force and now - _pvp_saved_at[0] < _PVP_SAVE_MIN_INTERVAL:
+        return
+    with _pvp_state_lock:
+        try:
+            blob = {"chips": dict(_pvp_chips), "tickets": dict(_pvp_tickets)}
+            os.makedirs(os.path.dirname(PVP_STATE_PATH), exist_ok=True)
+            tmp = PVP_STATE_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(blob, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, PVP_STATE_PATH)
+            _pvp_dirty[0] = False
+            _pvp_saved_at[0] = now
+        except Exception as e:
+            _pvp_saved_at[0] = now
+            print("[pvp] 筹码落盘失败（下次重试）：%s" % e, flush=True)
+
+
+_pvp_state_load()
+# 正常退出（Ctrl+C / 进程结束）时把节流窗口里剩下的一点点也写掉，
+# 别让最后 10 秒的产出白白丢掉。
+atexit.register(lambda: _pvp_state_save(force=True))
+
 
 # --- 局内票（免费票）--------------------------------------------------------
 # 用户 m02890 的规则：开局每人 3 张局内票，每 1h 回 1 张，回满 3 张为止；
@@ -1604,6 +1790,7 @@ def _pvp_tickets_for(pid):
         init = cfg_int("matchmaking", "free_tickets_initial", default=maxn)
         st = {"tickets": max(0, min(maxn, init)), "ts": 0}
         _pvp_tickets[pid] = st
+        _pvp_mark_dirty()
     if st["tickets"] < maxn:
         if not st["ts"]:
             st["ts"] = now                      # 从不满的这一刻开始计时
@@ -1612,8 +1799,10 @@ def _pvp_tickets_for(pid):
             if gained > 0:
                 st["tickets"] = min(maxn, st["tickets"] + gained)
                 st["ts"] = st["ts"] + gained * interval
+                _pvp_mark_dirty()
     if st["tickets"] >= maxn:
         st["ts"] = 0                            # 满了就不再回
+    _pvp_state_save()
     return st["tickets"], st["ts"]
 
 
@@ -1629,6 +1818,8 @@ def _pvp_consume_ticket(pid):
     if st["tickets"] >= maxn:
         st["ts"] = int(time.time())             # 从满票掉下来，回票从现在开始计
     st["tickets"] -= 1
+    _pvp_mark_dirty()
+    _pvp_state_save()
     return st["tickets"]
 
 
@@ -1646,6 +1837,7 @@ def _pvp_chips_state(pid):
             "tracks": [],
         }
         _pvp_chips[pid] = st
+        _pvp_mark_dirty()
     return st
 
 
@@ -1655,6 +1847,8 @@ def _pvp_set_tracks(pid, ids):
         return
     st = _pvp_chips_state(pid)
     st["tracks"] = list(ids or [])
+    _pvp_mark_dirty()
+    _pvp_state_save()
 
 
 def _pvp_chips_for(pid):
@@ -1679,6 +1873,15 @@ def _pvp_chips_for(pid):
             st["ts"] = int(time.time())
         return int(st["chips"] or 0)
     now = int(time.time())
+    # 一次性补偿（`chips.bonus`）。放在这里而不是建 state 的时候，是为了让
+    # 「旧版本已经攒过、但状态只在内存里」的账号也能拿到。
+    if not st.get("bonus_done"):
+        st["bonus_done"] = True
+        amt = cfg_int("chips", "bonus", default=0) or 0
+        if amt:
+            st["chips"] = int(st["chips"] or 0) + amt
+            print("[pvp] 一次性补偿筹码 %s +%d -> %d" % (pid, amt, st["chips"]), flush=True)
+        _pvp_mark_dirty()
     period = cfg_int("chips", "per_track_seconds", default=3600)
     ntrack = len(st.get("tracks") or [])
     if period and period > 0 and ntrack > 0:
@@ -1691,8 +1894,10 @@ def _pvp_chips_for(pid):
             st["chips"] += gained
             if top and top > 0 and st["chips"] > top:
                 st["chips"] = top
+            _pvp_mark_dirty()
     else:
         st["ts"] = now
+    _pvp_state_save()
     return st["chips"]
 
 
@@ -1708,6 +1913,8 @@ def _pvp_spend_chips(pid, amount):
         amount = 0
     if amount > 0:
         st["chips"] = max(0, st["chips"] - amount)
+        _pvp_mark_dirty()
+    _pvp_state_save()
     return st["chips"]
 
 
@@ -2085,6 +2292,7 @@ def _pvp_bank_match_chips(m):
         gain = max(0, got - base)
         if gain > 0:
             st["chips"] = int(st["chips"] or 0) + gain
+            _pvp_mark_dirty()
             print("[pvp] 结算局内筹码 %s +%d -> %d" % (p, gain, st["chips"]), flush=True)
 
     # 再把输家已有的筹码转给赢家（3 条赛道占住 ≥2 条者为赢家）。
@@ -2094,6 +2302,7 @@ def _pvp_bank_match_chips(m):
             winner = p
             break
     if not winner:
+        _pvp_state_save()
         return
     keep = cfg_int("chips", "match_loser_keeps_pct", default=50)
     try:
@@ -2111,8 +2320,10 @@ def _pvp_bank_match_chips(m):
         lst["chips"] = have - stolen
         wst = _pvp_chips_state(winner)
         wst["chips"] = int(wst["chips"] or 0) + stolen
+        _pvp_mark_dirty()
         print("[pvp] 夺走筹码 %s -%d -> %d ; %s +%d -> %d"
               % (p, stolen, lst["chips"], winner, stolen, wst["chips"]), flush=True)
+    _pvp_state_save()
 
 
 def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
@@ -2505,6 +2716,53 @@ def h_pvp_player(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, _pvp_player_info(_pvp_chips_for(who))
 
 
+def h_pvp_players(path, query, body, headers):
+    """GET /public/pvp_matches/v1/players?profiles=<pid,pid,…> —— 碉堡的好友榜（cmd 0x37）。
+
+    ⚠ 这个端点以前注册在 `h_pvp_accept` 上，回 `{"data": []}` —— **对象**。而解析器
+    `tr::OnlinePVP::parseFriendLeaderboard` @0x4fe88c 第一件事就是：
+
+        0x4fe8c0  ldr w8, [x1, #0x30]      ; json_value->type
+        0x4fe8c4  ... cmp w8, #2           ; 2 = array
+        0x4fe8c8  b.ne #0x4fea98           ; 不是数组 → 一个字都不解析
+
+    于是「进碉堡一直转圈」：请求发得出去（真机 2026-10-05 13:12:17 已见），
+    响应类型不对，客户端永远等不到 `onFriendLeaderboardReceived`。
+    ⇒ **根必须是 JSON 数组**，元素对象逐成员比对这 5 个键：
+
+        rank        0xb869b5  → u16（0x4fe99c `strh w8,[sp,#0x2c]`）
+        elo_rank    0xb869b1  → int（0x4fe9a8 `str w8,[sp,#0x28]`）
+        star        0xb86947  → u16（0x4fe9b4 `strh w8,[sp,#0x2e]`）
+        profile_id  0xb86951  → 字符串，`0x4fe9c0 ldr x1,[x27,#0x28]; strcpy`
+        season      0xb868e5  → int（0x4fe990；缺键时 memset 留下的默认是 -1）
+
+    之后 0x4fea20 用 `OnlineFriends::getFriend(profile_id)` 换显示名；换不到、且
+    profile_id 也不等于本机玩家（对比 `[GlobalData+0x420]->[0]+0x110`）时才 `b` 跳过
+    那一条。⇒ 所以 **每个请求到的 profile 都要回一条**，`profile_id` 必须与请求里
+    的字符串逐字节一致（它随后还要拿去查头像）。
+
+    发起者是 `tr::OnlinePVP::getFriendLeaderboard(OnlinePVPFriendLeaderboardQuery*)`
+    @0x4fb650：URL 模板 @0xb86840、`0x4fb77c mov w3,#0x37`（cmd 0x37）、
+    `0x4fb6c8 ldr w24,[x19,#0x38]` 是起始下标、`0x4fb788` 那组最多凑 0x13+1=20 条。
+    """
+    pid = _ghost_caller(headers)
+    listing = []
+    seen = set()
+    raw = dict(parse_qsl(query or "", keep_blank_values=True)).get("profiles")
+    if isinstance(raw, str):
+        for who in raw.split(","):
+            who = who.strip()
+            if not who or who in seen:
+                continue
+            seen.add(who)
+            info = _pvp_player_info(_pvp_chips_for(who))
+            info["profile_id"] = who
+            listing.append(info)
+    print("[pvp] players pid=%s -> %d 条 %s"
+          % (pid, len(listing), [it["profile_id"] for it in listing]), flush=True)
+    return 200, {"Content-Type": "application/json"}, listing
+
+
 def h_pvp_config(path, query, body, headers):
     """GET /public/pvp_matches/v1/pvp_config?lang=%s —— 赛季配置（cmd 0x30）。
 
@@ -2766,9 +3024,18 @@ def h_replay_id(path, query, body, headers):
         cid = g.get("contentId") if g else None
 
     if not cid:
-        print("[ghost] replay_id %s %s -> 库里没有可用幽灵，回失败形状"
+        g = acct.ghost_any()
+        cid = g.get("contentId") if g else None
+
+    if not cid:
+        # 库里真的一条幽灵都没有（理论上不会：`ghost_sync_legacy` 启动时总会导入内置幽灵）。
+        # ★ 但即使这样也**绝不能**回 `{"data": []}`：cmd 14 @0x50895c 读键
+        #   `"replay_id"`@0xb87bc0 后紧跟 `cmp w20,#1; b.lt 0x508a68`，
+        #   小于 1 一律走 err=7 ⇒ 按钮永久灰着。宁可给一个必定取不到 payload 的 id，
+        #   至少让按钮亮起来、界面进得去。
+        print("[ghost] replay_id %s %s -> 库里一条幽灵都没有，回兜底 id=1"
               % (pid, board), flush=True)
-        return 200, {"Content-Type": "application/json"}, {"data": []}
+        return 200, {"Content-Type": "application/json"}, {"replay_id": 1}
 
     print("[ghost] replay_id %s %s %s ms -> replay_id=%d"
           % (rec.get("profile_id"), rec.get("track_name"), rec.get("drive_time"), cid),
@@ -3024,19 +3291,22 @@ def _opponent_entries():
         records = []
     by_track = {}
     for rec in records:
-        if not rec.get("builtin") and not rec.get("legacy_path"):
-            continue                         # 玩家自己上传的幽灵不是对手
         if not (rec.get("stored") or rec.get("legacy_path")):
             continue                         # 只有 metadata、没有二进制的容器不算
-        track = rec.get("track_id")
+        # ★ 赛道号在这里也掩一次：客户端会叠 0x800000 / 0x10000 / 0x100000 标志位，
+        #   而 `h_ghost` 查询侧是按掩码后的裸 ID 找 `board = "track%d"` 的。
+        #   之前两边一个掩一个不掩，表里是 track66633、查的是 track1097 ⇒ 永远 miss。
+        track = acct.mask_track(rec.get("track_id"))
         time_ms = rec.get("drive_time") or rec.get("payload_drive_time")
         if not track or not time_ms:
             continue
-        by_track.setdefault(int(track), []).append(rec)
+        by_track.setdefault(track, []).append(rec)
     for track, recs in by_track.items():
         board = "track%d" % track
         recs.sort(key=lambda r: (r.get("drive_time") or 0, r.get("contentId") or 0))
-        for pid, rec in zip(OPPONENT_PIDS, recs):
+        # 内置幽灵才折成假对手，撑起排行榜的行（行为与以前一致）。
+        builtins = [r for r in recs if r.get("builtin") or r.get("legacy_path")]
+        for pid, rec in zip(OPPONENT_PIDS, builtins):
             rows.setdefault(pid, {})[board] = {
                 "player": pid,
                 "drivetime": int(rec.get("drive_time") or 0),
@@ -3047,6 +3317,14 @@ def _opponent_entries():
                 "updated": int(rec.get("updated") or 0),
             }
             ghosts.setdefault(pid, {})[board] = rec.get("contentId")
+        # ★ 玩家自己/好友上传的幽灵按**真实 owner** 单独建索引。
+        #   以前 `if not rec.get("builtin") and not rec.get("legacy_path"): continue`
+        #   把这些记录整条丢掉 ⇒ 刚上传的幽灵既进不了 `ghost_of`、`h_replay_id`
+        #   也只会回失败形状，等于「自己的幽灵永远无法被挑战、也拿不到自己的 id」。
+        for rec in recs:
+            own = str(rec.get("owner") or "")
+            if own and own not in OPPONENT_PIDS:
+                ghosts.setdefault(own, {})[board] = rec.get("contentId")
     _OPPONENT_CACHE = (rows, ghosts)
     print("[opponent] 内置幽灵折成 %d 个对手 / %d 条赛道" %
           (len(rows), len(by_track)), flush=True)
@@ -3481,7 +3759,8 @@ DYNAMIC = [
     ("GET", "/pvp_banner/", h_pvp_banner),
     # ⚠ 顺序有讲究：`players?profiles=` 的 path 是 /…/players，
     # 它是 /…/player/ 的前缀，必须排在前面，否则会被 h_pvp_player 抢走。
-    ("GET", "/public/pvp_matches/v1/players", h_pvp_accept),
+    # 回的是**数组**不是 {"data": …} —— 见 h_pvp_players 的注释（回对象就转圈）。
+    ("GET", "/public/pvp_matches/v1/players", h_pvp_players),
     ("GET", "/public/pvp_matches/v1/player/", h_pvp_player),
     ("GET", "/public/pvp_matches/v1/pvp_config", h_pvp_config),
     ("GET", "/public/pvp_matches/v1/season/", h_pvp_season_data),
