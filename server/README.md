@@ -205,6 +205,20 @@ Handler.do_GET / do_POST / do_PUT / do_DELETE
 
 ### 5.4 PVP / 碉堡（`pvp_matches/v1`）
 
+**2026-10-05：奖励/经济链修复，尚待真机到账验收。**
+`start_race → race → increase_rewards → matches → close` 现有实际记账；奖池、对局、免费票、金票、筹码和领取状态持久化。
+金币/宝石由客户端成功回调发放，服务端不直接修改角色存档重复加币。
+季奖配置仍为扁平运营条目，wire输出26档嵌套数组；特殊项 `item_id=145` 的 `amount` 是原表RewardID。
+旧固定 `rewards.default/win` 占位奖池已删除，改为实际转盘上报累计。
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+当前仅验证基础价金票购买，套装折扣/旧缓存价会被拒绝；不能将21项隔离回归等同于真机完整复刻。
+部署前备份数据并停止旧进程，源码修改需重启；不要同时开两个进程写同一状态文件。
+详见 [本轮修复报告](<../work/trials-frontier/notes/2026-10-05_pvp-economy-report.md>)。
+
 `h_pvp_init` / `h_pvp_matches` / `h_pvp_accept` / `h_pvp_player` / `h_pvp_race` /
 `h_pvp_chips` / `h_pvp_new_ranked` / `h_pvp_config` / `h_pvp_season_data` /
 `h_pvp_close_season`，参数全部来自 `tf_config.json` 的 `matchmaking` / `season` / `chips`。

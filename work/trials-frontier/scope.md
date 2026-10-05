@@ -1,14 +1,14 @@
-﻿# Case Scope
+# Case Scope
 
 ## meta
 - case_id: trials-frontier
 - created: 2026-10-03T13:08:41.5275608+08:00
 - operator: local
 - project_root: F:\Code\Trials_Frontier_Offiline_Hack
-- primary_skill: reverse-engineering/SKILL.md
-- primary_id: R0
+- primary_skill: apk-reverse/SKILL.md
+- primary_id: R1
 - lead_role: lead
-- specialist_roles: []
+- specialist_roles: [cre, cae, doc]
 - hint: Trials Frontier com.ubisoft.redlynx.trialsfrontier.ggp 停服复活：去广告、解锁内容、最小本地服务器
 - preset: own-system
 
@@ -21,8 +21,9 @@
 ## in_scope
 - assets:
   - F:\Code\Trials_Frontier_Offiline_Hack\APKS\特技摩托前线\7.9.4 带剧情不减反增车不全.apk
-- surfaces: []
-- activities: []
+- surfaces: [mobile, binary, local_api]
+- activities: [offline_reverse, local_server_repair, isolated_regression]
+- continuation: 2026-10-05 用户要求继续路线图第3条；只读取既有样本及派生产物、修改本项目服务器和文档；HTTP测试限临时127.0.0.1端口，不连接官方服务/设备，不修改真实玩家状态。
 
 ## out_of_scope
 - assets: []

@@ -43,6 +43,8 @@ DEVICES = os.path.join(DATA, "devices.json")
 # 长期凭据（育碧叫 rememberMeTicket）。跟 sessions.json 分开存，
 # 因为 sessions 只保留最近 200 张会被裁剪，长期凭据不能被裁掉。
 REMEMBER = os.path.join(DATA, "remember.json")
+# 客户端（IP / 设备 id）-> 账号。用途见 resolve_identity()。
+BINDINGS = os.path.join(DATA, "bindings.json")
 SAVE_DIR = os.path.join(DATA, "save")
 GHOST_DIR = os.path.join(DATA, "ghosts")
 
@@ -520,6 +522,81 @@ def authenticate(headers):
     return None, "unknown-ticket"
 
 
+# ------------------------------------------------- 客户端 -> 账号绑定（身份稳定）
+# ★ 为什么需要（2026-10-05 真机日志复盘）：一次冷启动里客户端会用**好几个身份**发请求 ——
+#   带账号票据的、完全不带 Authorization 的、以及我们回给它的匿名票
+#   `tf-local-ticket-0001`。7360 条真机请求里 1737 条没有 Authorization、
+#   1489 条用那张匿名票，于是 PVP/存档状态被劈成「账号槽」和「匿名槽」两半，
+#   表现就是用户说的「时好时坏」：有时看到自己的段位与进行中的对局，
+#   有时是全新玩家（rank 25 / 0 筹码 / 没有对局 → 碉堡界面空转）。
+#   这里按客户端 IP（tf_server 注入的 X-TF-Client）+ 设备 id 记住最近一次
+#   **成功登录**的账号，之后认不出凭据的请求一律归到它名下。
+# ponytail: 按 IP 绑定；同一 NAT 后多台设备会串成同一个人，家用单机私服够用。
+#           真要多人就只认 by_device（UbiMobile 票里的 device_id），IP 那条删掉即可。
+def _load_bindings():
+    db = _load(BINDINGS, {})
+    if not isinstance(db, dict):
+        db = {}
+    for key in ("by_ip", "by_device"):
+        if not isinstance(db.get(key), dict):
+            db[key] = {}
+    return db
+
+
+def bind_client(acc, client_ip=None, device_id=None):
+    """把账号记在这台客户端（IP / 设备 id）名下；只在成功登录后调用。"""
+    who = (acc or {}).get("username")
+    if not who:
+        return
+    who = who.lower()
+    with _LOCK:
+        db = _load_bindings()
+        changed = False
+        if client_ip and db["by_ip"].get(client_ip) != who:
+            db["by_ip"][client_ip] = who
+            changed = True
+        if device_id and db["by_device"].get(str(device_id)) != who:
+            db["by_device"][str(device_id)] = who
+            changed = True
+        if changed:
+            _store(BINDINGS, db)
+            print("[acct] 客户端绑定：ip=%s device=%s -> %s" % (client_ip, device_id, who),
+                  flush=True)
+
+
+def account_by_client(client_ip=None, device_id=None):
+    """按设备 id 优先、其次客户端 IP，取回这台客户端登录过的账号。"""
+    with _LOCK:
+        db = _load_bindings()
+    who = (db["by_device"].get(str(device_id)) if device_id else None) or \
+          (db["by_ip"].get(client_ip) if client_ip else None)
+    return lookup_account(who) if who else None
+
+
+def resolve_identity(headers):
+    """`authenticate()` + 「认不出凭据时归到这台客户端的账号」。
+
+    返回与 `authenticate()` 同形的 (info, error)。规则：
+      * 明确的口令错误（invalid-credentials）**不许**被 IP 绑定洗白，照旧 401；
+      * 已经认成账号 → 顺手把绑定刷新（下次不带凭据也能认出来）；
+      * 设备票 / 匿名 / 不认识的票 → 看这台客户端登录过谁，有就归他。
+    """
+    raw = parse_authorization(headers or {})
+    info, err = authenticate(headers)
+    client_ip = (headers or {}).get("X-TF-Client") or None
+    device_id = raw.get("device_id") if raw.get("kind") == "device" else None
+    if info and info.get("kind") == "account":
+        bind_client(lookup_account(info["who"]), client_ip, device_id)
+        return info, None
+    if err == "invalid-credentials":
+        return info, err
+    acc = account_by_client(client_ip, device_id)
+    if acc is not None:
+        return {"kind": "account", "who": acc["username"].lower(),
+                "profileId": acc["profileId"]}, None
+    return info, err
+
+
 def lookup_account(username):
     with _LOCK:
         return _load(ACCOUNTS, {}).get("users", {}).get((username or "").lower())
@@ -636,7 +713,7 @@ def save_progress(headers, body, client_ip=None):
     obj = _split_body(body)
     if obj is None:
         return None, {}, "bad-body"
-    who_info, err = authenticate(headers)
+    who_info, err = resolve_identity(headers)
     if err:
         return None, {}, err
     pid, who = who_info["profileId"], who_info["who"]
@@ -750,7 +827,7 @@ def serve_progress(headers, client_ip=None):
       4. 真的什么都没有 -> 返回 None，调用方必须回 **404**（让客户端走
          onNetworkError @0x574198 分支），**绝不能回空 JSON**，否则就是清档。
     """
-    who_info, err = authenticate(headers)
+    who_info, err = resolve_identity(headers)
     if err:
         return None, None, "auth:" + err
     pid = who_info["profileId"]

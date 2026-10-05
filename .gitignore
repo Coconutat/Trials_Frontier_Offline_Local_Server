@@ -25,6 +25,9 @@ work/trials-frontier/*
 work/trials-frontier/notes/*
 !work/trials-frontier/notes/*.md
 
+# pvp docs
+pvp_docs
+
 # 原版 APK 备份（Main_APK_Backup.7z.001-011，约 318 MB）与手机截图：
 # 体积与仓库无关，且截图属于个人信息 —— 一律不入库，磁盘文件保留。
 APKS/
@@ -49,6 +52,8 @@ server/data/remember.json
 server/data/leaderboards.json
 # 筹码余额与局内票（运行期状态，重启要留住但绝不入库）
 server/data/pvp_state.json
+# 客户端绑定表（按客户端 IP / 设备 id 记住最近登录的账号；含设备地址，不入库）
+server/data/bindings.json
 # 玩家存档（真实进度，含金币 / 赛道纪录 / identifier）
 server/data/save/
 # ── 幽灵仓库（server/data/ghosts/）─────────────────────────
@@ -59,3 +64,4 @@ server/data/ghosts/store/
 server/data/ghosts/index.json
 server/data/ghosts/replays.json
 server/data/ghosts/inbox/
+
