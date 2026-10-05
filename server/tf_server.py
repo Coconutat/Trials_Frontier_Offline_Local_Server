@@ -34,6 +34,7 @@ import json
 import os
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -239,7 +240,30 @@ _TF_CONFIG_DEFAULTS = {
     },
     "weekly": {
         "track_id": 1041,
+        # 0 = 自动用本周赛道（见 _weekly_leaderboard_id）；>=1 = 显式榜 id。
+        "leaderboard_id": 0,
+        # 合成对手数量（0 = 关）、时间基准（0 = 自动取最快内置幽灵）与两侧幅度（%）；
+        # fast 只放开一点点，否则玩家永远够不到 1%（见 _weekly_fake_field）。
+        "fake_field": 0,
+        "fake_field_base_ms": 0,
+        "fake_field_fast_pct": 3,
+        "fake_field_slow_pct": 25,
+        # 每周次数上限（= left_retry_times）与用完后的冷却时长（秒）。
         "left_retry_times": 3,
+        "cooldown_seconds": 3600,
+        # 模拟翻周：1 = 假装"这一周已经结束、服务器进到下一周"（真机验奖励/敲奖杯）。
+        "week_offset": 0,
+        # 每档奖杯一次发几件（1..3）。客户端在池子里用**它自己的 rand()** 挑一件，
+        # 而那个 rand() 不播种 ⇒ 每次同一件；多给几个槽就等于多给几件（见 reward_config）。
+        "reward_slots": 1,
+        # 按档位写死池子（可选）。空 = 内置规则（第 i 档 → Reward_{v*5+i+1}）。
+        # 例：{"platinum": [3, 8, 13]} = 最高奖改发"整台车×2"那三套池子。
+        "reward_ids": {},
+    },
+    "appcfg": {
+        # `h_app_configuration` 发给 Java/DLC 的基址：请求 Host 是回环时代替成它。
+        # 留空 = 自动探测本机局域网 IP（见 _public_host / _lan_ip）。
+        "public_host": "",
     },
 }
 
@@ -446,8 +470,11 @@ def h_app_configuration(path, query, body, headers):
         重试，启动链走不到 `pvp_init`，碉堡四个面板永远转圈（2026-10-05 真机定位）。
       ⇒ 现在按请求的 Host 回显：客户端用什么地址找到我们，就让它继续用那个地址。
         真机 Host 就是 `tf_server.txt` 里那一条，所以这条路不再需要 adb reverse。
+      ★ 但**回环地址一律不发**（`_public_host`）：一旦客户端被钉在 127.0.0.1，
+        Java/DLC 与 Ubi SDK（`libplayground.so` 写死 127.0.0.1）就都得靠 adb reverse
+        才能用 —— 用户明确不要"插线才能玩"。
     """
-    host = _req_host(headers)
+    host = _public_host(headers)
     print("[appcfg] sandbox url -> http://%s/" % host, flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "configuration": {
@@ -553,8 +580,45 @@ def _req_host(headers):
     return "127.0.0.1:8000"
 
 
-def _banner_url(headers):
-    # 路径走配置（season.banner_path），方便以后把横幅换成自己的图。
+def _lan_ip():
+    """本机在局域网里的 IPv4（一次 UDP connect 取对外网卡地址，不发任何包）。"""
+    for probe in (lambda: (lambda s: (s.connect(("8.8.8.8", 80)), s.getsockname()[0])[1])(
+                      socket.socket(socket.AF_INET, socket.SOCK_DGRAM)),
+                  lambda: socket.gethostbyname(socket.gethostname())):
+        try:
+            ip = probe()
+        except OSError:
+            continue
+        if ip and not ip.startswith("127."):
+            return ip
+    return ""
+
+
+def _public_host(headers):
+    """给 `h_app_configuration` 用的基址 host —— **绝不把回环地址发出去**。
+
+    ★ 为什么必须这么做：`sandboxes[].url` 是 Java/DLC 侧的 base（客户端
+      `setserverAddress` 拿它），而 Ubi SDK 所在的 `libplayground.so` 里更是只有
+      编译期写死的 `http://127.0.0.1:8000/{version}`（该库没有运行期地址改写）。
+      以前这里是"客户端用哪个地址找到我们，就让它继续用哪个" —— 于是**只要有一次**
+      请求是从回环进来的（`tf_server.txt` 写着 127.0.0.1，或者开着 `adb reverse`），
+      Java/SDK 侧就被钉死在 127.0.0.1，**必须插线**才能玩（2026-10-05 用户报的
+      "为啥还要 adb 转发，插线可不行"）。
+      现在回环一律换成局域网 IP；想写死就配 `appcfg.public_host`。
+    """
+    host = _req_host(headers)
+    head, _, tail = host.rpartition(":")
+    if not head or not tail.isdigit():          # 没带端口（或 IPv6 字面量）就整体当 host
+        head, tail = host, "8000"
+    if head.strip("[]").lower() not in ("127.0.0.1", "localhost", "::1", "0.0.0.0", ""):
+        return host
+    override = str(cfg("appcfg", "public_host", default="") or "").strip()
+    if override:                                # 可以只写 IP，也可以写 IP:端口
+        return override if ":" in override else "%s:%s" % (override, tail)
+    return "%s:%s" % (_lan_ip() or "127.0.0.1", tail)
+
+
+def _banner_url(headers):    # 路径走配置（season.banner_path），方便以后把横幅换成自己的图。
     return "http://%s%s" % (_req_host(headers), _banner_path())
 
 
@@ -884,7 +948,8 @@ def h_profiles_query(path, query, body, headers):
         out.append({
             "profileId": pid, "userId": pid, "platformType": "ubimobile",
             "idOnPlatform": pid,
-            "nameOnPlatform": FRIEND_NAMES.get(pid, "Player" + pid[:4]),
+            "nameOnPlatform": (FRIEND_NAMES.get(pid) or _WEEKLY_FAKE_NAMES.get(pid)
+                               or "Player" + pid[:4]),
         })
     return 200, {"Content-Type": "application/json"}, {"profiles": out}
 
@@ -1344,9 +1409,15 @@ _WEEK_SECONDS = 7 * 24 * 3600
 
 def _week_index():
     """-> (week_start, week_index)。basic_info 与 config 必须给出同一个周，
-    否则客户端会认为「配置不属于当前周」而拒绝开赛。"""
-    week_start = (int(time.time()) // _WEEK_SECONDS) * _WEEK_SECONDS
-    return week_start, (week_start // _WEEK_SECONDS) & 0xFFFFFF
+    否则客户端会认为「配置不属于当前周」而拒绝开赛。
+
+    ★ `weekly.week_offset`（默认 0）是**模拟/测试**用的：设成 1 就等于"这一周已经结束、
+      服务器翻到下一周" —— 客户端于是走 `updateStateEv` 的 `w9 != w10 && lb > 0` 分支
+      → state 4 → 上一周的结算画面（敲奖杯 / 发奖）。真机验证奖励流程就靠它。
+    """
+    week = int(time.time()) // _WEEK_SECONDS + cfg_int("weekly", "week_offset", default=0)
+    week_start = week * _WEEK_SECONDS
+    return week_start, week & 0xFFFFFF
 
 
 def _weekly_track_id():
@@ -1355,6 +1426,67 @@ def _weekly_track_id():
     1041 在幽灵库里（owner 0 / 6f857655 / 99511744 都有它的幽灵），真机日志里也出现过
     `GET /public/playerstats/v1/ranking/track1041` 与 ghost_*_1041.bin。"""
     return cfg_int("weekly", "track_id", default=1041) or 1041
+
+
+def _weekly_leaderboard_id():
+    """发给客户端的 `week_settings.week_leaderboard` —— 午夜杯排行榜的**数字 id**。
+
+    客户端拿它去 `tr::OnlineLeaderboards::getLeaderboardName(char*, int)` @0x00509604 换榜名：
+    `0`→`global_stats`、`0x10000`→`global_stats_donkey`、`0x100000`→`global_stats_crazy`、
+    bits17-19 → `event_stats<N>`、其余 → `track<id>`；再按**同一个 id** 在本地
+    `LeaderboardManager` 里查这张榜。而
+    `WeeklyChallengeManager::hasLeaderboard` @0x006316fc / `getLeaderboard` @0x00634500 /
+    `getPlayerRankPercent` @0x00634548 三个函数第一件事都是 `if (id < 1) return null / -1.0f`
+    —— 所以**发 0 等于告诉客户端「本模式没有榜」**：榜区空白、`getPlayerRankPercent()`
+    返回 -1.0f ⇒ 底部 TOP 1% 条无数据、周奖杯被 `getPlayerTrophyType(-1)` 判成
+    5 = wood（最低档）；同时它仍然会用 `getLeaderboardName(0)` 的名字去拉
+    `ranking/global_stats`，所以真机日志里能看到"拉榜了但屏上没有"。
+
+    默认 0 = 自动用本周赛道（`weekly.track_id`）：赛道规则原文「每个人在午夜杯的赛道都是
+    一样的…每周的挑战都是全球性」⇒ 榜 = 本周赛道的全球榜，而服务端这张 `track<id>` 榜
+    本来就有真实行（玩家 + 内置幽灵折出来的对手，见 `_opponent_entries`），玩家自己的行也在，
+    `getPlayerRankPercent` 才能算出百分位。
+    """
+    lb = cfg_int("weekly", "leaderboard_id", default=0)
+    return lb if lb and lb > 0 else _weekly_track_id()
+
+
+def _weekly_joined(profile_id):
+    """-> `(他参加的那一周号, 那个榜 id)`；没参加过就是 None。
+
+    ★ 为什么需要它：客户端把 `basic_info` 里的
+      `(last_participated_week, last_participated_week_lb)` 原样喂给
+      `WeeklyChallengeManager::updateStateEv` @0x00631000：
+        w9 = [this+0x8c]（上次参与的周号）/ w8 = [this+0x94]（那个榜）/ w10 = [this+0x90]（本周周号）
+        w9 == -1   -> state = (w8 > 0) ? 4 : 0
+        w9 != w10  -> state = (w8 > 0) ? 4 : 2
+        w9 == w10  -> state = (w8 != 0) ? 3 : 2
+      `MenuzStateWeeklyChallenge::changeSubState` @0x007b125c 再把 state 映射成 UI 子状态
+      （跳转表 @0xb9c750：0→1、1→2、2→3、3→5、4→6），`loadSubState` @0x007b3080 的
+      UI 表 @0xb9c778 里 UI 3 = `loadJoinState`（"加入午夜杯！"那一屏）、UI 4 =
+      `loadInProgressState`（带全球榜/Next Challenger 的那一屏）。
+      于是 `lb` 恒发 0 ⇒ 永远 state 2 ⇒ 永远停在加入屏：按下按钮直接开赛，跑完又回到同一屏
+      （2026-10-05 真机复现的"加入→比赛→加入→…"循环）。
+      真实服务器在玩家加入后会把"参加过的周 + 那个榜"记下来发回，state 才会变 3/4。
+
+    ★ 周号从榜行的 `updated`（我们记下这条成绩的时刻）反推，**不是**"当前周"：
+      这样 `weekly.week_offset = 1`（模拟翻周）时报出去的仍是**上一周**，客户端的
+      `w9 != w10` 分支才成立 —— 也就是"上一周结束 → 结算/敲奖杯"那条路。
+    """
+    try:
+        board = "track%d" % _weekly_track_id()
+        rows = _load_ranked_boards().get(board) or {}
+    except Exception as exc:                 # 榜坏了也不该把周赛拖垮
+        print("[liveevent] 本周榜读取失败：%r" % exc, flush=True)
+        return None
+    row = rows.get(profile_id) if profile_id else None
+    if not row:
+        return None
+    try:
+        week = (int(row.get("updated") or 0) // _WEEK_SECONDS) & 0xFFFFFF
+    except (TypeError, ValueError):
+        week = 0
+    return (week or _week_index()[1]), _weekly_leaderboard_id()
 
 # 奖杯序号（1..5）→ `calculateReward` 用来查 reward_config 那张 map 的键名。
 # 跳转表 @0xb91880（`sub w8,w20,#1; cmp w8,#4; b.hi` 越界直接跳过）已按跳转目标
@@ -1372,6 +1504,9 @@ _WEEKLY_TROPHIES = ("platinum", "gold", "silver", "bronze", "wood")
 #   客户端每次进游戏都重发一次 `submitLastWeekData`（真机日志里成百上千次），
 #   而且 `reward_config` 的轮换方案锁死在方案 0。
 # 不落盘：客户端自己会把值存进存档，服务重启后它重报一次即可自愈。
+# ★ 唯一的例外：玩家本周已经在本周榜上留名时，`h_liveevents_basic_info` 会把
+#   `(last_participated_week, last_participated_week_lb)` 报成"本周 + 本周那个榜"，
+#   否则客户端永远算不出 state 3/4、永远停在「加入午夜杯！」那一屏（见 _weekly_joined）。
 _WEEKLY_LAST = {}          # profile_id -> (last_participated_week, last_participated_week_lb)
 
 
@@ -1422,19 +1557,29 @@ def h_liveevents_basic_info(path, query, body, headers):
         print("[liveevent] 记录上周成绩 pid=%s last=%d lb=%d" % ((pid,) + _WEEKLY_LAST[pid]),
               flush=True)
     last, last_lb = _WEEKLY_LAST.get(pid, (0, 0))
+    joined = _weekly_joined(pid)
+    if joined:
+        # ★ 榜上有名 = 参加过 —— 报"**他实际参加的那一周** + 那个榜"（周号从榜行的
+        #   `updated` 反推，见 _weekly_joined）。本周参加 ⇒ w9==w10 ⇒ state 3（已加入屏）；
+        #   服务器翻到下一周（`weekly.week_offset=1`）⇒ w9!=w10 ⇒ state 4（上周结算/敲奖杯）。
+        last, last_lb = joined
     payload = {
         "week_index": week_index,
         "week_start": week_start,
         "weeK_end": week_start + _WEEK_SECONDS,   # ★大写 K
         "last_participated_week": last,
         "last_participated_week_lb": last_lb,
-        "left_retry_times": cfg_int("weekly", "left_retry_times", default=3),
+        # 次数是服务端权威的（`start_race` 扣一次，见 _weekly_attempt_state）：
+        # 用完回 0 + last_attempt_time，客户端据此算冷却剩余（时长在 config 的
+        # `global_cooldown_time`），`skip_cooldown` / `refill_retry_count` 能补回来。
+        "left_retry_times": _weekly_left(pid),
         # 午夜杯 = 周赛：窗口 = 本周（week_start ~ week_end），一周内恒定。
         "midnight_circuit_start_time": week_start,
         "midnight_circuit_end_time": week_start + _WEEK_SECONDS,
-        "last_attempt_time": 0,
+        "last_attempt_time": _weekly_attempt_state(pid)[3],
     }
-    print("[liveevent] basic_info week_index=%s" % payload["week_index"], flush=True)
+    print("[liveevent] basic_info week_index=%s last=%d lb=%d" %
+          (payload["week_index"], last, last_lb), flush=True)
     return 200, {"Content-Type": "application/json"}, payload
 
 
@@ -1456,15 +1601,32 @@ def h_liveevents_config(path, query, body, headers):
     ⚠ 路径末段那个 %d 是客户端传进来的（周号），我们忽略即可，任何值都回同一份配置。
     """
     week_start, week_index = _week_index()
+    # ★ 路径末段是客户端要的**周号**：平时就是本周（`config/0` 是"当前周"的意思），
+    #   但翻周之后它会拿 `last_participated_week` 去要**上一周**的配置（用来渲染
+    #   刚结束那一周的成绩/结算）。以前这里一律回"本周"，于是客户端判定
+    #   "配置不属于当前周"并死循环重试（真机 2026-10-05 23:56 每秒好几次 config/2961，
+    #   界面卡在「查看进度…」）。所以：末段是合法周号且不等于本周时，按那一周回。
+    try:
+        req_week = int(path.rstrip("/").rsplit("/", 1)[-1])
+    except (AttributeError, ValueError):
+        req_week = 0
+    if req_week > 0 and req_week != week_index:
+        week_index = req_week
+        week_start = req_week * _WEEK_SECONDS
+        print("[liveevent] config 要的是第 %d 周（非本周）—— 按那一周回" % req_week,
+              flush=True)
     payload = {
         "week_index": week_index,
         "week_settings": {
             "week_start": week_start,
             "week_end": week_start + _WEEK_SECONDS,
-            "week_leaderboard": 0,
-            # 冷却/重试：给 0 冷却 + 3 次重试，避免玩家一进去就被冷却卡住
-            "global_cooldown_time": 0,
-            "global_retry_count": 3,
+            # ★ 午夜杯排行榜的数字 id（客户端自己 id→榜名，见 _weekly_leaderboard_id）。
+            #   发 0 等于「没有榜」：榜区空白 + TOP 1% / 周奖杯一起退化。默认 0 = 本周赛道。
+            "week_leaderboard": _weekly_leaderboard_id(),
+            # 冷却/重试：冷却时长与每周次数都是**规则**，实际剩余次数走 basic_info 的
+            # left_retry_times（见 _weekly_attempt_state）。
+            "global_cooldown_time": _weekly_cooldown_seconds(),
+            "global_retry_count": _weekly_retry_limit(),
             "global_gem_amount": 1,
         },
         "challenge_settings": {
@@ -1500,8 +1662,170 @@ def h_liveevents_config(path, query, body, headers):
         },
         "retry_pool": [{"retry": 1, "gems": 1}],
     }
-    print("[liveevent] config -> 赛道 %d 周号 %d" % (_weekly_track_id(), week_index), flush=True)
+    print("[liveevent] config -> 赛道 %d / 榜 id %d / 周号 %d" %
+          (_weekly_track_id(), _weekly_leaderboard_id(), week_index), flush=True)
     return 200, {"Content-Type": "application/json"}, payload
+
+
+def _weekly_opponent():
+    """本周的 Next Challenger —— 返回 `(对手标识, 他在本周赛道上的幽灵 contentId)`。
+
+    ★ 为什么必须是 **pid** 而不是显示名（真机日志 2026-10-05 23:27 实证）：
+      客户端拿到 `find_opponent` 的 `"TangoPro"` 后立刻去查那个人的成绩
+      `GET /public/playerstats/v1/stats/track1041?players=TangoPro`；而服务端的榜行
+      是按 **profileId** 存的，用显示名永远查不到 ⇒ 客户端**死循环重试**
+      （同一秒里 `find_opponent` + `stats?players=TangoPro` + `ghost/0/payload` 各刷 ~30 次）。
+      pid 两边都对得上；显示名客户端会自己用 `/v1/profiles/<pid>` 解析。
+
+    ★ `replay_id` 必须是这个对手在**本周赛道**上的幽灵 contentId：客户端拿它去
+      `GET /public/userstorage/v2/content/ghost/<id>/payload`。回 0 就是 404 再加一轮
+      死循环（日志里 `ghost/0/payload -> 404` 与上面那对请求同步出现）。
+      pid→contentId 的映射由 `_opponent_entries()` 从内置幽灵库建出来（见那里的注释）。
+
+    榜上还没有别人（或那条赛道没有内置幽灵）时回落到原来的机器人名字 + 0。
+    """
+    board = "track%d" % _weekly_track_id()
+    rows, ghosts = _opponent_entries()
+    for pid in OPPONENT_PIDS:
+        rec = (rows.get(pid) or {}).get(board)
+        cid = (ghosts.get(pid) or {}).get(board)
+        if rec and cid is not None:
+            return pid, int(cid)
+    name, _drive, _rec = _robot_opponent(_weekly_track_id())
+    return name, 0
+
+
+# ------------------------------------------------- 本周榜单的"其他玩家"（合成行）
+# ★ 为什么非要造：午夜杯的百分位是客户端自己算的
+#   （`WeeklyChallengeManager::getPlayerRankPercent` @0x00634548 → 名次/榜行数），
+#   榜上只有 3 行时最好的成绩也只能显示「前 34%」，"进全球 1%"在物理上不可能。
+#   原始服务器上有几万人，我们只有几个真实账号 —— 这块就是补这个差距的。
+# ★ 三个硬约束：
+#   1) **不落盘**：合成行只在 `_load_ranked_boards()` 的视图里，`_record_result` 走的是
+#      原始 `_load_leaderboards()`，所以 leaderboards.json 永远干净（与 OPPONENT_PIDS 同）。
+#   2) **同周内恒定**：种子 = (week_index, track_id)，重启/多进程都长一样 ——
+#      客户端会缓存名字与成绩，行一变界面就闪。
+#   3) **不进总榜**：`_aggregate_global_entries()` 跳过这些 pid，免得 120 个假人
+#      把碉堡的天梯榜也算进去（那是另一个模式的数据）。
+_WEEKLY_FAKE_NAME_POOL = (
+    # pvp.png 里那几条真名（原始服务器 2016 年的榜）+ 本机机器人名池
+    "Uschard", "Fevves", "CHG420", "Sandholm", "dnz15", "Bakerboah123", "accelman",
+) + _ROBOT_NAMES
+_WEEKLY_FAKE_NAMES = {}          # pid -> 显示名（h_profiles_query 用）
+_WEEKLY_FAKE_PIDS = set()
+_WEEKLY_FAKE_CACHE = {"key": None, "rows": {}}
+
+
+def _weekly_fake_base_ms(track):
+    """合成行的基准时间 = 这条赛道上**最快的内置幽灵**的真实成绩。
+
+    挑幽灵而不是随便编一个数：这样"跑得比内置幽灵快的人才能排前面"这件事是有依据的
+    （真机 1041：内置幽灵 25.656s / 28.577s ⇒ 基准 25656ms）。
+    """
+    board = "track%d" % track
+    rows, _ = _opponent_entries()
+    times = [int((r or {}).get("drivetime") or 0)
+             for boards in rows.values() for b, r in boards.items() if b == board]
+    times = [t for t in times if t > 0]
+    return min(times) if times else 30000
+
+
+def _weekly_fake_names():
+    """名字池：`weekly.fake_names`（数组，将来 WebUI 可改）优先，否则用内置池。"""
+    names = cfg("weekly", "fake_names", default=None)
+    if not isinstance(names, list) or not names:
+        names = list(_WEEKLY_FAKE_NAME_POOL)
+    return [str(x) for x in names if str(x).strip()]
+
+
+def _weekly_fake_field():
+    """-> {board: {pid: row}}；`weekly.fake_field` <= 0 时是空表（默认关）。
+
+    时间分布（**基准是固定的**，所以不是"水涨船高"的跑步机）：
+      `fake_field_base_ms`（0 = 自动 = 这条赛道最快的内置幽灵）为基准，
+      往快的一侧只放开 `fake_field_fast_pct`%（默认 3），往慢的一侧放到
+      `fake_field_slow_pct`%（默认 25）。
+      真机 1041：基准 25656ms ⇒ 合成行落在 24886 ~ 32070ms。
+      玩家 24.368s ⇒ 直接第一（1/123 = 0.8% = TOP 1%）；想有点挑战就把
+      fast_pct 调大（比如 8 ⇒ 最快 23604ms，得再快 3% 才第一）。
+      ⚠ 基准**不要**取玩家自己的成绩 —— 那样他一进步整个榜也跟着变，永远差那一点。
+    """
+    n = cfg_int("weekly", "fake_field", default=0)
+    if n <= 0:
+        return {}
+    track = _weekly_track_id()
+    board = "track%d" % track
+    fast = max(0, min(50, cfg_int("weekly", "fake_field_fast_pct", default=3)))
+    slow = max(0, min(200, cfg_int("weekly", "fake_field_slow_pct", default=25)))
+    base = cfg_int("weekly", "fake_field_base_ms", default=0) or _weekly_fake_base_ms(track)
+    week = _week_index()[1]
+    key = (week, track, n, fast, slow, base, tuple(_weekly_fake_names()))
+    if _WEEKLY_FAKE_CACHE["key"] == key:
+        return _WEEKLY_FAKE_CACHE["rows"]
+    rnd = random.Random("weekly-%d-%d" % (week, track))
+    pool = _weekly_fake_names()
+    week_start = _week_index()[0]
+    per_board, names = {}, {}
+    for i in range(n):
+        pid = "%08x-%04x-4%03x-8%03x-%012x" % (
+            rnd.getrandbits(32), rnd.getrandbits(16), rnd.getrandbits(12),
+            rnd.getrandbits(12), rnd.getrandbits(48))
+        name = pool[i % len(pool)]
+        if i >= len(pool):                     # 名字不够就给后缀，保证不重名
+            name = "%s%d" % (name, 10 + i // len(pool) + 1)
+        drive = max(1000, int(base * (1.0 + rnd.uniform(-fast, slow) / 100.0)))
+        per_board[pid] = {
+            "player": pid, "drivetime": drive, "submittime": week_start,
+            "data": 0, "upgrades": 0, "extradata": 0, "updated": week_start,
+        }
+        names[pid] = name
+    rows = {board: per_board}
+    _WEEKLY_FAKE_NAMES.clear()
+    _WEEKLY_FAKE_NAMES.update(names)
+    _WEEKLY_FAKE_PIDS.clear()
+    _WEEKLY_FAKE_PIDS.update(names)
+    _WEEKLY_FAKE_CACHE["key"] = key
+    _WEEKLY_FAKE_CACHE["rows"] = rows
+    print("[liveevent] 本周榜合成 %d 个对手（基准 %d ms，快 %d%% / 慢 %d%%）" %
+          (n, base, fast, slow), flush=True)
+    return rows
+
+
+# --------------------------------------------------------- 本周比赛次数（服务端权威）
+# 规则（帮助原文）：每周 3 次机会，用完进冷却，可用宝石补次/跳冷却。
+# ★ 不落盘：重启 = 新的一周重新给满次数。私有服可接受，也省掉一个要维护的状态文件；
+#   代价写在 `ponytail:` 里，将来要持久化就把它挪进 server/data/。
+# ponytail: 次数只在内存里；重启服务器会白送满次数。
+_WEEKLY_ATTEMPTS = {}            # pid -> [week_index, used, bonus, last_attempt_ts]
+
+
+def _weekly_retry_limit():
+    return max(0, cfg_int("weekly", "left_retry_times", default=3))
+
+
+def _weekly_cooldown_seconds():
+    return max(0, cfg_int("weekly", "cooldown_seconds", default=3600))
+
+
+def _weekly_attempt_state(pid):
+    """-> [week_index, used, bonus, last_attempt_ts]；跨周自动清零。"""
+    week = _week_index()[1]
+    st = _WEEKLY_ATTEMPTS.get(pid)
+    if st is None or st[0] != week:
+        st = [week, 0, 0, 0]
+        _WEEKLY_ATTEMPTS[pid] = st
+    return st
+
+
+def _weekly_left(pid):
+    st = _weekly_attempt_state(pid)
+    return max(0, _weekly_retry_limit() + st[2] - st[1])
+
+
+# pid -> 下一次 reward_config 用哪套轮换方案（3 套奖励池）。客户端挑池内那一件用的是
+# 它自己的 rand()（不播种 ⇒ 每次都同一件），所以我们只能靠"换池子"给变化 —— 见
+# h_liveevents_reward_config 的 ★★ 段。
+_REWARD_ROTATION = {}
 
 
 def h_liveevents_find_opponent(path, query, body, headers):
@@ -1514,12 +1838,14 @@ def h_liveevents_find_opponent(path, query, body, headers):
     ⚠ `"opponent"` 在 .rodata 里是 `/find_opponent` 的尾巴子串（@0xb871fe），
       别被字符串搜索误导成独立常量。
     名字必须对同一周稳定：客户端会拿它去查头像和幽灵。
+    ★ 两种"名字"的区别见 `_weekly_opponent()`：必须是 **pid**，且 `replay_id`
+      必须是他在本周赛道上的**幽灵 contentId**，否则客户端会每秒刷三十次。
     """
-    name, drive, rec = _robot_opponent(_weekly_track_id())
-    print("[liveevent] find_opponent -> %s (%d ms)" % (name, drive), flush=True)
+    player, replay_id = _weekly_opponent()
+    print("[liveevent] find_opponent -> %s (replay_id=%d)" % (player, replay_id), flush=True)
     return 200, {"Content-Type": "application/json"}, {
-        "opponent": name,
-        "replay_id": 0,
+        "opponent": player,
+        "replay_id": replay_id,
     }
 
 
@@ -1540,26 +1866,68 @@ def h_liveevents_reward_config(path, query, body, headers):
     `Reward_<n>` 的排布 = 3 个轮换方案 × 5 个奖杯，已按内容核对：
       Reward_{k*5+1} 赛道(23)   +2 服装(30)   +3 服装/摩托(8~12)
       +4 宝石/金币/金券(14)     +5 同款但更少(14)
-    轮换方案 = URL 末段 % 3（末段是客户端传的 max(last_participated_week,0)，
-    同一周内稳定不变；0 取方案 0）。
+
+    ★★ 轮换方案必须**每次下发都换**（真机 bug，User m01488：「最高奖励也只有一个地图，
+      我领取了两次是同一个地图」）：
+      `getRewardItemForSlot` 里挑池内那一件的逻辑是
+        `0x00635be8 bl rand` → `w8 = rand() % (vector_size / 0x44)`（一个 68 字节的条目）
+      也就是**用客户端的 `rand()`**。而游戏没有（或没在正确时机）`srand()`，第一次 `rand()`
+      恒为 1804289383 ⇒ `% 23 = 11` ⇒ **每次都是同一件**。
+      客户端的随机数我们改不了，能改的只有"给哪个池子" —— 所以这里按请求轮转方案
+      （`(base+k) % 3`），同一个池内下标就会落到不同内容上；`weekly.reward_slots`
+      （默认 1，可到 3）还能让一档一次给多件（每个槽 = 一个池子的一件）。
 
     ⚠ 槽对象只给一个成员会崩：parseRewardsSlot 在 0x505d7c 无条件执行
       `ldr x25, [x8, #0x10]`，x8 = first_child->next，没有兄弟成员时那里是空指针。
-      所以每个槽固定给两个等长数组。
+      所以每个槽固定给两个等长数组（`reward` 第一 + 一个同名长度的兄弟）。
     """
     try:
         n = int(path.rstrip("/").rsplit("/", 1)[-1])
     except (AttributeError, ValueError):
         n = 0
-    variant = n % 3 if n > 0 else 0
+    # 按 pid 轮转"用哪套方案打头"，保证连续几次领取/进入拿到的是不同的池子。
+    pid = _caller_profile(headers)
+    base = _REWARD_ROTATION.get(pid, n % 3 if n > 0 else 0) % 3
+    _REWARD_ROTATION[pid] = (base + 1) % 3
+    slots = max(1, min(8, cfg_int("weekly", "reward_slots", default=1)))
     payload = {}
     for i, name in enumerate(_WEEKLY_TROPHIES):
-        reward = variant * 5 + i + 1
-        payload[name] = {"reward": [reward], "n": [reward]}
-    print("[liveevent] reward_config %s -> 方案 %d %s" %
-          (path, variant, " ".join("%s=Reward_%d" % (k, v["reward"][0])
-                                   for k, v in payload.items())), flush=True)
+        ids = _reward_pool_ids(name, i, base, slots)
+        payload[name] = {"reward": ids, "n": ids}
+    print("[liveevent] reward_config %s -> 方案 %d(+%d 槽) %s" %
+          (path, base, slots, " ".join("%s=%s" % (k, v["reward"])
+                                       for k, v in payload.items())), flush=True)
     return 200, {"Content-Type": "application/json"}, payload
+
+
+def _reward_pool_ids(name, tier, base, slots):
+    """某一档奖杯这次发哪几个池子（`Reward_N` 的 N）。
+
+    默认规则：第 tier 档（0..4）= 轮换方案 `(base+k)%3` 的 `Reward_{v*5+tier+1}`，
+    与客户端本地表 `/conf/wts_rewards.txt` 的排布一致（3 套方案 × 5 档）。
+
+    `weekly.reward_ids` 可以按档位写死一组池子（数组，循环使用），例如
+      `{"platinum": [3, 8, 13], "gold": [2, 7, 12]}`
+    —— 想换"最高奖励是什么"就改这里（客户端那张表的**内容**我们改不了，能换的只有
+    给哪个池子）。内置表里可选的池子：
+      Reward_{1,6,11} 赛道/赛道碎片(23)   Reward_{2,7,12} 服装(30)
+      Reward_{3,8,13} **整台车×2**(8~12)  Reward_{4,9,14} 宝石/改件/金币/黄金票
+      Reward_{5,10,15} 上一档的小号版本
+    """
+    custom = (cfg("weekly", "reward_ids", default=None) or {})
+    pool = custom.get(name) if isinstance(custom, dict) else None
+    ids = []
+    if isinstance(pool, list):
+        for raw in pool:
+            try:
+                val = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= val <= 15:
+                ids.append(val)
+    if not ids:
+        return [((base + k) % 3) * 5 + tier + 1 for k in range(slots)]
+    return [ids[(base + k) % len(ids)] for k in range(slots)]
 
 
 def h_liveevents_accept(path, query, body, headers):
@@ -1582,6 +1950,33 @@ def h_liveevents_accept(path, query, body, headers):
       只是走 POST + cmd 0x7f。所以由 `h_liveevents_basic_info` 一并覆盖。
     """
     b = _json_body(body)
+    pid = _caller_profile(headers)
+    tail = path.rstrip("/").rsplit("/", 1)[-1]
+    # 比赛次数（服务端权威）：start_race 扣一次、skip_cooldown 补满、
+    # refill_retry_count 按客户端报的 retry_times 加次数（见 _weekly_attempt_state）。
+    if tail == "start_race":
+        st = _weekly_attempt_state(pid)
+        if _weekly_left(pid) > 0:
+            st[1] += 1
+            st[3] = int(time.time())
+            print("[liveevent] start_race pid=%s 用掉第 %d 次，剩 %d" %
+                  (pid, st[1], _weekly_left(pid)), flush=True)
+        else:
+            print("[liveevent] start_race pid=%s 次数已用完（未扣）" % pid, flush=True)
+    elif tail == "skip_cooldown":
+        st = _weekly_attempt_state(pid)
+        st[1], st[2] = 0, 0
+        print("[liveevent] skip_cooldown pid=%s -> 次数补满 %d" % (pid, _weekly_left(pid)),
+              flush=True)
+    elif tail == "refill_retry_count":
+        try:
+            extra = int(str(b.get("retry_times", 1)))
+        except (TypeError, ValueError):
+            extra = 1
+        st = _weekly_attempt_state(pid)
+        st[2] += max(1, min(9, extra))
+        print("[liveevent] refill_retry_count pid=%s +%d -> 剩 %d" %
+              (pid, extra, _weekly_left(pid)), flush=True)
     print("[liveevent] %s %s <- %s -> data:[]" % (path, query, b), flush=True)
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
@@ -3650,6 +4045,9 @@ def _load_ranked_boards():
     for pid, boards in rows.items():
         for board, row in boards.items():
             db.setdefault(board, {}).setdefault(pid, row)
+    # ★ 合成的"其他玩家"（午夜杯榜单）同样只在视图里，不落盘 —— 见 _weekly_fake_field。
+    for board, entries in _weekly_fake_field().items():
+        db.setdefault(board, {}).update(entries)
     return db
 
 
@@ -3848,7 +4246,11 @@ def h_result_stats(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"data": []}
 
 
-GLOBAL_LEADERBOARDS = {"global_stats", "global_stats_donkey"}
+# ★ crazy 也在这套里：客户端 `OnlineLeaderboards::getLeaderboardName` @0x00509604 的
+#   id 空间里 `0x100000 → "global_stats_crazy"`（与 0 → global_stats、0x10000 → donkey
+#   并列），少一个它就会被当成普通 `track<N>` 榜去聚合/落库，对它的成绩上报还会吃
+#   `400 invalid-track`（h_result_stats 只认 `track[0-9]+`）。
+GLOBAL_LEADERBOARDS = {"global_stats", "global_stats_donkey", "global_stats_crazy"}
 
 
 def _aggregate_global_entries():
@@ -3860,6 +4262,10 @@ def _aggregate_global_entries():
         if board in GLOBAL_LEADERBOARDS or not board.startswith("track"):
             continue
         for profile_id, row in (records or {}).items():
+            # ★ 午夜杯榜单里的合成对手不进总榜：那是碉堡的天梯，混进 120 个假人
+            #   会把另一套玩法的名次彻底弄乱（合成行由 _weekly_fake_field 产生）。
+            if profile_id in _WEEKLY_FAKE_PIDS:
+                continue
             try:
                 drivetime = int(row.get("drivetime", 0))
             except (TypeError, ValueError):
