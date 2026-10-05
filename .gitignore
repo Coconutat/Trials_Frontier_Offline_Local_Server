@@ -25,6 +25,10 @@ work/trials-frontier/*
 work/trials-frontier/notes/*
 !work/trials-frontier/notes/*.md
 
+# 原版 APK 备份（Main_APK_Backup.7z.001-011，约 318 MB）与手机截图：
+# 体积与仓库无关，且截图属于个人信息 —— 一律不入库，磁盘文件保留。
+APKS/
+
 # 历史遗留：误展开的变量目录（$*）
 /$*/
 

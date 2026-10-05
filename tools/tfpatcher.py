@@ -117,8 +117,12 @@ def find_build_tools(explicit):
             if os.path.isdir(bt):
                 for d in sorted(os.listdir(bt), reverse=True):
                     cands.append(os.path.join(bt, d))
-    # 本项目开发机上的固定位置，作为最后的兜底
-    cands.append(r"C:\Users\<user>\AppData\Local\Android\Sdk\build-tools\36.0.0")
+    # 兜底：各平台默认安装点（不写死用户名）
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        cands.append(os.path.join(local, "Android", "Sdk", "build-tools", "36.0.0"))
+    cands.append(os.path.expanduser(os.path.join("~", "Library", "Android", "sdk",
+                                                  "build-tools", "36.0.0")))
     for c in cands:
         if c and os.path.isfile(os.path.join(c, "zipalign.exe" if os.name == "nt"
                                             else "zipalign")):

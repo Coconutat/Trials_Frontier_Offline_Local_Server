@@ -18,7 +18,13 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
-$BT = 'C:\Users\<user>\AppData\Local\Android\Sdk\build-tools\36.0.0'
+if (-not $SkipSign -and [string]::IsNullOrEmpty($StorePass)) {
+  throw "未提供签名口令。请设 `$env:TF_STOREPASS，或显式传 -StorePass。"
+}
+
+# Android SDK 位置：优先 $env:ANDROID_HOME，否则用本机默认安装点（不写死用户名）
+$sdk = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
+$BT = Join-Path $sdk 'build-tools\36.0.0'
 $unaligned = "tmp\build\tf-$Name-unsigned.apk"
 $aligned   = "tmp\build\tf-$Name-aligned.apk"
 $final     = "tmp\build\tf-$Name.apk"

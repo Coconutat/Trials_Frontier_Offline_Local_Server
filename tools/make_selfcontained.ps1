@@ -30,9 +30,15 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $env:JAVA_TOOL_OPTIONS = '-Duser.language=en -Duser.country=US'
 
-$BT   = 'C:\Users\<user>\AppData\Local\Android\Sdk\build-tools\36.0.0'
-$AJ   = 'C:\Users\<user>\AppData\Local\Android\Sdk\platforms\android-37.0\android.jar'
-$ZULU = 'C:\Program Files\Zulu\zulu-25\bin'
+if (-not $SkipSign -and [string]::IsNullOrEmpty($StorePass)) {
+  throw "未提供签名口令。请设 `$env:TF_STOREPASS，或显式传 -StorePass。"
+}
+
+# Android SDK / JDK 位置：优先环境变量，否则用本机默认安装点（不写死用户名）
+$sdk  = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { Join-Path $env:LOCALAPPDATA 'Android\Sdk' }
+$BT   = Join-Path $sdk 'build-tools\36.0.0'
+$AJ   = Join-Path $sdk 'platforms\android-37.0\android.jar'
+$ZULU = if ($env:JAVA_HOME) { Join-Path $env:JAVA_HOME 'bin' } else { 'C:\Program Files\Zulu\zulu-25\bin' }
 
 $OLDAPP = 'com.ubisoft.redlynx.trialsgo.DexApplicationClass'
 $NEWAPP = 'com.ubisoft.redlynx.trialsgo.OfflinePayloadSetup'
