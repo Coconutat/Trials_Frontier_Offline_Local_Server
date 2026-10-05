@@ -30,6 +30,22 @@ Matching machinery: `tmp\match_paths.py` (hash every candidate path string from
 `tmp\libTrialsGo.strings.txt` and compare against the container table) — 167 of 2494 entries named.
 The extraction driver is `tmp\make_itemids.py`; raw dumps are in `tmp\packout\itemids_report.txt`.
 
+### 已知数据瑕疵：`dailyrewards.txt` 有一处 JSON 语法错误（原厂 typo）
+
+一次性把 8 张配置表全部 dump 出来验证时（条目 **#10** `dailyrewards`、**#49** `wts_rewards`、
+**#8** `dailyquestrewards`、**#9** `dailyquesttasks`、**#2232–2235** `state_pvp_*`），
+**解包/解压 0 失败**，但 `/conf/dailyrewards.txt` 的**第 993 行少一个逗号**：
+
+```
+"ItemAmount":1	<-- 这里缺 ','	"Fallback":2
+```
+
+⇒ `json.loads` 直接报 `Expecting ',' delimiter`。**这不是我们解包或解压的问题，是 RedLynx 自己发出去的数据有 typo**（其余各表均可正常解析）。
+
+* **影响**：任何"把 `content.dat` 全表 dump 成 JSON 再 diff / 校验"的工具必须对这一行容错，否则脚本会挂在这一张表上。
+* **落地**：写解析器时按行正则补齐或对该表单独 try/except。
+* 复现：`tmp\packout\all\` 里对应 `<idx>_<hash>.bin` **本身就是解好的明文**，直接复制改名即可；要重放容器则用 `datapack::DataFilePack`（`tmp\obb\content.dat`，magic `dbf7dddb`）按表记录取 blob，`flag==1` 时 `zlib.decompress`（配方已由 `tmp\verify_pack_recipe.py` 验证 SHA256 一致）。文件名后缀 = `getHashCode(path)`，据此反查条目号。
+
 The `ITEM_TYPE` enum (235 values) was decoded from the jump table of
 `MissionEditorTexts::getNameForItemType(ITEM_TYPE)` @ `0x437458` in `tmp\extract\libTrialsGo.so`.
 

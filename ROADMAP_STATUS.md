@@ -1,7 +1,7 @@
 # ROADMAP 进度与任务规划
 
 > 对应根目录 [`ROADMAP.md`](ROADMAP.md)。本文档记录每一条的**当前完成度、证据、缺口、下一步动作**。
-> 最后更新：2026-10-04 22:40（设备 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa`）
+> 最后更新：2026-10-05（真机 `<设备序列号>` / 小米 8 / LineageOS 22.2 `ursa` ＋ 模拟器 `emulator-5554` / Android 14 / x86_64）
 
 ---
 
@@ -797,6 +797,53 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 
 ---
 
+## 7. 下一步规划（2026-10-05 盘点）
+
+> ROADMAP 那五条讲的是**做什么**，这一节讲**先做哪个、为什么现在能做**。
+
+### P0 · 收口（不用等任何人）
+
+| # | 事项 | 现状 / 依据 |
+| --- | --- | --- |
+| 1 | **真机复验「比赛幽灵」按钮** | 服务端已修：`h_replay_id` @ `server/tf_server.py:2713` 现在按 `pid + track` 查对手表并回 `{"replay_id": N}`（N≥1 客户端才会点亮按钮）。**只差用户在真机上点一次**。 |
+| 2 | 私服规则数值**改照史料填** | `work/trials-frontier/notes/online-rules-evidence.md` 落地后，「赛季多长 / 榜截断多少 / 门票怎么消耗」从**自己编**变成**有出处**（见 P1-4）。 |
+| 3 | 后台服务器 | 已在跑：`python server\tf_server.py --host 0.0.0.0 --port 8000`（`/public/timeservice/v1/time` 实测 HTTP 200 `{"data": []}`）。 |
+
+### P1 · ROADMAP §3「在线功能完善」的剩余缺口
+
+| # | 事项 | 卡在哪 / 怎么解 |
+| --- | --- | --- |
+| 4 | `limited_purchases` 的 `product_id` | **`.so` 里只有 product_id 字符串，没有 bundle id ↔ 具体礼包的映射**（`targeting-v1.md` §9）。两条路：运行时 dump，或在真机上抓一次**真实**的 `receiptvalidation/v1/product/configuration` 响应。**在此之前商店里不会出现礼包**（`h_iap_products` 回空数组）。 |
+| 5 | 午夜杯 / 限时活动的**运营参数** | 现在有出处了：赛季长度 **S1 = 59 天（2014-12-12→2015-02-09）→ S83 = 28 天（2021-03-22→2021-04-19）**；榜截断 **PvP 前 10 000 / Global 前 30 000**；**KTM Rally = 4 个 leg、间隔约 7 天、每赛道只取前 3 000**；**Golden Ticket = PvP 排名赛的入场消耗品**；**Midnight Club = 编号每周轮次**（服务器 `event/22`）；事件编号 `/event/1…/event/123+`，多 leg 为 2–6。全部带 URL + 原文。 |
+| 6 | 事件/赛季**具体数值**仍缺的那些 | 史料明确查不到（`online-rules-evidence.md` §5）：Legend 以下的段位名、晋升星数、ticket 发放与恢复节奏、**PvP 赛后金币/宝石量级**、芯片收支速率、每日登录奖励链、每日任务结构、限时礼包内容。⇒ 这些**只能我们自己定**，且应当交给 WebUI（见 P2）。 |
+| 7 | `dlcontent_frontier_android/794/info.json` 是否要给真内容 | 未定。仓库里目前只有 `tmp/cdn/frontieronlinecontent.zip`（305 198 B）。 |
+
+### P2 · ROADMAP §4「WebUI 管理界面」
+
+| # | 事项 | 说明 |
+| --- | --- | --- |
+| 8 | 管理界面 | 注册页 + 管理 API 已起头。有了 P1-5/6 的分工，**赛季长度、榜截断、leg 数、门票消耗这些正好按 §4 的 ★ 决策记录做成 WebUI 可调项** —— 那些"史料查不到"的数值本来就该是运营参数。 |
+
+### P3 · ROADMAP §5「一键开服打包成 exe」
+
+| # | 事项 | 说明 |
+| --- | --- | --- |
+| 9 | 打包 exe | 未开始。 |
+
+### P4 · 悬而未决 / 需要用户输入
+
+| # | 事项 | 需要什么 |
+| --- | --- | --- |
+| 10 | **Data Cube 为什么在赛道里看不见**（m01917） | **已定论的部分**：它是**常驻本地 10 环剧情链 `MISSION_362–371`**（PANDORA'S CUBE / HIDDEN DATA / IMPACT / INVESTIGATION / DISCOVERY / UTOPIA / DIVISION / DOWNFALL / PANIC ROOM / THE DARK MACHINE），文本**全部由客户端 loc 表本地提供**；`.so` 里**没有方块位置表**。用户存档 `missions2.solved` 里 **362/363/365/366/367 已经 solved** ⇒ 这条链在这个档上已经走了 5 环。`missions2.available` 是 `(group<<16)\|mask` 位掩码、只覆盖 mission 0–191，方块任务不在其中（说明它们不是任务大厅里可选的剧情任务）。<br>**缺的是用户回答**：这个存档是**原版带过来的**，还是**在私服新开的**？若是带过来的 ⇒ 已收集的方块按设计**永久消失**，当前表现就是正确的。 |
+| 11 | 在模拟器上跑一遍在线功能 | 服务器已在后台跑（`0.0.0.0:8000`）。**模拟器访问宿主机必须用 `10.0.2.2`**，即 `/sdcard/Android/data/com.ubisoft.redlynx.trialsfrontier.ggp/files/tf_server.txt` 里应写 `10.0.2.2:8000`（真机则写宿主机的局域网 IP）。 |
+
+### 附：本轮清掉的垃圾（2026-10-05，共释放 1742.3 MB）
+
+- 删 `$e/` —— **1229 文件 90.6 MB**，一份完整 APK 解包，是某次 PowerShell 变量重定向事故的产物（`.gitignore` 里的 `/$*/` 规则早就把它标注为「历史遗留」）。
+- 删 `tmp/build/` 下全部 `*-unsigned.apk` 与 `*-aligned.apk` 共 41 个 —— **1.65 GB** 纯中间产物。**保留 `tmp/build/tf-m16.apk`**，因为 `tools/make_selfcontained.ps1` 拿它当 `$Base`。
+
+---
+
 ## 附：当前交付物
 
 | 路径 | 说明 |
@@ -809,6 +856,12 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 | `tools/tf_redirect_mount.sh` | 把 `files/` 绑定挂载到 `/sdcard/Android/data/<pkg>/files`（幂等，见 §6） |
 | `tools/tf_redirect_unmount.sh` | 卸载绑定并把游戏数据搬回私有目录（回滚用，见 §6） |
 | `tmp/build/tf-m8-release-backup.apk` | 上一版发布基线备份（无 IAP 补丁） |
+| `dist/TrialsFrontier-offline-full.apk` | **全自包含离线版（推荐给普通用户）**：336 531 425 字节，SHA-256 `4A76FAA832C643E7ED344E6A27F2D5DEE987481A40363F02F8BA1F1D6FE049FA`。DL 内容 + OBB 都在包内，首启由 app 自己解包进 `/data/data` 与 `/sdcard`，**不需要 adb、不需要 root、不依赖服务器**。原理见 `work/trials-frontier/notes/selfcontained-apk.md` |
+| `dist/TrialsFrontier-offline-full-说明.md` | 上面那个包的安装说明（怎么装 / 限制 / 改 IP / 校验） |
+| `dist/TrialsFrontier-clean-pack.7z` | 干净整合包（APK + OBB + data 区、无存档），给**有 root / 用 adb** 的人；347 128 628 字节，SHA-256 `41AB9DD206A9F4C1C793B42743D6D7F3DEBBF8AFA5A77CF1F7477C331B95B2DC` |
+| `tools/make_selfcontained.ps1` | 打全自包含 APK 的流水线：换 Application 名 → javac+d8 出 `classes4.dex` → 生成 `payload.txt` → `build_apk --add` → `zipalign -p -f 4` → `apksigner` |
+| `tools/apkpayload/OfflinePayloadSetup.java` | 首启自解包类（`extends DexApplicationClass`，只覆盖 `onCreate`），随包进 `classes4.dex` |
+| `work/trials-frontier/notes/*.md` | 逆向与情报笔记：`selfcontained-apk.md`（打包原理 + 两个坑）、`online-rules-evidence.md`（赛季/事件史料，带出处）、`real-server-samples.md`（全仓库唯二的真实服务器样本）、`web-research-toolkit.md`（本机抓取方法） |
 
 ### 构建流水线
 ```

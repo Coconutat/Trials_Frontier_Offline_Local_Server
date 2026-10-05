@@ -36,6 +36,9 @@ def main():
     ap.add_argument("--replace", action="append", default=[],
                     metavar="APK内路径=本地文件",
                     help="用本地文件替换包内某个条目（可重复）")
+    ap.add_argument("--add", action="append", default=[],
+                    metavar="APK内路径=本地文件",
+                    help="往包里加一个新条目，以 store 方式压缩（可重复）")
     ap.add_argument("--drop-prefix", action="append", default=[],
                     metavar="前缀",
                     help="丢弃该前缀下的所有条目（可重复）")
@@ -53,6 +56,17 @@ def main():
             print("找不到替换用的文件: %s" % local)
             return 2
         replacements[inner] = local
+
+    additions = []
+    for spec in args.add:
+        if "=" not in spec:
+            print("--add 需要写成 包内路径=本地文件 的形式: %s" % spec)
+            return 2
+        inner, local = spec.split("=", 1)
+        if not os.path.isfile(local):
+            print("找不到要加入的文件: %s" % local)
+            return 2
+        additions.append((inner, local))
 
     for p in args.drop_prefix:
         if p.startswith("/") or ".." in p:
@@ -90,15 +104,36 @@ def main():
                 new.create_system = info.create_system
                 zout.writestr(new, payload)
 
+            # 新加的条目：一律 store（体积已经在 APK 里，且 store 条目才能被 zipalign 对齐
+            # 到 4 字节边界，AssetManager.openFd 才肯 mmap 它）
+            added_names = []
+            for inner, local in additions:
+                with open(local, "rb") as f:
+                    payload = f.read()
+                new = zipfile.ZipInfo(inner, date_time=(1980, 1, 1, 0, 0, 0))
+                new.compress_type = zipfile.ZIP_STORED
+                new.external_attr = 0o100644 << 16
+                new.create_system = 0
+                zout.writestr(new, payload)
+                added_names.append(inner)
+
     missing = set(replacements) - replaced_names
     if missing:
         print("这些要替换的条目在原包里不存在: %s" % ", ".join(sorted(missing)))
+        return 2
+
+    dup = set(n for n, _ in additions) & set(info.filename for info in infos)
+    if dup:
+        print("这些要新增的条目在原包里已经存在: %s" % ", ".join(sorted(dup)))
         return 2
 
     print("基础包 : %s (%d 字节)" % (args.base, os.path.getsize(args.base)))
     print("输出   : %s (%d 字节)" % (args.out, os.path.getsize(args.out)))
     for name in sorted(replaced_names):
         print("  替换 %-45s <- %s" % (name, replacements[name]))
+    for name in added_names:
+        print("  新增 %-45s <- %s (%d 字节)"
+              % (name, dict(additions)[name], os.path.getsize(dict(additions)[name])))
     for name in dropped_names:
         print("  丢弃 %s" % name)
     return 0

@@ -2,6 +2,7 @@
 *.apk
 
 # workspace（构建中间产物 / 反编译输出 / 交付包）
+_research
 tmp
 dist/*
 # 交付包里的说明文档值得入库，其余（APK、patcher、server 副本）不入库
@@ -24,8 +25,8 @@ work/trials-frontier/*
 work/trials-frontier/notes/*
 !work/trials-frontier/notes/*.md
 
-# 历史遗留：误展开的变量目录（$t/ANDROID.RSA）
-/$t/
+# 历史遗留：误展开的变量目录（$*）
+/$*/
 
 # Python 缓存
 __pycache__/
