@@ -47,6 +47,8 @@ server/data/sessions.json
 server/data/devices.json
 server/data/remember.json
 server/data/leaderboards.json
+# 筹码余额与局内票（运行期状态，重启要留住但绝不入库）
+server/data/pvp_state.json
 # 玩家存档（真实进度，含金币 / 赛道纪录 / identifier）
 server/data/save/
 # ── 幽灵仓库（server/data/ghosts/）─────────────────────────

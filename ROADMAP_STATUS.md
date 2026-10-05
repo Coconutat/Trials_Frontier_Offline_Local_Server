@@ -805,7 +805,7 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 
 | # | 事项 | 现状 / 依据 |
 | --- | --- | --- |
-| 1 | **真机复验「比赛幽灵」按钮** | 服务端已修：`h_replay_id` @ `server/tf_server.py:2713` 现在按 `pid + track` 查对手表并回 `{"replay_id": N}`（N≥1 客户端才会点亮按钮）。**只差用户在真机上点一次**。 |
+| 1 | **真机复验「比赛幽灵」按钮** | 服务端已修并**离线复验**：`h_replay_id` 查不到对手时改为回 `{"replay_id": 1}`（客户端 cmd 14 是 `cmp w20,#1; b.lt` 硬失败，<1 就永远是灰的）；`GET /public/resultservice/v1/replaydata?track_id=N` 现在按 `pid + track` 回 `{"content_id": N}` 让客户端**更新已有**幽灵而不是每场新建。**只差用户在真机上点一次**。 |
 | 2 | 私服规则数值**改照史料填** | `work/trials-frontier/notes/online-rules-evidence.md` 落地后，「赛季多长 / 榜截断多少 / 门票怎么消耗」从**自己编**变成**有出处**（见 P1-4）。 |
 | 3 | 后台服务器 | 已在跑：`python server\tf_server.py --host 0.0.0.0 --port 8000`（`/public/timeservice/v1/time` 实测 HTTP 200 `{"data": []}`）。 |
 
@@ -841,6 +841,47 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 
 - 删 `$e/` —— **1229 文件 90.6 MB**，一份完整 APK 解包，是某次 PowerShell 变量重定向事故的产物（`.gitignore` 里的 `/$*/` 规则早就把它标注为「历史遗留」）。
 - 删 `tmp/build/` 下全部 `*-unsigned.apk` 与 `*-aligned.apk` 共 41 个 —— **1.65 GB** 纯中间产物。**保留 `tmp/build/tf-m16.apk`**，因为 `tools/make_selfcontained.ps1` 拿它当 `$Base`。
+
+---
+
+## 8. 第二轮修复（2026-10-05，用户 m02863 提的四项）
+
+> 依据来自两个只读逆向子代理的报告 + 真机（小米 8 `<设备序列号>`）实测，全部端点契约已按反汇编逐条核对。
+
+### 8.1 碉堡（PVP）筹码：总量不保存
+
+- **根因**：账号级筹码与局内票**从来没落盘**，每次重启都从 `cfg_int("chips","start")` 重来；「从 0 涨到 1 或 3」是 `_pvp_chips_for()` 按**已解锁赛道数**的产出曲线在跑（实测 ≈1 枚/92 秒 = 3600 ÷ 39 条赛道），产出逻辑本身没错。
+- **改动**：`server/tf_server.py` 新增 `_pvp_state_load/_pvp_state_save` + `PVP_STATE_PATH`，落 `server/data/pvp_state.json`（已加进 `.gitignore:51`）。
+- **补偿**：`tf_config.json` 里 `chips.bonus = 114514`，每个账号**只发一次**（`bonus_done` 一起落盘）。真人账号已是 114514，人机 `44444444-…` 保持 `chips.bot_start = 500`。
+- 用户对两个数的区分（原话 m02863）：「碉堡界面那个筹码是货币，对局那个是争夺工资」—— 代码里本来就分开：`_pvp_chips`（账号级货币，商店消费）与 `_pvp_match_chips`（局内曲线）。
+
+### 8.2 碉堡进去转圈
+
+- **根因**：`GET /public/pvp_matches/v1/players?profiles=…` 原来回 `{"data": []}`（**对象**），而 `parseFriendLeaderboard @0x4fe88c` 第一句就是 `ldr w8,[x1,#0x30]; cmp w8,#2; b.ne` ⇒ **根必须是 JSON 数组**，对象直接短路，界面永远转圈。
+- **改动**：新增 `h_pvp_players`（按 `profiles` 切 CSV 去重，逐条 `_pvp_player_info()` + `profile_id`，**直接返回列表**），路由从 `h_pvp_accept` 改指它。
+- **踩坑**：动态处理器的 `query` 参数是**原始查询字符串**不是 dict，必须 `dict(parse_qsl(query or ""))`。
+- **真机验证**：`tmp/shot1.png` —— 碉堡完整加载，25 级徽章、赛季奖励轨道、左下角筹码 **114514**，转圈消失。
+
+### 8.3 幽灵挑战 / 上传 / 下载
+
+- **挑战（按钮灰）**：`h_replay_id` 命中不到时回 `{"data": []}` → 客户端 `cmp w20,#1; b.lt` 判 err=7。改为「先跨赛道兜底 `ghost_any()`，再不行回 `{"replay_id": 1}`」。
+- **上传（每场 +1 条）**：`replaydata?track_id=N` 被设成永远回空，而客户端 cmd 13 正是用它的 **`"content_id"`（snake_case）@0xb87d85** 决定「更新已有」还是「新建」。改为按 `pid + track` 查本人幽灵并回 `{"content_id": N}`。
+- **下载（12 字节 JSON 当幽灵喂引擎）**：cmd 15/16/18 分支有 `cmp w8,#0x65; b.lo`，**响应体必须 ≥101 字节**；改为无幽灵时 **404 + 空体**。`h_ghost` 兼容**单数 `player`**（`pvp_replaydata`/`robot_replaydata` 发的就是单数）。
+- **形状不符**：search 的 `metadata` 补 `size`（cmd 28 `size < 1` 直接失败）、补 `pvpid` 过滤、`get_ghost` 的 `players` 当 owner 过滤（**只有非 PVP**）、`GET /content/ghost/<id>` 补顶层 `profileId`。
+- **赛道号掩码**：以前只在查询侧掩 `&0xFFFF`、写入侧原样存，index.json 里 `51:8389649` 与 `1:1041` 混存。现在**在存储边界掩**（`mask_track` + `_migrate_ghost_records`），迁移后 `track_id > 0xFFFF` 的记录数 = 0。
+- **真机验证**：`PUT /public/userstorage/v2/content/ghost/67/payload`（2063 B，头 `03 00 00 00`）+ `PUT /content/ghost/67`（body 无 `track_id`，与 `createMetaData` 的 `w5==-1` 分支一致），落库 `cid 67 / track 1315 / size 2063`。`GET …/replaydata?track_id=1315` → `{"content_id": 67}`（复用），无幽灵赛道 → `{"data": []}`（新建）。
+
+### 8.4 午夜杯（= 周赛）规则
+
+- **时间窗滑动**：服务端原来给 `now-3600 ~ now+24h`，而客户端把这对时间戳写进**物品 1165 / 1166**（实测：槽位 = `base_id*5 + variant`，即 `getItemCount(233,0/1)`；`base 234 → 1170 = 5` 与 `item_names.tsv` 的 `234='Rally Tickets'` 吻合可佐证）。存档 history 里 `1166-1165` 恒为 **90000** 且两端一起前移 ⇒ 倒计时永不减少。**改为按 epoch 周钉死**为 `week_start ~ week_start+604800`，且与 `config` 的 `week_end` 一致（此前两者矛盾：`ChallengeConfig::getRemainingTime @0x62f358` = `week_end + mc_challenge_end_extra_time`，后者实测 = **10**）。
+- **`last_participated_week` 回 0**：新增进程内 `_WEEKLY_LAST`，**记住客户端 POST 上来的值再原样还回去**（服务端不产生它）。以前一直回 0 ⇒ `updateLastWeekIndex @0x6335cc` 永远满足 `w8 < 1` 而反复重发。两种 POST body 都接（`{"additional_retry":%d}` @0xb87596 / 带 `last_participated_week` 的 @0xb87465）；`additional_retry` 是客户端本地装扮加成（`getCurrentChallengeRetryBonus`，本机算 256）、**不可信，直接丢弃**。
+- **物品 233 / 125 不需要服务端下发**（原子代理建议已作废）：物品由客户端自己上传、服务端只存不产。存档实测 `getItemCount(125,2)`（槽位 627）= **1**，`canEnterEv @0x7b26c4` 的门是过的。
+- **决定不做的三件**：①`left_retry_times` 递减（`+0x258` 读者扫出 240 处无法区分栈偏移，`checkCooldownValidity` 机制上不该锁死，用户也没抱怨）②BUG-10（robot 对手名/time 绑定，现有 `ghost_any_for_track` 兜底实际能对上）③BUG-11（`h_ghost_upload` 死代码）。`reward_config` 也**保持每槽 1 条**（改成 12~31 条是对 pair 语义的猜测，有崩栈风险）。
+- **代码顺带**：`weekly.window_hours` / `weekly.task` 两个失效配置键删掉；`_WEEKLY_TRACK_ID` 常量改成 `_weekly_track_id()`（读 `weekly.track_id`，热加载）。
+
+### 8.5 仍未收敛的一条
+
+`POST basic_info` 在真机上**每次 `GET basic_info` 后面都跟一次**（两种 body 交替），即使服务端已回 `last_participated_week = 2961 == week_index`。逐条量时间后确认**不是风暴**：00:46–00:59 只有 10 次、13:19 与 13:24 各一次，节奏 = 每次进界面/回前台一次。所以 `updateLastWeekIndex` 的 `w8 == week_index → 不发` 不是唯一触发点，`submitLastWeekData` 另有调用者。**暂不处理**（无害，且 `last_participated_week` 现在能正确往返）。
 
 ---
 
