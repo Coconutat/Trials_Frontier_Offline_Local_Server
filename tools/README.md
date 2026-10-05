@@ -36,8 +36,9 @@ python tools/tfpatcher.py --apk 原版.apk --out TrialsFrontier-offline.apk
 第一行 = <PC 的 IP>:8000
 ```
 
-原版 APK 在仓库里是 `APKS/特技摩托前线/Main_APK_Backup.7z.001…011`（11 卷、318 MB），
-解出来的内嵌 APK 会被流水线当作 base。
+原版 APK 原本以 `APKS/特技摩托前线/Main_APK_Backup.7z.001…011`（11 卷、318 MB）入库，
+现已从版本控制移出（体积 + 截图属个人信息，见 `.gitignore` 的 `APKS/` 规则），
+但**磁盘上仍在**，解出来的内嵌 APK 依旧被流水线当作 base。
 
 ---
 
@@ -335,7 +336,7 @@ python tools/re/locdump.py key M_RACE_GHOST # english 'Race Ghost'
 
 | 路径 | 是什么 | 入库？ |
 |---|---|---|
-| `APKS/特技摩托前线/Main_APK_Backup.7z.001…011` | 原版 APK（分卷 7z，318 MB） | ✅ |
+| `APKS/特技摩托前线/Main_APK_Backup.7z.001…011` | 原版 APK（分卷 7z，318 MB） | ❌ 已移出版本控制（`.gitignore`），磁盘保留 |
 | `server/data/ghosts/<track>/*.bin` | 游戏自带静态幽灵文件 | ✅ |
 | `tmp/` | 反编译树、解包产物、解出来的 `.so`、基线库 | ❌ 4.6 GB，`.gitignore` 排除 |
 | `tmp/libcmp/orig-libTrialsGo.so` | **RE 基线库**（未打补丁的原版库），上面所有 `tools/re/` 例子都用它 | ❌ |
@@ -344,7 +345,7 @@ python tools/re/locdump.py key M_RACE_GHOST # english 'Race Ghost'
 要让 `tools/re/` 的工具跑起来，先准备一份基线库：
 
 ```bash
-# 从仓库里的原版 APK 解出来
+# 从本地保留的原版 APK 备份解出来（该目录已不入库，需自己备份一份）
 7z x APKS/特技摩托前线/Main_APK_Backup.7z.001 -o tmp/extract
 # 或者直接取内嵌 APK 里的库
 ```
