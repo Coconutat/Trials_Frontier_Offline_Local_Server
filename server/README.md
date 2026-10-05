@@ -229,15 +229,35 @@ python -m unittest discover -s tests -v
 * 机器人成绩 = 玩家成绩 × `bot_time_margin_pct` + `bot_time_margin_ms`（默认 1.018 / 400ms）。
 * 赛季星星曲线 `season.star_array` 是 25 级天梯，`chip_equation_x/y` 决定筹码结算。
 
-### 5.5 限时活动 / 周赛（`liveevents/v1/weekly_track_system`）
+### 5.5 限时活动 / 午夜杯（`liveevents/v1/weekly_track_system`）
 
 `config/<week_index>`、`basic_info`(GET+POST)、`find_opponent`、`reward_config/<n>`、
 `start_race` / `end_race` / `skip_cooldown` / `refill_retry_count`（后四个都进 `h_liveevents_accept`）。
 
-* 周赛固定跑 `weekly.track_id`（默认 1041），`_week_index()` 按 7 天一个窗口算。
+* 周赛固定跑 `weekly.track_id`（默认 1041）；`_week_index()` 按 7 天一个窗口算，
+  `weekly.week_offset` 把「本周」整体推后 N 周（= **模拟翻周**，真机验「敲奖杯/领奖」用）。
+* `week_settings.week_leaderboard` 是客户端认的**排行榜数字 id**：发 `0` 等于告诉它「本模式没有榜」
+  （榜区空白 + TOP 1% 条 + 周奖杯一起退化）。`weekly.leaderboard_id = 0` 时自动用本周赛道
+  （`track<id>` 榜，复用榜单视图里已有的行）。
+* `basic_info` 的 `(last_participated_week, last_participated_week_lb)` 决定客户端进哪个子状态：
+  本周参加过 → 结算/领奖屏；只参加过上一周（配 `week_offset=1`）→ 上周结算屏。见 `_weekly_joined()`。
+* `config/<week>` 必须**按请求的那一周**回 —— 翻周后客户端会来要上一周，回本周它会判定
+  「配置不属于当前周」并每秒重试（界面卡在「查看进度…」）。
+* `find_opponent` 必须回**pid + 该 pid 在本周赛道上的幽灵 contentId**：回显示名 + `replay_id=0`
+  会让客户端以 ~30 次/秒刷 `find_opponent`+`stats`+`ghost/0/payload`(404)。见 `_weekly_opponent()`。
+* 榜单里的「其他玩家」由 `weekly.fake_field`（默认 120）+ `fake_field_base_ms/fast_pct/slow_pct`
+  合成（客户端用「名次/playerCount」算百分位，只有 3 行时永远进不了全球 1%）。合成行不落盘、
+  不进总榜、同周内恒定。
+* 每周次数是**服务端权威**的：`start_race` 扣、`skip_cooldown` 补满、`refill_retry_count` 加；
+  剩余走 `basic_info.left_retry_times`，冷却**时长**是 `weekly.cooldown_seconds`（规则）。
+  `ponytail:` 次数只在内存里（`_WEEKLY_ATTEMPTS`），重启服务器会白送满次数。
+* 奖励池内容在客户端 `/conf/wts_rewards.txt`（15 个池子），服务端只能选「哪一档用哪个池子」：
+  `weekly.reward_slots`(1..3) / `weekly.reward_ids`。**完整对照表**见
+  `work/trials-frontier/notes/weekly-reward-pools.md`，WebUI 用的机器可读版本是
+  `data/wts_rewards.json`（由 `tools/wts_reward_doc.py` 生成）。
+  ★ 客户端挑「池内哪一件」用的是它**不播种的 `rand()`** —— 池子不变就永远是同一件。
 * `config/<week>` 响应里 **`challenge_settings.bike_id` 必须是一个合法车辆 id** ——
   曾经给 0 导致「进入午夜杯场地」直接崩溃。
-* `start_race` / `end_race` 之间的成绩由 `h_liveevents_accept` 记账。
 
 ### 5.6 内购 / 礼包 / 好友（targeting）
 
