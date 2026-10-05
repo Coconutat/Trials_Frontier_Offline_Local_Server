@@ -5,11 +5,13 @@
 只做我们能证明的事：
   * dump   —— 打印字符串池、资源映射，以及每个 <element> 的属性（带绝对偏移）
   * set    —— 就地改某个属性的数值（不改变文件长度，因此不需要修 chunk size）
+  * setstr —— 就地改字符串池里的一条 UTF-16 字符串（不得变长，同样不改长度）
 
 用法:
     python tools/patch_manifest.py dump 原版AndroidManifest.xml [--grep targetSdk]
-    python tools/patch_manifest.py set  in.xml out.xml targetSdkVersion=27
     python tools/patch_manifest.py get  in.xml targetSdkVersion
+    python tools/patch_manifest.py set  in.xml out.xml targetSdkVersion=27
+    python tools/patch_manifest.py setstr in.xml out.xml 旧串=新串
 """
 import argparse
 import struct
@@ -220,6 +222,66 @@ def cmd_set(args):
     return rc
 
 
+def cmd_setstr(args):
+    """就地替换字符串池里某一条 UTF-16 字符串；新串不得更长（短的用 0 补齐）。
+
+    只动字符串数据本身：条数、offsets[]、chunk size 全不变，所以不存在
+    "改完要重排所有偏移"的问题。前提是字符串池必须是 UTF-16。
+    """
+    d = bytearray(open(args.xml, "rb").read())
+    s, resmap, els = parse_chunks(bytes(d))
+    typ, hs, total = struct.unpack_from("<HHI", d, 0)
+    pool_off, pos = None, hs
+    while pos + 8 <= total:
+        ctyp, chs, csz = struct.unpack_from("<HHI", d, pos)
+        if csz < 8:
+            break
+        if ctyp == RES_STRING_POOL_TYPE:
+            pool_off = pos
+            break
+        pos += csz
+    if pool_off is None:
+        print("找不到字符串池")
+        return 2
+    cnt, styc, flags, strstart, stystart = struct.unpack_from("<IIIII", d, pool_off + 8)
+    if flags & (1 << 8):
+        print("字符串池是 UTF-8，setstr 只处理 UTF-16")
+        return 2
+    offs = struct.unpack_from("<%dI" % cnt, d, pool_off + 28) if cnt else ()
+    base = pool_off + strstart
+    rc = 0
+    for nv in args.items:
+        old, new = nv.split("=", 1)
+        hits = [i for i in range(cnt) if s["strings"][i] == old]
+        if len(hits) != 1:
+            print("字符串池里 %r 命中 %d 条，拒绝改（必须唯一）" % (old, len(hits)))
+            rc = 2
+            continue
+        i = hits[0]
+        p = base + offs[i]
+        end = base + (offs[i + 1] if i + 1 < cnt else stystart)
+        enc = new.encode("utf-16-le")
+        need = 2 + len(enc) + 2
+        if need > end - p or len(new) >= 0x8000:
+            print("新串放不进原槽位：%r 需要 %d 字节，槽位只有 %d"
+                  % (new, need, end - p))
+            rc = 2
+            continue
+        struct.pack_into("<H", d, p, len(new))
+        d[p + 2:p + 2 + len(enc)] = enc
+        d[p + 2 + len(enc):end] = b"\x00" * (end - p - 2 - len(enc))
+        print("改字符串池[%d]  %r -> %r  (槽位 %d 字节，写了 %d，@0x%06x)"
+              % (i, old, new, end - p, need, p))
+    if rc == 0:
+        if args.out != args.xml:
+            open(args.out, "wb").write(bytes(d))
+            print("已写出 %s (%d 字节)" % (args.out, len(d)))
+        else:
+            open(args.xml, "wb").write(bytes(d))
+            print("已就地写回 %s" % args.xml)
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -238,6 +300,12 @@ def main():
     p.add_argument("out")
     p.add_argument("items", nargs="+")
     p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("setstr")
+    p.add_argument("xml")
+    p.add_argument("out")
+    p.add_argument("items", nargs="+", metavar="旧串=新串")
+    p.set_defaults(func=cmd_setstr)
     args = ap.parse_args()
     return args.func(args)
 
