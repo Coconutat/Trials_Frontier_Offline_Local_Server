@@ -5,6 +5,9 @@
 > 用途：给私服定规则时，这是**唯一的外部事实来源**（其余全靠 `.so` 反汇编 + `online-rules-evidence.md` 的史料）。
 >
 > 采集：2026-10，真机 `<设备序列号>`；来源是 logcat 与 app 自身的 Volley 缓存。
+>
+> ⚠️ **本文已脱敏**：§1 的 `deviceuid` / `federated_id` / `ubimobi_access_token` 是真实值，已替换为占位符。
+> 需要原值时翻 `tmp/logcat_m1.txt:2676`（该文件不入库）。
 
 ## 0. 先说反面结论：没有停服前的样本
 
@@ -28,8 +31,8 @@ POST https://gamecfg-mob.ubi.com/profile/?action=register_device&productid=101&d
 ```
 
 * 证据位置：`tmp/logcat_m1.txt:2676`（以及同文件其它约 20 处）。
-* 形态要点：响应根是 `{"device": {...}}`，两个字段都是**字符串**。
-* `deviceuid` 与我们 `shared_prefs/ubisoftData.xml` 里的 `ubiduid` 同源（`<deviceuid>`）。
+* 形态要点：响应根是 `{"device": {...}}`，两个字段都是**字符串**；`federated_id` 与 `ubimobi_access_token` 都是 **43 字符的 base62**，`deviceuid` 是标准 UUID。
+* `deviceuid` 与我们 `shared_prefs/ubisoftData.xml` 里的 `ubiduid` 同源。
 * 注意：这两个 token 属于**游客身份**、早已作废，仅作协议形状参照。
 
 ## 2. 样本 B：`profile/?epoch=1` 的空载荷
