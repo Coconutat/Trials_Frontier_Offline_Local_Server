@@ -1,6 +1,7 @@
 {
   "_note": "Trials Frontier 本地服务器的运营参数。改完存盘即生效（服务器按 mtime 热加载，不用重启），也可以 GET/POST http://<host>:8000/__config 读写。未来 WebUI 就管理这个文件。",
   "matchmaking": {
+    "_note": "★ 测试档：match_duration_seconds 现在是 300（3 分钟），为的是几分钟就能走完一局看到 close 结算；正式开服用 21600（6 小时）。改这个值不用重启，存盘即生效。",
     "enabled": true,
     "bot_wait_seconds": 60,
     "active_window_seconds": 300,
@@ -8,7 +9,7 @@
     "track_id": 1041,
     "bot_profile_id": "44444444-4444-4444-4444-444444444444",
     "bot_name": "GhostRider",
-    "match_duration_seconds": 21600,
+    "match_duration_seconds": 300,
     "bike_id": 1,
     "free_tickets_max": 3,
     "free_tickets_initial": 3,
@@ -42,10 +43,13 @@
       1291
     ],
     "bot_time_margin_pct": 1.018,
-    "bot_time_margin_ms": 400
+    "bot_time_margin_ms": 400,
+    "ranked_match_slots": 3,
+    "additional_match_cost": 1,
+    "ranked_match_limit": 10
   },
   "season": {
-    "_note": "season.star_array = 25 级天梯每级需要几颗星（index 0 = rank 1 最高，index 24 = rank 25 最低，最多 26 项）。season.rewards = 天梯奖励栏，[{\"rank\":N,\"item_id\":X,\"amount\":Y}]，item_id 1=金币 2=钻石 145=特殊奖励占位，其余见 tmp/packout/ITEM_IDS_REPORT_CN.md。season.product_list = [{\"product_id\":\"...\",\"amount\":N}]，只有 chip_shop.goldentickets 是确定存在的 id。",
+    "_note": "star_array: rank1..25升级星数；rewards为扁平运营条目，服务端转换成rank0..25嵌套rewards数组。★ rewards 必须覆盖 rank0..25 每一档：客户端结算的是「index>=当前rank的所有档之和」，缺档等于那一级什么都不给；同一条 (rank,item_id,amount) 不许重复写（服务端会去重并打印告警，写重=多发）。item_id1/2为金币/宝石；item_id145的amount为/conf/pvp_match_rewards.txt中的RewardID（非库存ItemId/数量）。每档是增量，客户端累加达成档位。product_list/chip_shop.goldentickets的amount是单张金票筹码基价。这张表就是将来 WebUI 赛季编辑器要生成的模板。",
     "track_id": 1041,
     "title_text": "Trials Frontier",
     "banner_path": "/pvp_banner/season.png",
@@ -83,93 +87,183 @@
         "amount": 3
       }
     ],
-    "rewards": [
-      {
-        "rank": 1,
-        "item_id": 1,
-        "amount": 500
-      },
-      {
-        "rank": 1,
-        "item_id": 2,
-        "amount": 5
-      },
-      {
-        "rank": 1,
-        "item_id": 459,
-        "amount": 1
-      },
-      {
-        "rank": 2,
-        "item_id": 1,
-        "amount": 400
-      },
-      {
-        "rank": 2,
-        "item_id": 2,
-        "amount": 4
-      },
-      {
-        "rank": 3,
-        "item_id": 1,
-        "amount": 300
-      },
-      {
-        "rank": 3,
-        "item_id": 2,
-        "amount": 3
-      },
-      {
-        "rank": 5,
-        "item_id": 1,
-        "amount": 250
-      },
-      {
-        "rank": 5,
-        "item_id": 49,
-        "amount": 2
-      },
-      {
-        "rank": 10,
-        "item_id": 1,
-        "amount": 200
-      },
-      {
-        "rank": 10,
-        "item_id": 44,
-        "amount": 2
-      },
-      {
-        "rank": 15,
-        "item_id": 1,
-        "amount": 150
-      },
-      {
-        "rank": 15,
-        "item_id": 39,
-        "amount": 2
-      },
-      {
-        "rank": 20,
-        "item_id": 1,
-        "amount": 100
-      },
-      {
-        "rank": 20,
-        "item_id": 34,
-        "amount": 2
-      },
-      {
-        "rank": 25,
-        "item_id": 1,
-        "amount": 50
-      },
-      {
-        "rank": 25,
-        "item_id": 29,
-        "amount": 2
-      }
-    ],
+    "rewards":       [
+        {
+          "rank": 0,
+          "item_id": 1,
+          "amount": 1000
+        },
+        {
+          "rank": 1,
+          "item_id": 1,
+          "amount": 500
+        },
+        {
+          "rank": 2,
+          "item_id": 1,
+          "amount": 400
+        },
+        {
+          "rank": 3,
+          "item_id": 1,
+          "amount": 300
+        },
+        {
+          "rank": 4,
+          "item_id": 1,
+          "amount": 275
+        },
+        {
+          "rank": 5,
+          "item_id": 1,
+          "amount": 250
+        },
+        {
+          "rank": 6,
+          "item_id": 1,
+          "amount": 240
+        },
+        {
+          "rank": 7,
+          "item_id": 1,
+          "amount": 230
+        },
+        {
+          "rank": 8,
+          "item_id": 1,
+          "amount": 220
+        },
+        {
+          "rank": 9,
+          "item_id": 1,
+          "amount": 210
+        },
+        {
+          "rank": 10,
+          "item_id": 1,
+          "amount": 200
+        },
+        {
+          "rank": 11,
+          "item_id": 1,
+          "amount": 190
+        },
+        {
+          "rank": 12,
+          "item_id": 1,
+          "amount": 180
+        },
+        {
+          "rank": 13,
+          "item_id": 1,
+          "amount": 170
+        },
+        {
+          "rank": 14,
+          "item_id": 1,
+          "amount": 160
+        },
+        {
+          "rank": 15,
+          "item_id": 1,
+          "amount": 150
+        },
+        {
+          "rank": 16,
+          "item_id": 1,
+          "amount": 140
+        },
+        {
+          "rank": 17,
+          "item_id": 1,
+          "amount": 130
+        },
+        {
+          "rank": 18,
+          "item_id": 1,
+          "amount": 120
+        },
+        {
+          "rank": 19,
+          "item_id": 1,
+          "amount": 110
+        },
+        {
+          "rank": 20,
+          "item_id": 1,
+          "amount": 100
+        },
+        {
+          "rank": 21,
+          "item_id": 1,
+          "amount": 90
+        },
+        {
+          "rank": 22,
+          "item_id": 1,
+          "amount": 80
+        },
+        {
+          "rank": 23,
+          "item_id": 1,
+          "amount": 70
+        },
+        {
+          "rank": 24,
+          "item_id": 1,
+          "amount": 60
+        },
+        {
+          "rank": 25,
+          "item_id": 1,
+          "amount": 50
+        },
+        {
+          "rank": 1,
+          "item_id": 2,
+          "amount": 5
+        },
+        {
+          "rank": 2,
+          "item_id": 2,
+          "amount": 4
+        },
+        {
+          "rank": 3,
+          "item_id": 2,
+          "amount": 3
+        },
+        {
+          "rank": 1,
+          "item_id": 145,
+          "amount": 220
+        },
+        {
+          "rank": 5,
+          "item_id": 145,
+          "amount": 20040
+        },
+        {
+          "rank": 10,
+          "item_id": 145,
+          "amount": 20035
+        },
+        {
+          "rank": 15,
+          "item_id": 145,
+          "amount": 20030
+        },
+        {
+          "rank": 20,
+          "item_id": 145,
+          "amount": 20025
+        },
+        {
+          "rank": 25,
+          "item_id": 145,
+          "amount": 20020
+        }
+      ],
     "chip_equation_x": 0.5,
     "chip_equation_y": 0.5
   },
@@ -178,26 +272,11 @@
     "track_id": 1041,
     "left_retry_times": 3
   },
-  "rewards": {
-    "_note": "赛后奖励，对应比赛 JSON 的 rewards 数组 = [金币, 钻石, 特殊奖励等级]。客户端 parseMatch 把它变成 PVPMatch+0x170 的 {(1,金币),(2,钻石),(145,特殊奖励等级)}，赛后界面直接显示。不发这个键 → 打完一局金币/钻石留空、特殊奖励空。",
-    "default": [
-      150,
-      1,
-      0
-    ],
-    "win": [
-      300,
-      2,
-      0
-    ]
-  },
   "chips": {
-    "_note": "筹码。start/per_track_seconds/max 是账号级的长期产出（_pvp_chips_for）；局内筹码曲线在 season.chip_equation_x/y（客户端用它画赢家头像的填充圆环）。bot_start = 人机已有的筹码（客户端把它画成对手头像下的红筹码）；match_loser_keeps_pct = 整局结算时输家保住的比例（%），其余被赢家夺走。bonus = 一次性补偿筹码，每个账号只发一次（发过记 bonus_done 一起落盘）；余额和局内票现在都会存 server/data/pvp_state.json，重启不再归零。",
+    "_note": "筹码。start = 新号起步余额。per_track_seconds = **账号级**挂机产币的周期（每这么多秒、每条已解锁赛道产 1 枚）；2026-10-05 真机复核后设为 0（关掉）：它会在一局都没结算的情况下让钱包自己长大，而且和局内圆环那条产币线重复 —— 筹码现在只从「占住赛道 → 圆环累积 → 整局到期 close 结算」来（season.chip_equation_x/y + _pvp_bank_match_chips）。要重开挂机产币就把这里设回 3600（或 WebUI 里调）。max = 上限（0=不限）。match_loser_keeps_pct = 整局结算时输家保住的比例（%），其余被赢家夺走。余额与局内票存在 server/data/pvp_state.json，重启不丢。",
     "start": 0,
-    "per_track_seconds": 3600,
+    "per_track_seconds": 0,
     "max": 0,
-    "bot_start": 500,
-    "match_loser_keeps_pct": 50,
-    "bonus": 114514
+    "match_loser_keeps_pct": 50
   }
 }

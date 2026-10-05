@@ -27,6 +27,8 @@ Trials Frontier 本地服务器（本地存档/离线后端）
 
 import argparse
 import atexit
+import copy
+import functools
 import hashlib
 import json
 import os
@@ -59,6 +61,14 @@ _TF_CONFIG_DEFAULTS = {
         "active_window_seconds": 300,
         # 查询队列/对局的过期时间，防止玩家强杀进程后留下僵尸队列。
         "search_ttl_seconds": 1800,
+        # ★ 能同时开几条 PVP 对局（= 客户端 `pvp_match_settings.ranked_match_slots`，
+        #   同一份配置两处共用）。用户回忆的机制：**免费 3 条**，超过之后每开一条
+        #   要花一张黄金门票（`additional_match_cost`），到 `ranked_match_limit` 封顶。
+        "ranked_match_slots": 3,
+        # 第 4 条起每条新对局收几张黄金门票（0 = 免费无限开）。
+        "additional_match_cost": 1,
+        # 并行对局的硬上限（防止客户端狂点「全新对决」把状态撑爆）。
+        "ranked_match_limit": 10,
         # 人机对局用的赛道（幽灵库里必须存在这一条赛道）。
         "track_id": 1041,
         "bot_profile_id": "44444444-4444-4444-4444-444444444444",
@@ -98,8 +108,8 @@ _TF_CONFIG_DEFAULTS = {
         "free_tickets_max": 3,
         "free_tickets_initial": 3,
         "free_tickets_interval_seconds": 3600,
-        # 天梯起始等级。★ 25 = 最低级，不能发 0：客户端 `rank == 0` 是
-        #   「未揭示/顶级」的特殊态，`MenuzStatePVPPostMatch::increaseOneStar`
+        # 天梯起始等级。25 = 最低级；0 = Legend，不能作为普通新号初始值。
+        #   `MenuzStatePVPPostMatch::increaseOneStar`
         #   @0x730698 一看到 0 就直接返回，晋级动画永远不会触发。
         #   总共 25 级（`MissingRewardFallbackRewards` 恰好 25 个键 "1".."25"）。
         "start_rank": 25,
@@ -138,30 +148,58 @@ _TF_CONFIG_DEFAULTS = {
         "chip_equation_x": 0.5,
         "chip_equation_y": 0.5,
         # ★ `current_season.rewards` @0xb8d6de —— `parseSeasonData` @0x4fe4f4 的
-        #   天梯奖励栏契约：数组，每项 `{"rank": int, "item_id": int, "amount": int}`
+        #   这里是扁平运营配置；wire 由 _pvp_season_rewards 转成嵌套 rewards 数组。
         #   （按 `rank` 归组进外层 vector，同一 rank 可给多个 (item_id, amount)；
         #   `rank < 0` 跳过）。item_id 的语义沿用 `tr::PVPReward`：
-        #     1 = 金币、2 = 钻石、145 = 特殊奖励占位（RewardID 100），
-        #     其余 = 物品表里的 id（`tmp/packout/ITEM_IDS_REPORT_CN.md` 有全表）。
+        #     1 = 金币、2 = 钻石；145 的 amount = 原表 RewardID。
+        #     库存 ItemId 不能冒充季奖 RewardID；每档数额为增量，客户端累加已达成档位。
         #   ⚠ `ItemId` 只在同一个 `Type` 内唯一，这里发的是物品栏 item id（Type 0）。
         "rewards": [
+            # ★ 客户端对 rank R 结算的是「**index >= R 的所有档之和**」（见
+            #   pvp-reward-contract.md：`getCombinedSeasonRewards @0x5e7364`），
+            #   所以 0..25 **每一档都要有**，缺档就等于那一级什么都不给。
+            #   形状刻意保持扁平 `{rank,item_id,amount}` —— 未来的 WebUI 直接编辑
+            #   这张表并导出成模板即可，不需要懂嵌套 wire 格式（wire 由
+            #   `_pvp_season_rewards()` 转成 nested）。
+            #   item_id: 1=金币、2=钻石；**145 的 amount 是 RewardID，不是物品数量**。
+            {"rank": 0, "item_id": 1, "amount": 1000},     # Legend
             {"rank": 1, "item_id": 1, "amount": 500},
-            {"rank": 1, "item_id": 2, "amount": 5},
-            {"rank": 1, "item_id": 459, "amount": 1},
             {"rank": 2, "item_id": 1, "amount": 400},
-            {"rank": 2, "item_id": 2, "amount": 4},
             {"rank": 3, "item_id": 1, "amount": 300},
-            {"rank": 3, "item_id": 2, "amount": 3},
+            {"rank": 4, "item_id": 1, "amount": 275},
             {"rank": 5, "item_id": 1, "amount": 250},
-            {"rank": 5, "item_id": 49, "amount": 2},
+            {"rank": 6, "item_id": 1, "amount": 240},
+            {"rank": 7, "item_id": 1, "amount": 230},
+            {"rank": 8, "item_id": 1, "amount": 220},
+            {"rank": 9, "item_id": 1, "amount": 210},
             {"rank": 10, "item_id": 1, "amount": 200},
-            {"rank": 10, "item_id": 44, "amount": 2},
+            {"rank": 11, "item_id": 1, "amount": 190},
+            {"rank": 12, "item_id": 1, "amount": 180},
+            {"rank": 13, "item_id": 1, "amount": 170},
+            {"rank": 14, "item_id": 1, "amount": 160},
             {"rank": 15, "item_id": 1, "amount": 150},
-            {"rank": 15, "item_id": 39, "amount": 2},
+            {"rank": 16, "item_id": 1, "amount": 140},
+            {"rank": 17, "item_id": 1, "amount": 130},
+            {"rank": 18, "item_id": 1, "amount": 120},
+            {"rank": 19, "item_id": 1, "amount": 110},
             {"rank": 20, "item_id": 1, "amount": 100},
-            {"rank": 20, "item_id": 34, "amount": 2},
+            {"rank": 21, "item_id": 1, "amount": 90},
+            {"rank": 22, "item_id": 1, "amount": 80},
+            {"rank": 23, "item_id": 1, "amount": 70},
+            {"rank": 24, "item_id": 1, "amount": 60},
             {"rank": 25, "item_id": 1, "amount": 50},
-            {"rank": 25, "item_id": 29, "amount": 2},
+            # 钻石：只在最低三段给（原有运营配置，未改动）。
+            {"rank": 1, "item_id": 2, "amount": 5},
+            {"rank": 2, "item_id": 2, "amount": 4},
+            {"rank": 3, "item_id": 2, "amount": 3},
+            # 特殊季奖：item_id 145 + amount=RewardID。每档**只能有一条**，
+            # 写重了就是双发（曾经真的写重过，见 _pvp_season_rewards 的去重保护）。
+            {"rank": 1, "item_id": 145, "amount": 220},
+            {"rank": 5, "item_id": 145, "amount": 20040},
+            {"rank": 10, "item_id": 145, "amount": 20035},
+            {"rank": 15, "item_id": 145, "amount": 20030},
+            {"rank": 20, "item_id": 145, "amount": 20025},
+            {"rank": 25, "item_id": 145, "amount": 20020},
         ],
     },
     # 筹码（chips）。
@@ -177,10 +215,13 @@ _TF_CONFIG_DEFAULTS = {
     "chips": {
         # 起步筹码（用户规则：最低天梯 0）。
         "start": 0,
-        # 每条已拥有赛道每隔这么多秒产 1 枚（0 或负数 = 不产）。
-        # ⚠ 这条「赛道产线」是**账号级**的长期产出（`_pvp_chips_for`），
-        #   与局内的 `chip_equation` 曲线是两回事，别混。
-        "per_track_seconds": 3600,
+        # 每条已拥有赛道每隔这么多秒产 1 枚（0 = 不产）。
+        # ★ 2026-10-05 真机复核后关掉（=0）：它会**在没有任何对局结算的情况下**让钱包
+        #   自己长大（玩家原话「都没结束。都没结算哪来的筹码」），而且和客户端画的那个
+        #   圆环是**两套并行的产币机制** —— 圆环那条（`chip_equation_x/y`，占住赛道后
+        #   随时间产、整局到期由 `_pvp_bank_match_chips` 入账）已经实现了「谁占了赛道
+        #   谁就产币」这个规则。要重新打开就把这个值设回 3600（或 WebUI 里调）。
+        "per_track_seconds": 0,
         # 上限（0 = 不限）。★ 别再用 200：筹码商店里最贵的一条赛道 63000 筹码，
         # 顶到 200 会让商店永久锁死。
         "max": 0,
@@ -189,42 +230,12 @@ _TF_CONFIG_DEFAULTS = {
         #   累积速度重置，又从快开始变慢；整局跑完才结算成 `chips` 余额。
         #   曲线见 `season.chip_equation_x/y`（`_pvp_match_chips` 用的就是它）。
         #
-        # ── 人机（对手）的已有筹码。人机没有账号，但客户端会把
-        #   `player2.chips` 画成对手头像下的红筹码，且整局结算时「赢家夺走输家
-        #   已有的筹码」需要对面有筹码可夺（用户 m04835：三条赛道都赢了，
-        #   对面已有的筹码也不会扣除 / 这一把 AI 的筹码被清零了）。
-        "bot_start": 500,
+        # ── 人机不另给筹码（曾经为「对手头像下的红筹码」播种 500，是调试值）。
+        #   它的余额就是上次结算剩下的；真人这边照常按赛道产币。
         # 整局结算时**输家保住**的比例（%），其余归赢家。
-        # ★ 客户端 `getChipHeritage` @0x5dec48 里那两个系数是硬编码的 0.5/0.1，
+        # ★ 客户端 `getChipHeritage @0x5dec48` 里那两个系数是硬编码的 0.5/0.1，
         #   只影响赛后界面文案，真正的转移比例由这里决定。
         "match_loser_keeps_pct": 50,
-        # 一次性补偿筹码。旧服务器把 `_pvp_chips` 放在纯内存 dict 里，重启就归零
-        # （用户 m02863：「总量不会保存，还会从 0 增长到 1 或者 3」），已经攒下的
-        # 筹码全丢了。这里给每个账号补一次；发过就记 `bonus_done` 一起落盘，
-        # 不会因为重启再发第二遍。
-        "bonus": 114514,
-    },
-    # 赛后奖励。比赛 JSON 的 `rewards` 是**数组**，parseMatch @0x4fd9d0 只读前 3 个整数
-    # （`cmp w9,#2; b.gt`，见 0x4fdd78），然后拼成 PVPMatch+0x170 上的
-    # `std::vector<mz::Pair<int,int>> = {(1,r0), (2,r1), (145,r2)}`（0x4fe1d4 起）。
-    #   MenuzStatePVPPostMatch::setupComponents @0x7308f0 把这个 vector 整个搬到
-    #   赛后界面对象 +0x340，setupRewards @0x73129c 再按 pair.first 分发：
-    #     first == 1     → 金币（PVPReward::getCoins @0x5de03c → Item::getItemAmountString(1, n, 0)）
-    #     first == 2     → 钻石（PVPReward::getGems  @0x5de078 → getItemAmountString(2, n, 0)）
-    #     first == 0x91  → 特殊奖励等级（getSpecialLevel @0x5de2a0 → getSpecialRewardById）
-    # ★ 不发这个键 → 那个 vector 是空的 → 赛后界面金币/钻石文本留空、特殊奖励走
-    #   setAsEmpty，也就是用户报的「我打完一局比赛我的奖励呢」。
-    "rewards": {
-        # [金币, 钻石, 特殊奖励等级]
-        "default": [150, 1, 0],
-        # 对局已结束（客户端 POST 过 /pvp_matches/v1/race）时改用它；留空则一直用 default。
-        "win": [300, 2, 0],
-        # ★ `/race`（cmd 0x2d）响应的 `ownership_changed`，必须是**字符串** "True"/"False"。
-        #   客户端 `PVPManager::onRankedResultSubmitted` @0x5e5b90 会算
-        #   `PVPMatch+0x1b4 = (~ownership_changed) & 1`，而 `+0x1b4 == 0` 才是
-        #   「允许弹转盘」；发 False → 1 → `MenuzStatePVPMatch::onTimerFinished`
-        #   的 case 2 直接跳过，转盘永远不出现。
-        "ownership_changed": True,
     },
     "weekly": {
         "track_id": 1041,
@@ -368,6 +379,89 @@ def h_timeservice(path, query, body, headers):
     now = int(time.time())
     digest = hashlib.md5(("%d%s" % (now, TS_SALT)).encode("utf-8")).hexdigest()
     return 200, {}, {"ret": True, "time_now": now, "checksum": digest}
+
+
+# --------------------------------------------------- gamecfg（启动期配置/游客身份）# 客户端启动序列的第一步（真机日志）：`GET /?product=101&portal=Google&version=7.9.4`
+# 与 `GET /?product=101&portal=Google&version=1.5.1`。以前这两条落 rules.json 的
+# `*` 兜底、回 `{"data": []}`，服务端等于没实现。
+#
+# ★ 形状有真实样本（`work/trials-frontier/notes/real-server-samples.md` §1/§2，
+#   来源是设备上残留的 Volley 缓存 + logcat，不是猜的）：
+#     GET  https://gamecfg-mob.ubi.com/profile/?epoch=1     → 裸 `[]`
+#          响应头带 `Ubisoft-CA: OK` / `Ubisoft-Zone: CN` / `Server-Time: <unix>`
+#          （该端点 2026-10 仍然在线，实测返回 `[]`，与缓存字节一致）
+#     POST https://gamecfg-mob.ubi.com/profile/?action=register_device&productid=101
+#          &devicetype=google&deviceuid=<uuid>
+#          → {"device":{"federated_id":"<43 字符 base62>","ubimobi_access_token":"<43 字符 base62>"}}
+_B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _base62(seed, length):
+    """确定性地生成 `length` 个 base62 字符。
+
+    ★ 必须**按设备稳定**：客户端会把 federated_id 当自己的游客身份存下来，
+      每次随机换一串等于每次开机换个人（和 PVP 状态被劈成两半是同一类毛病）。
+    ★ 长度照真实样本给 43：客户端读这两个字段的缓冲区是按真实长度开的。
+    """
+    out = []
+    h = hashlib.sha256(seed.encode("utf-8")).digest()
+    while len(out) < length:
+        for byte in h:
+            out.append(_B62[byte % 62])
+            if len(out) >= length:
+                break
+        h = hashlib.sha256(h).digest()
+    return "".join(out)
+
+
+def h_gamecfg(path, query, body, headers):
+    """`GET|POST /` —— gamecfg：Java 侧 DLC 配置 + 游客设备注册。"""
+    q = dict(parse_qsl(query or "", keep_blank_values=True))
+    hdrs = {
+        "Content-Type": "application/json",
+        "Ubisoft-CA": "OK",
+        "Ubisoft-Zone": "CN",
+        "Server-Time": str(int(time.time())),
+    }
+    if (q.get("action") or "").lower() == "register_device":
+        uid = q.get("deviceuid") or q.get("deviceId") or "local"
+        return 200, hdrs, {"device": {
+            "federated_id": _base62("tf-federated:" + uid, 43),
+            "ubimobi_access_token": _base62("tf-token:" + uid, 43),
+        }}
+    print("[gamecfg] %s?%s -> []" % (path, query), flush=True)
+    return 200, hdrs, []          # 真实服务器这里就是一个裸空数组
+
+
+def h_app_configuration(path, query, body, headers):
+    """`GET /v1/applications/<appid>/configuration` —— Ubiservices 应用配置。
+
+    ★ 这里的 `sandboxes[].url` 就是客户端 `setserverAddress(...)` 拿到的**服务器基址**
+      （依据：`friendlyName` 必须是 `triag_an_lnch61_a_ws` 或 `android_beta`，否则
+      `setserverAddress` 根本不会被调用 —— notes/online-endpoints.md:12）。
+      ⚠ 以前这条写在 `server/rules.json` 里、写死 `http://127.0.0.1:8000/`：
+        原生侧的地址被 `tf_server.txt` 钩子改成了局域网 IP，**Java 侧（DLC/内购）
+        却永远拿着 127.0.0.1** ⇒ 必须开 `adb reverse tcp:8000 tcp:8000` 才能启动，
+        否则 Java DLC 一直 `ConnectException: Failed to connect to /127.0.0.1:8000`
+        重试，启动链走不到 `pvp_init`，碉堡四个面板永远转圈（2026-10-05 真机定位）。
+      ⇒ 现在按请求的 Host 回显：客户端用什么地址找到我们，就让它继续用那个地址。
+        真机 Host 就是 `tf_server.txt` 里那一条，所以这条路不再需要 adb reverse。
+    """
+    host = _req_host(headers)
+    print("[appcfg] sandbox url -> http://%s/" % host, flush=True)
+    return 200, {"Content-Type": "application/json"}, {
+        "configuration": {
+            "sandboxes": {
+                "triag_an_lnch61_a_ws": {
+                    "name": "triag_an_lnch61_a_ws",
+                    "friendlyName": "triag_an_lnch61_a_ws",
+                    "url": "http://%s/" % host,
+                }
+            },
+            "Anticheating_Enabled": False,
+            "setOnlineConfigured": True,
+        }
+    }
 
 
 # ------------------------------------------------------------ 占位图片
@@ -569,8 +663,24 @@ def h_session(path, query, body, headers):
         #   下次启动就能静默换会话，不必再让玩家手输账号（见 tflocal_accounts
         #   里 issue_remember_ticket 的反汇编依据）。
         rm = acct.issue_remember_ticket(acc)
+        # 记住「这台客户端 = 这个账号」：客户端随后的请求里有一半不带 Authorization
+        # 或只用我们发的匿名票，靠这条绑定才能落回同一个槽（见 resolve_identity）。
+        acct.bind_client(acc, _client_ip(headers), info.get("device_id"))
         return 200, {"Content-Type": "application/json"}, \
             acct.session_body(acc, ticket, remember, remember_ticket=rm)
+
+    # ★ 这台客户端绑定过谁？（见 tflocal_accounts 的绑定注释）
+    #   凡是「认不出是谁」的兜底路径（设备票 / 设备静默 / 匿名）都先问它。
+    #   2026-10-05 真机实测：冷启动第一条会话是 `rm_v1 t=tf-rm-…`（长期凭据），
+    #   走的是下面的 bearer 分支 —— 那里以前**没有**建绑定，紧接着的设备请求就
+    #   照样拿到了设备槽，等于白修。所以三条路径都要过这里。
+    def _bound_reply():
+        bound = acct.account_by_client(_client_ip(headers), info.get("device_id"))
+        if bound is None:
+            return None
+        rm = acct.issue_remember_ticket(bound)
+        return 200, {"Content-Type": "application/json"}, \
+            acct.session_body(bound, acct.issue_session(bound), remember, remember_ticket=rm)
 
     # ★ 登录固化的静默换会话：客户端拿我们发过的长期凭据（rememberMeTicket）
     #   或普通会话票来换新会话，不该再退化成匿名槽。
@@ -584,15 +694,26 @@ def h_session(path, query, body, headers):
         acc = acct.account_by_remember_ticket(tok) or acct.account_by_ticket(tok)
         if acc is not None:
             rm = acct.issue_remember_ticket(acc)
+            acct.bind_client(acc, _client_ip(headers), info.get("device_id"))
             return 200, {"Content-Type": "application/json"}, \
                 acct.session_body(acc, acct.issue_session(acc), True, remember_ticket=rm)
         dev = acct.device_by_ticket(tok)
         if dev is not None:
+            reply = _bound_reply()
+            if reply is not None:
+                return reply
             return 200, {"Content-Type": "application/json"}, \
                 acct.session_body(dev, dev["ticket"], remember)
 
     # 设备静默登录：按设备 id 分配独立的 profileId，
     # 这样不登录的多台设备不会挤在同一个槽里互相覆盖存档。
+    # ⚠ 但这台客户端**登录过账号**时必须优先回账号：真机日志里空 body 的会话请求
+    #   会拿到设备槽 224c7c78-…，客户端随后就拿它去发 PVP/存档请求，于是状态被
+    #   劈成两半 —— 用户看到的「时好时坏」。
+    reply = _bound_reply()
+    if reply is not None:
+        return reply
+
     if info.get("kind") == "device":
         dev = acct.ensure_device(info.get("device_id"))
         if dev is not None:
@@ -731,7 +852,7 @@ def _client_ip(headers):
 
 
 def _caller_profile(headers):
-    info, err = acct.authenticate(headers)
+    info, err = acct.resolve_identity(headers)
     if info:
         return info["profileId"]
     return acct.ANON_PROFILE_ID
@@ -808,9 +929,15 @@ def _looks_like_ghost(path):
 
 
 def _ghost_caller(headers):
-    """取调用者的 profileId（认不出就返回 None，不影响功能）。"""
+    """取调用者的 profileId（认不出就返回 None，不影响功能）。
+
+    ⚠ 走 `acct.resolve_identity`：客户端在一次冷启动里会混用「带账号票 / 不带
+    Authorization / 我们发的匿名票」三种身份（2026-10-05 真机日志：7360 条请求里
+    1737 条无 Authorization、1489 条用匿名票），直接 `authenticate` 会把一半请求
+    判成匿名槽，PVP 状态被劈成两半（「时好时坏」）。绑定逻辑见 tflocal_accounts。
+    """
     try:
-        info, _err = acct.authenticate(headers)
+        info, _err = acct.resolve_identity(headers)
     except Exception:
         info = None
     if isinstance(info, dict):
@@ -1494,7 +1621,7 @@ def h_liveevents_accept(path, query, body, headers):
 # ---------------------------------------------------------------------------
 
 
-def _pvp_player_info(chips=None, tickets=3, rank=None):
+def _pvp_player_info(chips=None, tickets=3, rank=None, pid=None):
     """`parseRankingData` @0x4fc918 的响应契约（键地址已逐个确认）。
 
     +0x00 `rank`(0xb869b5) / +0x04 `star`(0xb86947) / +0x08 `elo_rank`(0xb869b1)
@@ -1504,33 +1631,50 @@ def _pvp_player_info(chips=None, tickets=3, rank=None):
       它和 `elo_rank` 写同一个字段（+0x08），所以我们只发整数版的 `elo_rank`。
     `chips=None` 时取服务器记的余额（见 `_pvp_chips_for`）。
     `rank=None` 时取 `matchmaking.start_rank`（默认 25 = 最低级）。
-    ★ 不要发 rank=0：那是「未揭示/顶级」的特殊态，`increaseOneStar` @0x730698 会
-      直接 return，晋级动画与奖励栏都动不了。
+    rank=0 是 Legend；初始 rank=25，真正晋升后允许0。
     """
     if chips is None:
         chips = cfg_int("chips", "start", default=0)
     if rank is None:
         rank = cfg_int("matchmaking", "start_rank", default=25)
+    state = _pvp_player_state(pid) if pid else {}
     return {
-        "rank": rank,
-        "star": 0,
+        "rank": state.get("rank", rank),
+        "star": state.get("star", 0),
         "elo_rank": 1000,
-        "season": 0,
-        "golden_ticket": tickets,
+        "season": state.get("season", _pvp_season_window()[0]),
+        "golden_ticket": state.get("golden_ticket", tickets),
         "chips": chips,
-        "win_streak": 0,
+        "win_streak": state.get("win_streak", 0),
     }
+
+
+def _pvp_season_window(season_id=None):
+    duration = max(1, cfg_int("season", "duration_days", default=30)) * 86400
+    sid = int(season_id) if season_id is not None else int(time.time()) // duration + 1
+    return sid, (sid - 1) * duration, sid * duration
+
+
+def _pvp_player_state(pid):
+    if pid not in _pvp_players:
+        _pvp_players[pid] = {
+            "rank": max(1, min(25, cfg_int("matchmaking", "start_rank", default=25))),
+            "star": 0, "season": _pvp_season_window()[0], "win_streak": 0,
+            # Preserve the old server's advertised initial golden-ticket balance.
+            "golden_ticket": 3,
+        }
+        _pvp_mark_dirty()
+    return _pvp_players[pid]
 
 
 def _pvp_star_array():
     """`star_array` @0xb86be8 —— 扁平 int 数组，最多 26 项，`parseSeason` @0x4fd694。"""
-    vals = cfg("season", "star_array", default=None) or []
-    out = []
-    for v in vals[:26]:
-        try:
-            out.append(int(v))
-        except (TypeError, ValueError):
-            out.append(0)
+    vals = cfg("season", "star_array", default=None)
+    vals = vals if isinstance(vals, list) else []
+    out = list(_TF_CONFIG_DEFAULTS["season"]["star_array"])
+    for index, value in enumerate(vals[:25]):
+        if type(value) is int and 0 < value <= 100:
+            out[index] = value
     return out
 
 
@@ -1555,8 +1699,8 @@ def _pvp_product_list():
 def _pvp_season_rewards():
     """`current_season.rewards` @0xb8d6de —— `parseSeasonData` @0x4fe4f4。
 
-    每项 `{"rank": int, "item_id": int, "amount": int}`。三个键都必须存在且是
-    JSON 整数，否则整条被丢（`orr w8,w28,w21; tbnz w8,#0x1f` 那条判断）。
+    配置为扁平条目，wire 按rank分组并补足0..25共26档。
+    item_id=145 时 amount 是原表RewardID；不是库存物品数量。
     """
     vals = cfg("season", "rewards", default=None) or []
     out = []
@@ -1569,10 +1713,24 @@ def _pvp_season_rewards():
             amt = int(it.get("amount", 1))
         except (TypeError, ValueError):
             continue
-        if rk < 0:
+        if not 0 <= rk <= 25 or not 0 <= iid <= 65535 or not 0 <= amt <= 2147483647:
             continue
         out.append({"rank": rk, "item_id": iid, "amount": amt})
-    return out
+    grouped = {rank: [] for rank in range(26)}
+    seen = set()
+    for item in out:
+        key = (item["rank"], item["item_id"], item["amount"])
+        if key in seen:
+            # ★ 同一档、同一 item_id、同一 amount 写两遍 = 客户端收两份。真发生过
+            #   （rank 5/10/15/20/25 的 item_id:145 各写重一条）。这里去重并吵一声，
+            #   免得运营表里的复制粘贴变成多发的季奖；WebUI 生成的模板也走这条保护。
+            print("[pvp] 季奖配置重复条目已忽略：rank=%d item_id=%d amount=%d" % key,
+                  flush=True)
+            continue
+        seen.add(key)
+        grouped.setdefault(item["rank"], []).append(
+            {"item_id": item["item_id"], "amount": item["amount"]})
+    return [{"rank": rank, "rewards": items} for rank, items in sorted(grouped.items())]
 
 
 def _pvp_season(banner_url=""):
@@ -1618,9 +1776,7 @@ def _pvp_season(banner_url=""):
         客户端再把它从 `server_time` 外推到 `now`（`getPlayerChips` @0x5ed6f8 的
         `- floor(f(server_time)) + floor(f(now))`）。
     """
-    now = int(time.time())
-    week_start, _wi = _week_index()
-    days = cfg_int("season", "duration_days", default=30) or 30
+    season_id, season_start, season_end = _pvp_season_window()
     ftk_max = cfg_int("matchmaking", "free_tickets_max", default=3)
     ftk_init = cfg_int("matchmaking", "free_tickets_initial", default=ftk_max)
     ftk_iv = cfg_int("matchmaking", "free_tickets_interval_seconds", default=3600)
@@ -1632,19 +1788,21 @@ def _pvp_season(banner_url=""):
         "free_tickets_initial": ftk_init,
         "chip_equation_x": _cx,
         "chip_equation_y": _cy,
+        # 这两个只影响赛后界面的文案（`getChipHeritage @0x5dec48` 的系数是客户端
+        # 硬编码的），但文案得跟服务端真正干的事一致 ⇒ loser 直接取掠夺配置。
         "winner_chip_heritage": 100,
-        "loser_chip_heritage": 50,
+        "loser_chip_heritage": cfg_int("chips", "match_loser_keeps_pct", default=50),
         "ranked_match_duration": cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600,
         "friendly_match_duration": 3600,
-        "ranked_match_slots": 3,
-        "ranked_match_limit": 10,
+        "ranked_match_slots": cfg_int("matchmaking", "ranked_match_slots", default=3),
+        "ranked_match_limit": cfg_int("matchmaking", "ranked_match_limit", default=10),
         "game_mode": 0,
         "pvp_skill_time_bonus_seconds": 0,
         "pvp_skill_fault_punishment_factor": 1,
         "pvp_skill_decay_in_fanpoint": 0,
         "pvp_skill_fanpoints": 0,
         "chip_store_specials_refresh_interval_hours": 24,
-        "additional_match_cost": 0,
+        "additional_match_cost": cfg_int("matchmaking", "additional_match_cost", default=1),
         "match_price_factor": 1,
     }
     sa = _pvp_star_array()
@@ -1654,7 +1812,7 @@ def _pvp_season(banner_url=""):
     if pl:
         settings["product_list"] = pl
     season = {
-        "end_time": max(now + days * 24 * 3600, week_start + _WEEK_SECONDS),
+        "id": season_id, "start_time": season_start, "end_time": season_end,
         "title_text": cfg("season", "title_text", default=None) or "Trials Frontier",
         "banner_url": banner_url,
         "rank": 0,
@@ -1689,16 +1847,14 @@ _pvp_id_lock = threading.Lock()
 _pvp_next_id = [1]                    # 用列表包一层，方便就地自增
 _pvp_tickets = {}                     # profileId -> {"tickets": n, "ts": 回票基准时刻(0=已满)}
 _pvp_chips = {}                       # profileId -> {"chips": n, "ts": 上次结算时刻, "acc": 余数, "tracks": [赛道 id]}
-_pvp_reward_data = {}                 # profileId -> 客户端最近一次 increase_rewards 上报的 reward_data
+_pvp_players = {}                     # profileId -> rank/star/season/win_streak
 
-# 筹码/局内票的落盘文件。★ 这两个 dict 原先只在内存里，服务器一重启就回
-# `chips.start`（=0）再从头慢慢长，用户看到的就是「总量不会保存，还会从 0 增长
-# 到 1 或者 3」（m02863）。整局结算夺走的筹码同理也会凭空回滚。
 PVP_STATE_PATH = os.path.join(HERE, "data", "pvp_state.json")
-_pvp_state_lock = threading.Lock()
-_pvp_dirty = [False]                  # 有待落盘的改动
-_pvp_saved_at = [0.0]                 # 上次落盘时刻（节流用）
-_PVP_SAVE_MIN_INTERVAL = 10           # 客户端每 1–3 秒轮询一次，不能每问一次就写盘
+_pvp_state_lock = threading.RLock()
+_pvp_in_request = [False]
+_pvp_dirty = [False]
+_pvp_saved_at = [0.0]
+_PVP_SAVE_MIN_INTERVAL = 10
 
 
 def _pvp_mark_dirty():
@@ -1706,46 +1862,90 @@ def _pvp_mark_dirty():
 
 
 def _pvp_state_load():
-    """把筹码/票从磁盘读回内存。文件缺失或读坏都当空，不影响服务器起。"""
+    """兼容旧 chips/tickets 文件；对局内赛道键从 JSON 字符串恢复成整数。"""
     try:
         with open(PVP_STATE_PATH, "r", encoding="utf-8") as f:
             blob = json.load(f)
-    except Exception:
+    except FileNotFoundError:
         return
     if not isinstance(blob, dict):
-        return
-    for key, dst in (("chips", _pvp_chips), ("tickets", _pvp_tickets)):
-        got = blob.get(key)
-        if isinstance(got, dict):
-            dst.update({str(p): v for p, v in got.items() if isinstance(v, dict)})
-    print("[pvp] 筹码/票已恢复：%d 个账号" % len(_pvp_chips), flush=True)
+        raise ValueError("Invalid PVP state: expected object")
+    for key, dst in (("chips", _pvp_chips), ("tickets", _pvp_tickets),
+                     ("search", _pvp_search), ("players", _pvp_players)):
+        dst.update(blob.get(key) or {})
+    for key, match in (blob.get("matches") or {}).items():
+        for name in ("owner", "owner_at"):
+            match[name] = {int(t): v for t, v in match.get(name, {}).items()}
+        match["results"] = {p: {int(t): v for t, v in rows.items()}
+                            for p, rows in match.get("results", {}).items()}
+        _pvp_matches[int(key)] = match
+    _pvp_next_id[0] = max(int(blob.get("next_id", 1)), max(_pvp_matches, default=0) + 1)
 
 
 def _pvp_state_save(force=False):
-    """节流落盘。写失败就保留 dirty 标志，等下一次调用重试。"""
-    now = time.time()
-    if not _pvp_dirty[0]:
+    """一次替换写入经济状态与幂等标记；失败不能假报结算成功。"""
+    if not _pvp_dirty[0] or (_pvp_in_request[0] and not force):
         return
+    now = time.time()
     if not force and now - _pvp_saved_at[0] < _PVP_SAVE_MIN_INTERVAL:
         return
     with _pvp_state_lock:
-        try:
-            blob = {"chips": dict(_pvp_chips), "tickets": dict(_pvp_tickets)}
-            os.makedirs(os.path.dirname(PVP_STATE_PATH), exist_ok=True)
-            tmp = PVP_STATE_PATH + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(blob, f, ensure_ascii=False, indent=1)
-            os.replace(tmp, PVP_STATE_PATH)
-            _pvp_dirty[0] = False
-            _pvp_saved_at[0] = now
-        except Exception as e:
-            _pvp_saved_at[0] = now
-            print("[pvp] 筹码落盘失败（下次重试）：%s" % e, flush=True)
+        blob = {"chips": _pvp_chips, "tickets": _pvp_tickets,
+                "matches": _pvp_matches, "search": _pvp_search,
+                "players": _pvp_players, "next_id": _pvp_next_id[0]}
+        os.makedirs(os.path.dirname(PVP_STATE_PATH), exist_ok=True)
+        tmp = PVP_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            # 紧凑写：这个文件每个成功请求都要整份重写一遍（force=True），
+            # `indent=1` 白占一倍体积。人读可以用 /__pvp 内省端点。
+            json.dump(blob, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, PVP_STATE_PATH)
+        _pvp_dirty[0] = False
+        _pvp_saved_at[0] = now
+
+
+def _pvp_request(handler):
+    """ponytail: 单文件全局锁；吞吐量需要时再迁移 SQLite 事务。"""
+    @functools.wraps(handler)
+    def run(path, query, body, headers):
+        # 包住读端点：轮询也会补票/结算，不能和 POST 并发改余额。
+        with _pvp_state_lock:
+            if not _ghost_caller(headers):
+                return _pvp_error(401, "unauthenticated")
+            states = (_pvp_chips, _pvp_tickets, _pvp_matches, _pvp_search, _pvp_players)
+            before = copy.deepcopy(states)
+            next_id = _pvp_next_id[0]
+            dirty = _pvp_dirty[0]
+            _pvp_in_request[0] = True
+            try:
+                result = handler(path, query, body, headers)
+                if result[0] >= 400:
+                    for dst, old in zip(states, before):
+                        dst.clear()
+                        dst.update(old)
+                    _pvp_next_id[0] = next_id
+                    _pvp_dirty[0] = dirty
+                else:
+                    if states != before:
+                        _pvp_mark_dirty()
+                    _pvp_state_save(force=True)
+                return result
+            except Exception as exc:
+                for dst, old in zip(states, before):
+                    dst.clear()
+                    dst.update(old)
+                _pvp_next_id[0] = next_id
+                _pvp_dirty[0] = dirty
+                if not isinstance(exc, OSError):
+                    raise
+                print("[pvp] transaction not saved: %s" % exc, flush=True)
+                return 503, {"Content-Type": "application/json"}, {"error": "state-not-saved"}
+            finally:
+                _pvp_in_request[0] = False
+    return run
 
 
 _pvp_state_load()
-# 正常退出（Ctrl+C / 进程结束）时把节流窗口里剩下的一点点也写掉，
-# 别让最后 10 秒的产出白白丢掉。
 atexit.register(lambda: _pvp_state_save(force=True))
 
 
@@ -1778,18 +1978,19 @@ def _pvp_ticket_limits():
     return maxn, interval
 
 
-def _pvp_tickets_for(pid):
+def _pvp_tickets_for(pid, match=None):
     """返回 (tickets, ticket_increased)。ticket_increased == 0 表示已回满。"""
     if not pid:
         # 人机没有账号，永远给它「满票」——它也不该显示倒计时。
         return _pvp_ticket_limits()[0], 0
     maxn, interval = _pvp_ticket_limits()
     now = int(time.time())
-    st = _pvp_tickets.get(pid)
+    tickets_by_player = _pvp_tickets if match is None else match.setdefault("tickets", {})
+    st = tickets_by_player.get(pid)
     if st is None:
         init = cfg_int("matchmaking", "free_tickets_initial", default=maxn)
         st = {"tickets": max(0, min(maxn, init)), "ts": 0}
-        _pvp_tickets[pid] = st
+        tickets_by_player[pid] = st
         _pvp_mark_dirty()
     if st["tickets"] < maxn:
         if not st["ts"]:
@@ -1806,13 +2007,13 @@ def _pvp_tickets_for(pid):
     return st["tickets"], st["ts"]
 
 
-def _pvp_consume_ticket(pid):
+def _pvp_consume_ticket(pid, match=None):
     """开一局就消耗一张局内票；返回扣完之后还剩几张。"""
     if not pid:
         return 0
-    tickets, _ts = _pvp_tickets_for(pid)
+    tickets, _ts = _pvp_tickets_for(pid, match)
     maxn, _iv = _pvp_ticket_limits()
-    st = _pvp_tickets.get(pid)
+    st = (_pvp_tickets if match is None else match["tickets"]).get(pid)
     if st is None or st["tickets"] <= 0:
         return 0
     if st["tickets"] >= maxn:
@@ -1842,11 +2043,27 @@ def _pvp_chips_state(pid):
 
 
 def _pvp_set_tracks(pid, ids):
-    """记下这个玩家已解锁的赛道清单（来自 pvp_init 的 body），筹码按条数产。"""
+    """记下这个玩家已解锁的赛道清单（来自 pvp_init 的 body），筹码按条数产。
+
+    ★ 必须去重：真机 body 实测有重复项（`…,1097,1097,…`），重复一条就多一条产线。
+    ★ 必须滤掉明显不是赛道的 id：body 里混着 `1,2,4` 这种小号，而真实赛道 id 都在
+      1000+（见 notes 里 TRACK_MASK 的说明「真实赛道 ID 目前最大 1438」）。
+      ponytail: 100 是「一眼不是赛道」的分界；真要精确就等 WebUI 里配允许清单。
+    """
     if not pid:
         return
+    seen, out = set(), []
+    for tid in ids or []:
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            continue
+        if tid < 100 or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
     st = _pvp_chips_state(pid)
-    st["tracks"] = list(ids or [])
+    st["tracks"] = out
     _pvp_mark_dirty()
     _pvp_state_save()
 
@@ -1855,33 +2072,15 @@ def _pvp_chips_for(pid):
     """返回该玩家的筹码余额。
 
     产筹码完全在服务端：`chips.per_track_seconds` 秒 / 每一条已解锁赛道 / 1 枚。
-    用户 m03154：「筹码是硬件定期生成的，比如我赢了一局，这条赛道定期生成一个筹码」。
-    客户端那边的公式已被 `chip_equation_x/y = 0` 关掉，所以它只会显示这个总额。
+    用户 m03154：「筹码是硬件定期生成的，比如我赢了一局，这条赛道定期生成一个筹码」，
+    2026-10-05 再次确认「按赛道产币那套是对的」。
+    ⚠ 人机没有账号也没有赛道，所以它不产币、余额就是它上次结算剩下的（同一个函数，
+      不再给它特殊播种 —— 曾经为「对手头像下的红筹码」播种 500，那是调试值）。
     """
     if not pid:
         return 0
     st = _pvp_chips_state(pid)
-    if pid == _pvp_bot_id():
-        # 人机没有账号，但**必须**有一个「已有筹码」余额：
-        #   1. 客户端把 `player2.chips` 画成对手头像下的红筹码，发 0 就永远是空的；
-        #   2. 整局结算时「赢家夺走输家已有的筹码」也需要对面有筹码可夺
-        #      （用户 m04835：「如果三条赛道都赢了，对面已有的筹码也不会扣除」）。
-        # 只在第一次给它播种，之后照常在结算里增减。
-        if not st.get("seeded"):
-            st["seeded"] = True
-            st["chips"] = max(0, cfg_int("chips", "bot_start", default=500) or 0)
-            st["ts"] = int(time.time())
-        return int(st["chips"] or 0)
     now = int(time.time())
-    # 一次性补偿（`chips.bonus`）。放在这里而不是建 state 的时候，是为了让
-    # 「旧版本已经攒过、但状态只在内存里」的账号也能拿到。
-    if not st.get("bonus_done"):
-        st["bonus_done"] = True
-        amt = cfg_int("chips", "bonus", default=0) or 0
-        if amt:
-            st["chips"] = int(st["chips"] or 0) + amt
-            print("[pvp] 一次性补偿筹码 %s +%d -> %d" % (pid, amt, st["chips"]), flush=True)
-        _pvp_mark_dirty()
     period = cfg_int("chips", "per_track_seconds", default=3600)
     ntrack = len(st.get("tracks") or [])
     if period and period > 0 and ntrack > 0:
@@ -1942,14 +2141,10 @@ def _pvp_new_id():
 def _pvp_prune(now):
     """清掉过期的队列项与对局，免得玩家强杀进程后留下僵尸队列。"""
     ttl = cfg_int("matchmaking", "search_ttl_seconds", default=_PVP_QUEUE_TTL) or _PVP_QUEUE_TTL
-    for pid in list(_pvp_search):
-        e = _pvp_search.get(pid)
-        at = e.get("at", 0) if isinstance(e, dict) else int(e or 0)
-        if now - at > ttl:
+    for pid, entry in list(_pvp_search.items()):
+        if not entry.get("match_id") and now - entry.get("at", 0) > ttl:
             _pvp_search.pop(pid, None)
-    for mid in list(_pvp_matches):
-        if now - _pvp_matches[mid].get("at", 0) > ttl:
-            _pvp_matches.pop(mid, None)
+    # 已配对/待领取的对局不得按搜索 TTL 删除；close 收据也保留用于重试。
 
 
 def _pvp_real_players():
@@ -1970,7 +2165,7 @@ def _pvp_online_others(pid):
 def _pvp_view(pid, mid):
     """把内部对局渲染成 pid 视角的扁平对局对象。"""
     m = _pvp_matches.get(mid)
-    if not m:
+    if not m or pid not in m.get("players", []) or pid in m.get("closed", {}):
         return None
     opp = None
     for p in m.get("players") or []:
@@ -2250,7 +2445,8 @@ def _pvp_match_chips(m, who, now=None):
         return None
     now = int(now or time.time())
     x, y = _chip_curve()
-    total = int((m.get("chip_base") or {}).get(who) or 0)
+    now = min(now, int(m["start"]) + int(m["dur"]))
+    total = int((m.get("chip_base") or {}).get(who) or 0) + int(m.get("earned", {}).get(who, 0))
     at_map = m.get("owner_at") or {}
     start = int(m.get("start") or now)
     for tid in (m.get("tracks") or []):
@@ -2268,34 +2464,37 @@ def _pvp_match_chips(m, who, now=None):
 def _pvp_bank_match_chips(m):
     """整局跑完 → 把局内筹码结算进 `_pvp_chips`（幂等）。
 
-    结算分两步（用户 m04835 的两条要求）：
-      1. **局内新产的筹码**进余额 —— 只加 `_pvp_match_chips - chip_base` 这一段差值，
+    结算分两步：
+      1. **局内新产的筹码**进各自余额 —— 只加 `_pvp_match_chips - chip_base` 这一段差值，
          否则 `chip_base` 里那份「入场时已有的余额」会被重复加一次；
-      2. **输家已有的筹码被赢家夺走** —— `chips.match_loser_keeps_pct`（默认 50）
-         是输家保住的比例，其余转给赢家。原先这里只加不减，
-         所以「三条赛道都赢了，对面已有的筹码也不会扣除」。
-         客户端那两个 `*_chip_heritage` 配置项（`getChipHeritage` @0x5dec48 硬编码
-         0.5/0.1）只影响赛后界面的文案，真正的转移由服务器决定。
+      2. **赢家掠夺输家这一局里产出的筹码**：`chips.match_loser_keeps_pct`（默认 50）
+         是输家保住的比例，其余转给赢家。
+         ⚠ 抢的是**这一局里对方占赛道产出的那部分**（`gains`），
+           **不是对方的钱包余额** —— 用户 2026-10-05 纠正过：掠夺的对象是「对局里
+           正在生成的筹码」，钱包里原有的钱不该被按比例割走。
+           `match_loser_keeps_pct` 留作将来 WebUI 的可调项。
     """
     if not m or m.get("_banked"):
         return
     m["_banked"] = True
-    now = int(time.time())
+    now = int(m["start"]) + int(m["dur"])
     players = [p for p in (m.get("players") or []) if p]
     base_map = m.get("chip_base") or {}
 
-    # 先只把「局内新产的」记账，别动对手的余额。
+    # 先算清每人在这一局里产了多少，并各自入账（别动别人的钱包）。
+    gains = {}
     for p in players:
-        st = _pvp_chips_state(p)
         base = int(base_map.get(p) or 0)
         got = int(_pvp_match_chips(m, p, now) or 0)
         gain = max(0, got - base)
+        gains[p] = gain
         if gain > 0:
+            st = _pvp_chips_state(p)
             st["chips"] = int(st["chips"] or 0) + gain
             _pvp_mark_dirty()
             print("[pvp] 结算局内筹码 %s +%d -> %d" % (p, gain, st["chips"]), flush=True)
 
-    # 再把输家已有的筹码转给赢家（3 条赛道占住 ≥2 条者为赢家）。
+    # 再把输家**这一局的产出**按比例转给赢家（3 条赛道占住 ≥2 条者为赢家）。
     winner = None
     for p in players:
         if _pvp_match_won(m, p):
@@ -2312,18 +2511,34 @@ def _pvp_bank_match_chips(m):
     for p in players:
         if p == winner:
             continue
-        lst = _pvp_chips_state(p)
-        have = int(lst["chips"] or 0)
-        stolen = have * (100 - keep) // 100
+        stolen = gains.get(p, 0) * (100 - keep) // 100
         if stolen <= 0:
             continue
-        lst["chips"] = have - stolen
+        lst = _pvp_chips_state(p)
+        lst["chips"] = int(lst["chips"] or 0) - stolen
         wst = _pvp_chips_state(winner)
         wst["chips"] = int(wst["chips"] or 0) + stolen
         _pvp_mark_dirty()
-        print("[pvp] 夺走筹码 %s -%d -> %d ; %s +%d -> %d"
+        print("[pvp] 掠夺局内筹码 %s -%d -> %d ; %s +%d -> %d"
               % (p, stolen, lst["chips"], winner, stolen, wst["chips"]), flush=True)
     _pvp_state_save()
+
+
+def _pvp_slim_match(m):
+    """所有参与者都领完 → 丢掉这局的大块数据，只留重放要用的领取回执。
+
+    ★ 对局本来会**永远**留在 `_pvp_matches` 里（只有搜索队列有 TTL），而每局都带
+      results / races / race_receipts / reward_receipts / rewarded_races；
+      `_pvp_state_save(force=True)` 又在每个成功请求后整份重写 ⇒ 越玩越慢。
+      收尾时瘦身就够，先别上 SQLite（`_pvp_request` 的注释里留了这条升级路径）。
+    """
+    if not m:
+        return
+    for key in ("results", "owner", "owner_at", "earned", "races", "pending_races",
+                "race_receipts", "reward_receipts", "rewarded_races",
+                "ownership_changes", "chip_base"):
+        m.pop(key, None)
+    m["slim"] = True
 
 
 def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
@@ -2347,7 +2562,7 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     """
     now = int(time.time())
     # 本局状态（`_pvp_make_match` 建的）。`.get` 也兼容「服务器重启后客户端手上那条
-    # 我们已经没有记录的对局」——那时 `_m` 为空，一切退回合成值。
+    # 未找到的对局由路由返回404，不再制造新对局覆盖客户端。
     _m = _pvp_matches.get(match_id) or {}
     dur = int(_m.get("dur") or 0) or cfg_int("matchmaking", "match_duration_seconds",
                                              default=21600) or 21600
@@ -2363,17 +2578,7 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     if not isinstance(tlist, list) or not tlist:
         tlist = _pvp_tracks() if track is None else [int(track)]
     tlist = [int(t) for t in list(tlist)[:3] if int(t) > 0] or [_pvp_track()]
-    tickets, ticket_ts = _pvp_tickets_for(profile_id)
-    info = _pvp_player_info()
-    # 赛后奖励：整局跑完（3 条赛道都交过成绩）才算，且只有占住 ≥2 条赛道才给「赢」那一档。
-    # 以前只要 POST 过一次 race 就算赢，跑一条也发 win 档（用户 m04404 的规则是 3 局 2 胜）。
-    # ★ 这里**不要**再挂 `or not _m.get("results")` 之类的兜底：那会让「跑完但没占住任何
-    #   赛道」也发 win 档。没占住就是 default，见 m04404 的规则。
-    _rw = []
-    if _m.get("finished") and _pvp_match_won(_m, profile_id):
-        _rw = cfg("rewards", "win", default=[]) or []
-    if not _rw:
-        _rw = cfg("rewards", "default", default=[100, 0, 0])
+    _rw = _m.get("rewards", [0, 0, 0])
 
     def _track_json(tid):
         """一条赛道。★ 只发**双方真跑过的成绩**，绝不预先占位。
@@ -2432,30 +2637,25 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
                                               bike_data=(rec.get("bike_data") or bike))
         return out
 
-    # 两个槽用同一套票数/段位：parseMatch 收尾把「最后处理的那个槽」当自己、
-    # 另一个当对手（见 server/tf_server.py 上方注释），两边都给才不会踩空。
-    # ★ tickets / ticket_increased 必须发：不发 → PVPMatch+0xa8 = 0 → 扣黄金票。
-    def _slot(pid, me=False):
+    # Each slot has its own tickets/rank; rewards remains a shared match pool.
+    def _slot(pid):
         # 筹码：局内按「自己占着的赛道」随时间产（用户 m04404 的规则），
         # 没有对局（服务器重启后的补建）才退回账号总额。
         chips = _pvp_match_chips(_m, pid, now) if _m else None
         if chips is None:
             chips = _pvp_chips_for(pid)
+        info = _pvp_player_info(pid=pid)
+        slot_tickets, slot_ts = _pvp_tickets_for(pid, _m)
         return {
             "profile_id": pid,
-            "tickets": tickets,
-            "ticket_increased": ticket_ts,
+            "tickets": slot_tickets,
+            "ticket_increased": slot_ts,
             "chips": chips,
             "rank": info["rank"],
             "elo_rank": info["elo_rank"],
             "outfit": 0,
-            # ★ reward_data → parseMatch 的 `str w8,[x21,#0x1b8]` @0x4fe354，只写本机那个槽。
-            #   它是「本局特殊奖励（PVPTrack 里那一对 {145,level}）要不要真的发下去」的闸门：
-            #   onMatchEndSent @0x5e7b98 要求 `PVPMatch+0x1b8 >= 1` 才调
-            #   ItemManager::giveSpecialReward。发 0 等于把客户端自己攒的进度清零，
-            #   所以这里回显客户端经 increase_rewards 上报的 reward_data，缺省 1。
-            #   对手槽留 0，免得万一 parseMatch 是「后写的赢」而把对手的值盖到本机。
-            "reward_data": (int(_pvp_reward_data.get(pid) or 1) if me else 0),
+            # Native +0x1b8: per-player special-reward progress, not the shared pool.
+            "reward_data": int(_m.get("reward_data", {}).get(pid, 0)),
         }
     return {
         "id": match_id,
@@ -2465,7 +2665,7 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
         #   决定本地是 p1 还是 p2（不相等 → 本地 = player1），错了就会读错 chips /
         #   tickets / reward_data / 对手 profile_id（strcpy 到 match+0x131 的那个）。
         #   同理 result_pN 也是按槽位归属：本机是 player1 时，result_p1 = 本机成绩。
-        "player1": _slot(profile_id or _pvp_bot_id(), me=True),
+        "player1": _slot(profile_id or _pvp_bot_id()),
         "player2": _slot(opponent_id or _pvp_bot_id()),
         "start_time": start,
         "tracks": [_track_json(t) for t in tlist],
@@ -2506,7 +2706,7 @@ def _pvp_make_match(players, track=None, bot=False):
         "owner": {},
         # {track_id: 归属者拿到它的 unix 时间} —— 换主时重置，筹码累积速度随之重置
         "owner_at": {},
-        # {profile_id: 进这局时已有的筹码（结算基线，也是客户端显示的起点）}
+        "rewards": [0, 0, 0], "reward_data": {}, "earned": {},
         "chip_base": {},
         "bot": bool(bot),
     }
@@ -2518,10 +2718,7 @@ def _pvp_make_match(players, track=None, bot=False):
         #   （`_pvp_match_chips`），发 0 就等于每局都把对手的筹码清零
         #   （用户 m04835：「这一把AI的筹码清零了」）。
         _pvp_matches[mid]["chip_base"][p] = int(_pvp_chips_for(p) or 0)
-    for p in players:
-        if p and p != _pvp_bot_id():
-            left = _pvp_consume_ticket(p)
-            print("[pvp] 消耗局内票 %s -> %d" % (p, left), flush=True)
+    _pvp_mark_dirty()
     return mid
 
 
@@ -2538,8 +2735,10 @@ def _pvp_pair_with_human(pid, now):
             continue
         mid = _pvp_make_match([other, pid], bot=False)
         e["match_id"] = mid
+        e["new"] = False
         entry = _pvp_entry(pid) or {"at": now}
         entry["match_id"] = mid
+        entry["new"] = False
         _pvp_search[pid] = entry
         print("[pvp] 真人配对 match=%d %s <-> %s" % (mid, other, pid), flush=True)
         return mid
@@ -2550,9 +2749,26 @@ def _pvp_give_bot(pid, now, reason=""):
     entry = _pvp_entry(pid) or {"at": now}
     mid = _pvp_make_match([pid, _pvp_bot_id()], bot=True)
     entry["match_id"] = mid
+    entry["new"] = False
     _pvp_search[pid] = entry
     print("[pvp] 发人机 match=%d pid=%s (%s)" % (mid, pid, reason), flush=True)
     return mid
+
+
+def _pvp_charge_extra_match(pid, cost):
+    """并行对局超出免费名额时收黄金门票（用户回忆的机制：第 4 条起要一张金票）。
+
+    ★ 必须在**对局真的建出来之后**才调：等真人的那几十秒里 new 标记还挂着，
+      每次轮询都进这里，先扣就会被重复收票。
+    """
+    if not pid or not cost:
+        return None
+    player = _pvp_player_state(pid)
+    player["golden_ticket"] = max(0, int(player.get("golden_ticket") or 0) - int(cost))
+    _pvp_mark_dirty()
+    print("[pvp] 超出免费并行名额，收 %d 张黄金门票 -> 剩 %d pid=%s"
+          % (cost, player["golden_ticket"], pid), flush=True)
+    return player["golden_ticket"]
 
 
 def _pvp_match_info(profile_id=None, allow_create=False):
@@ -2567,35 +2783,62 @@ def _pvp_match_info(profile_id=None, allow_create=False):
 
     `allow_create=False`（pvp_init 用）：只汇报已有对局，不主动开新局——
     免得玩家刚进碉堡、还没点「全新对决」就被塞一条对局。
+
+    ★ 并行多局：`h_pvp_new_ranked` 每次被调用都会打一个「new」标记（一次显式开新局）。
+      以前只要已有未关闭对局就把旧的原样回给他，于是玩家再点「全新对决」看到的还是
+      那一局 —— 真机症状「再开一个对局会覆盖上一个对局」。免费名额
+      `matchmaking.ranked_match_slots`（= 发给客户端的 `ranked_match_slots`），
+      超出后每条收 `additional_match_cost` 张黄金门票，硬上限 `ranked_match_limit`。
+      新开的那条排在最前面。
     """
     if not profile_id:
         return {"matches": [], "waiting_requests": 0}
     now = int(time.time())
     _pvp_prune(now)
 
+    views = [_pvp_view(profile_id, mid) for mid, match in _pvp_matches.items()
+             if profile_id in match.get("players", []) and profile_id not in match.get("closed", {})]
     entry = _pvp_entry(profile_id)
-    if entry and entry.get("match_id"):
-        view = _pvp_view(profile_id, entry["match_id"])
-        if view:
-            return {"matches": [view], "waiting_requests": 0}
-        entry["match_id"] = None
+    want_new = bool(entry and entry.get("new"))
+    if not want_new:
+        if views or not allow_create or not entry:
+            return {"matches": views, "waiting_requests": 0}
+    elif not allow_create:
+        return {"matches": views, "waiting_requests": 0}
 
-    if not allow_create or not entry:
-        # 没在搜索（或不允许开新局）→ 空列表
-        return {"matches": [], "waiting_requests": 0}
+    # ★ 并行名额：前 `ranked_match_slots` 条免费，之后每开一条收
+    #   `additional_match_cost` 张黄金门票（用户回忆的机制），到 `ranked_match_limit` 封顶。
+    #   钱在对局真的建出来之后才扣（见 _pvp_charge_extra_match）。
+    cost = 0
+    if want_new:
+        slots = max(0, cfg_int("matchmaking", "ranked_match_slots", default=3))
+        limit = max(slots, cfg_int("matchmaking", "ranked_match_limit", default=10))
+        if len(views) >= limit:
+            entry["new"] = False
+            print("[pvp] 并行对局已达上限 %d，不再开新局 pid=%s" % (limit, profile_id), flush=True)
+            return {"matches": views, "waiting_requests": 0}
+        if len(views) >= slots:
+            cost = max(0, cfg_int("matchmaking", "additional_match_cost", default=1))
+            if cost and int(_pvp_player_state(profile_id).get("golden_ticket") or 0) < cost:
+                entry["new"] = False
+                print("[pvp] 免费并行名额已满 %d 且黄金门票不足（需 %d）pid=%s"
+                      % (slots, cost, profile_id), flush=True)
+                return {"matches": views, "waiting_requests": 0}
 
     if not (cfg("matchmaking", "enabled", default=True) is not False):
-        return {"matches": [], "waiting_requests": 0}
+        return {"matches": views, "waiting_requests": 0}
 
     mid = _pvp_pair_with_human(profile_id, now)
     if mid:
-        return {"matches": [_pvp_view(profile_id, mid)], "waiting_requests": 0}
+        _pvp_charge_extra_match(profile_id, cost)
+        return {"matches": [_pvp_view(profile_id, mid)] + views, "waiting_requests": 0}
 
     # ② 服务器上没有别的真人在活动 → 100% 人机，不等
     others = _pvp_online_others(profile_id)
     if not others:
         mid = _pvp_give_bot(profile_id, now, "no-other-human")
-        return {"matches": [_pvp_view(profile_id, mid)], "waiting_requests": 0}
+        _pvp_charge_extra_match(profile_id, cost)
+        return {"matches": [_pvp_view(profile_id, mid)] + views, "waiting_requests": 0}
 
     # ③ 有真人在活动但没排队 → 等 bot_wait_seconds，超时转人机
     wait = cfg_int("matchmaking", "bot_wait_seconds", default=60)
@@ -2603,11 +2846,12 @@ def _pvp_match_info(profile_id=None, allow_create=False):
         wait = 0
     if now - entry.get("at", now) >= wait:
         mid = _pvp_give_bot(profile_id, now, "timeout %ds, %d other(s) online" % (wait, len(others)))
-        return {"matches": [_pvp_view(profile_id, mid)], "waiting_requests": 0}
+        _pvp_charge_extra_match(profile_id, cost)
+        return {"matches": [_pvp_view(profile_id, mid)] + views, "waiting_requests": 0}
 
     print("[pvp] 等待真人 pid=%s 已等 %ds/%ds，在线他人 %d"
           % (profile_id, now - entry.get("at", now), wait, len(others)), flush=True)
-    return {"matches": [], "waiting_requests": 1}
+    return {"matches": views, "waiting_requests": 1}
 
 
 def h_pvp_new_ranked(path, query, body, headers):
@@ -2625,8 +2869,11 @@ def h_pvp_new_ranked(path, query, body, headers):
     print("[pvp] new_ranked pid=%s q=%s" % (pid, query), flush=True)
     if pid:
         _pvp_prune(int(time.time()))
-        _pvp_search[pid] = {"at": int(time.time()), "match_id": None}
-    info = _pvp_player_info()
+        # ★ 每次「全新对决」都是**一次显式开新局**，无条件打 new 标记。
+        #   以前只有「手上没有未关闭对局」时才排队 ⇒ 已有对局时再点一次，
+        #   matches 只会把旧对局回给他（真机症状「再开一个对局会覆盖上一个」）。
+        _pvp_search[pid] = {"at": int(time.time()), "match_id": None, "new": True}
+    info = _pvp_player_info(_pvp_chips_for(pid), pid=pid)
     return 200, {"Content-Type": "application/json"}, {
         "self": dict(info),
         "opponent": dict(info),
@@ -2637,7 +2884,7 @@ def h_pvp_init(path, query, body, headers):
     """POST /public/pvp_matches/v1/pvp_init —— 碉堡的总闸（cmd 0x27）。
 
     请求体（真机实测）：{"tracks":"1024,2,4,…","bikes":521227,"lang":"zh_Hans"}。
-    我们只需要回上面那三个成员。返回前不落盘：PVP 对局状态还没做持久化。
+    对局、奖池、票与筹码通过 _pvp_request 统一原子持久化。
     ⚠ 这里 `allow_create=False`：刚进碉堡只汇报已有对局，不主动开新局。
     """
     b = _json_body(body)
@@ -2653,7 +2900,7 @@ def h_pvp_init(path, query, body, headers):
         if ids:
             _pvp_set_tracks(pid, ids)
     return 200, {"Content-Type": "application/json"}, {
-        "player_info": _pvp_player_info(_pvp_chips_for(pid)),
+        "player_info": _pvp_player_info(_pvp_chips_for(pid), pid=pid),
         "match_info": _pvp_match_info(pid, allow_create=False),
         "pvp_config": _pvp_season(_banner_url(headers)),
     }
@@ -2681,25 +2928,7 @@ def h_pvp_matches(path, query, body, headers):
         view = _pvp_view(pid, mid)
         if view:
             return 200, {"Content-Type": "application/json"}, view
-        # 服务器重启过 / 队列过期：客户端手上那条对局我们没记录，就按同 id 补一条。
-        # ⚠ 必须带上同样的 start/dur/tracks —— 缺了 start 会让 `_pvp_match_json`
-        #   退回 `now`，倒计时又从满值开始（用户 m04404 看到的「几秒后跳回」）。
-        _now = int(time.time())
-        _tracks = _pvp_tracks()
-        _pvp_matches[mid] = {
-            "players": [pid, _pvp_bot_id()],
-            "at": _now,
-            "start": _now,
-            "dur": cfg_int("matchmaking", "match_duration_seconds", default=21600) or 21600,
-            "tracks": _tracks,
-            "track": _tracks[0],
-            "results": {},
-            "owner": {},
-            "owner_at": {},
-            "chip_base": {},
-            "bot": True,
-        }
-        return 200, {"Content-Type": "application/json"}, _pvp_view(pid, mid)
+        return _pvp_error(404, "match-not-found")
     print("[pvp] matches pid=%s" % (pid,), flush=True)
     return 200, {"Content-Type": "application/json"}, _pvp_match_info(pid, allow_create=True)
 
@@ -2713,7 +2942,7 @@ def h_pvp_player(path, query, body, headers):
     """
     print("[pvp] player %s" % path, flush=True)
     who = path.rstrip("/").rsplit("/", 1)[-1]
-    return 200, {"Content-Type": "application/json"}, _pvp_player_info(_pvp_chips_for(who))
+    return 200, {"Content-Type": "application/json"}, _pvp_player_info(_pvp_chips_for(who), pid=who)
 
 
 def h_pvp_players(path, query, body, headers):
@@ -2755,7 +2984,7 @@ def h_pvp_players(path, query, body, headers):
             if not who or who in seen:
                 continue
             seen.add(who)
-            info = _pvp_player_info(_pvp_chips_for(who))
+            info = _pvp_player_info(_pvp_chips_for(who), pid=who)
             info["profile_id"] = who
             listing.append(info)
     print("[pvp] players pid=%s -> %d 条 %s"
@@ -2774,186 +3003,264 @@ def h_pvp_config(path, query, body, headers):
 
 
 def h_pvp_season_data(path, query, body, headers):
-    """GET /public/pvp_matches/v1/season/<n>?lang=%s —— 赛季详情（cmd 0x31）。
-
-    解析器 `parseSeasonData` @0x4fe4f4，根对象直接是
-    {end_time, title_text, banner_url, rewards, rank}。
-    """
-    now = int(time.time())
-    return 200, {"Content-Type": "application/json"}, {
-        "end_time": now + 30 * 24 * 3600,
-        "title_text": "Trials Frontier",
-        "banner_url": _banner_url(headers),
-        "rank": 0,
-    }
+    try:
+        sid = int(path.rstrip("/").rsplit("/", 1)[-1])
+    except ValueError:
+        return _pvp_error(400, "invalid-season")
+    pid = _ghost_caller(headers)
+    if sid < 1:
+        sid = _pvp_player_state(pid)["season"]
+    current = _pvp_season(_banner_url(headers))["current_season"]
+    current["id"], current["start_time"], current["end_time"] = _pvp_season_window(sid)
+    state = _pvp_player_state(pid)
+    current["rank"] = state.get("season_history", {}).get(str(sid), {}).get("rank", state["rank"])
+    return 200, {"Content-Type": "application/json"}, current
 
 
 def h_pvp_close_season(path, query, body, headers):
-    """POST /public/pvp_matches/v1/close_season —— 结赛（cmd 0x36）。
+    # Native sends {}. Currency is granted locally by the season animation callback.
+    state = _pvp_player_state(_ghost_caller(headers))
+    current = _pvp_season_window()[0]
+    if state["season"] != current:
+        state.setdefault("season_history", {})[str(state["season"])] = {"rank": state["rank"], "star": state["star"]}
+        state.update(season=current, rank=max(1, min(25, cfg_int("matchmaking", "start_rank", default=25))),
+                     star=0, win_streak=0)
+    return 200, {"Content-Type": "application/json"}, {"rank": state["rank"], "star": state["star"]}
 
-    0x4fc65c 那个循环只认两个键，初值都是 -1：`rank` @0xb869b5 / `star` @0xb86947。
-    """
-    print("[pvp] close_season <- %s" % (_json_body(body),), flush=True)
-    return 200, {"Content-Type": "application/json"}, {"rank": 0, "star": 0}
+
+def _pvp_error(status, error):
+    return status, {"Content-Type": "application/json"}, {"error": error}
+
+
+def _pvp_post_match(body, headers):
+    data = _json_body(body)
+    pid = _ghost_caller(headers)
+    mid = data.get("match_id") if isinstance(data, dict) else None
+    # JSON integers only: bool and floats must not turn into valid ids.
+    match = _pvp_matches.get(mid) if type(mid) is int else None
+    if not match or pid not in match.get("players", []):
+        return data, pid, None
+    return data, pid, match
+
+
+def _pvp_receipt(pid, data):
+    return pid + ":" + hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def h_pvp_start_race(path, query, body, headers):
+    data, pid, match = _pvp_post_match(body, headers)
+    if match is None:
+        return _pvp_error(404, "match-not-found")
+    if time.time() >= match["start"] + match["dur"] or pid in match.get("closed", {}):
+        return _pvp_error(409, "match-ended")
+    tid = data.get("track")
+    # ★ 真机发的是**字符串**：`{"match_id": 1,"golden_ticket": "False","track": "1062"}`
+    #   （日志 2026-10-05 14:12:00 实测）。这里曾经写死 `type(tid) is not int` ⇒ 一律
+    #   400，客户端点「开赛」直接失败。h_pvp_race 早就容忍数字串，这里对齐，
+    #   并且**统一存成 int**（否则 h_pvp_race 的 `pending["track"] != tid` 会 409）。
+    if not (type(tid) is int or isinstance(tid, str) and tid.isdigit()):
+        return _pvp_error(400, "invalid-race")
+    tid = int(tid)
+    if tid not in match["tracks"] or data.get("golden_ticket") not in ("True", "False"):
+        return _pvp_error(400, "invalid-race")
+    norm = dict(data, track=tid)
+    pending = match.setdefault("pending_races", {})
+    # ponytail: 协议无开赛事务 id；同一未完赛请求按重试处理，换赛道是新尝试。
+    if pending.get(pid) == norm:
+        return 200, {"Content-Type": "application/json"}, {}
+    if data["golden_ticket"] == "True":
+        player = _pvp_player_state(pid)
+        if player["golden_ticket"] < 1:
+            return _pvp_error(409, "insufficient-tickets")
+        player["golden_ticket"] -= 1
+    else:
+        if _pvp_tickets_for(pid, match)[0] < 1:
+            return _pvp_error(409, "insufficient-tickets")
+        _pvp_consume_ticket(pid, match)
+    pending[pid] = norm
+    return 200, {"Content-Type": "application/json"}, {}
 
 
 def h_pvp_race(path, query, body, headers):
-    """POST /public/pvp_matches/v1/race —— 客户端交成绩（cmd 0x2d）。
-
-    ★ 响应体**必须**是 `{"ownership_changed":"True","race_id":<int>}`，不能是
-      `{"data": []}` —— 这是「打完一局不弹转盘」的根因。依据
-      `OnlinePVP::parseJsonResponse` 的 0x2d 分支 @0x4fc3a0 → `parseRace`：
-
-        "ownership_changed" @0xb86c73 : `json_strcmp(val, "True")` @0x4fc450
-                                        → `strb w8,[req+0x63]`
-          ★ 值必须**是 JSON 字符串** "True"；发布尔 true 会被当指针比较而恒为 0。
-        "race_id"          @0xb86c85 : `[req+0x30]`（缺省 −1）
-        json_parse 失败 → 监听器**根本不回调**，客户端永远卡在等待态。
-
-      解析成功后 `PVPManager::onRankedResultSubmitted` @0x5e5b90 会：
-        `PVPMatch+0x1b4 = (~ownership_changed) & 1`   ← 0 才允许弹转盘（!=0 跳过）
-        `PVPMatch+0x1bc = track`
-        `PVPMatch+0x1c0 = race_id`（唯一 writer，之后作为 w5 回传给 increase_rewards）
-
-    另一件要做的事：**记下这局已经跑完**。客户端紧接着就会 `GET matches/<id>` 回到
-    赛后界面（`MenuzStatePVPPostMatch`），那时 `_pvp_match_json` 才会把 `rewards`
-    换成「赢」那一档 —— 这是「打完一局没奖励」的修复点。
-
-    真机 body 样例：
-      {"match_id": 1,"track": "1041","timestamp": 1791121562,"score": 359974879,
-       "additional_score":0,"outfit": 3092271,"bike_data": 5,"checksum":"F3473A87…"}
-    """
-    data = _json_body(body) or {}
-    mid = data.get("match_id") if isinstance(data, dict) else None
-    try:
-        mid = int(mid)
-    except (TypeError, ValueError):
-        mid = None
-    pid = _ghost_caller(headers)
-    m = _pvp_matches.get(mid) if mid is not None else None
-    if m is not None:
-        # ★ 把这条赛道**真的**记下来。`parseMatch` 0x4fe0dc 起就是拿双方 result 的
-        #   score 比大小决定赛道归属（score 越大越快，`_pvp_score_int`），所以只要这里
-        #   存了玩家的真成绩，下一轮 `matches` 就会把它原样发回 result_p1 → 赛道真的易主。
-        #   以前不存，每轮都拿 `对手用时*1.06` 合成 → 玩家跑多快都打不过对手，
-        #   真机症状就是「我的成绩不被记录、超越他了也依然没法打败他」（用户 m04404）。
-        tid = data.get("track")
-        try:
-            tid = int(tid)
-        except (TypeError, ValueError):
-            tid = None
-        if tid is not None and pid:
-            try:
-                score = int(data.get("score") or 0)
-            except (TypeError, ValueError):
-                score = 0
-            by = m.setdefault("results", {}).setdefault(pid, {})
-            old = by.get(tid) or {}
-            if not old or score > int(old.get("score") or 0):
-                by[tid] = {
-                    "score": score,
-                    "additional_score": data.get("additional_score"),
-                    "bike_data": data.get("bike_data"),
-                    "at": int(time.time()),
-                }
-            # ★ 人机「跑」同一条赛道（用户 m04586：谁跑了谁才有数据；一局开始谁都没有
-            #   记录，玩家跑完人机才有一条自己的成绩，两条一比自己算归属）。
-            #   人机成绩被压在玩家之后（`_pvp_bot_time`）—— 用户 m04710：
-            #   「一般来说 PVP 的人机根本不跑图，默认真人赢」。
-            _pvp_bot_runs(m, tid, my_ms=_pvp_time_of_score(score))
-            # 归属变了 → 重置这条赛道的筹码累积起点
-            # （用户 m04404：对手拿回赛道后，筹码累积速度重置，又从快开始变慢）。
-            _who = _pvp_owner_of(m, tid)
-            if (m.setdefault("owner", {}).get(tid)) != _who:
-                m["owner"][tid] = _who
-                m.setdefault("owner_at", {})[tid] = int(time.time())
-                print("[pvp] 赛道 %s 易主 -> %s" % (tid, _who), flush=True)
-        m["finished"] = True
-        m["result"] = {
-            "track": data.get("track"),
-            "score": data.get("score"),
-            "additional_score": data.get("additional_score"),
-            "bike_data": data.get("bike_data"),
-            "timestamp": data.get("timestamp"),
-        }
-        # 3 条赛道都交过成绩 → 整局结束，结算筹码（幂等，见 `_pvp_bank_match_chips`）。
-        _tracks = [int(t) for t in (m.get("tracks") or [])]
-        _res = m.get("results") or {}
-        if _tracks and all(any(int(t) in (v or {}) for v in _res.values())
-                           for t in _tracks):
-            m["won"] = _pvp_match_won(m, pid)
-            print("[pvp] 整局跑完 match=%s tracks=%s won=%s"
-                  % (mid, _tracks, m.get("won")), flush=True)
-            _pvp_bank_match_chips(m)
-    # ownership_changed=1 → 客户端认为赛道易主 → 允许弹转盘 + 发特殊奖励。
-    _own = cfg("rewards", "ownership_changed", default=True)
-    print("[pvp] race match=%s <- %s" % (mid, data), flush=True)
-    return 200, {"Content-Type": "application/json"}, {
-        "ownership_changed": "True" if _own else "False",
-        "race_id": (mid if mid is not None else 0),
-    }
+    data, pid, match = _pvp_post_match(body, headers)
+    if match is None:
+        return _pvp_error(404, "match-not-found")
+    receipt = _pvp_receipt(pid, data)
+    receipts = match.setdefault("race_receipts", {})
+    if receipt in receipts:
+        return 200, {"Content-Type": "application/json"}, receipts[receipt]
+    now = int(time.time())
+    if now >= match["start"] + match["dur"] or pid in match.get("closed", {}):
+        return _pvp_error(409, "match-ended")
+    raw_track = data.get("track")
+    if not (type(raw_track) is int or isinstance(raw_track, str) and raw_track.isdigit()):
+        return _pvp_error(400, "invalid-track")
+    tid, score = int(raw_track), data.get("score")
+    if tid not in match["tracks"] or type(score) is not int or not 0 < score < 360000000:
+        return _pvp_error(400, "invalid-result")
+    pending = match.get("pending_races", {}).get(pid)
+    if not pending or pending.get("track") != tid:
+        return _pvp_error(409, "race-not-started")
+    previous_owner = _pvp_owner_of(match, tid)
+    by = match.setdefault("results", {}).setdefault(pid, {})
+    if score > int(by.get(tid, {}).get("score", 0)):
+        by[tid] = {"score": score, "additional_score": 0, "bike_data": cfg_int("matchmaking", "bike_id", default=1), "at": now}
+    _pvp_bot_runs(match, tid, now=now, my_ms=_pvp_time_of_score(score))
+    owner = _pvp_owner_of(match, tid)
+    changed = owner != previous_owner
+    if changed:
+        if previous_owner:
+            earned = match.setdefault("earned", {})
+            earned[previous_owner] = earned.get(previous_owner, 0) + _chips_at(now - match["owner_at"][tid])
+        match.setdefault("owner", {})[tid] = owner
+        match.setdefault("owner_at", {})[tid] = now
+        changes = match.setdefault("ownership_changes", {})
+        changes[pid] = changes.get(pid, 0) + 1
+    race_id = match.get("next_race_id", 1)
+    match["next_race_id"] = race_id + 1
+    match.setdefault("races", {})[str(race_id)] = pid
+    match.setdefault("pending_races", {}).pop(pid, None)
+    result = {"ownership_changed": "True" if changed else "False", "race_id": race_id}
+    receipts[receipt] = result
+    return 200, {"Content-Type": "application/json"}, result
 
 
 def h_pvp_accept(path, query, body, headers):
-    """PVP 里那些「客户端拿到响应也不解析」的 POST 的宽容接收端。
+    # tracks is just an upload acknowledgement. Reward mutation has its own handler.
+    return 200, {"Content-Type": "application/json"}, {}
 
-    `tracks`（cmd 0x2e）在跳转表里直接指向函数出口 0x4fc864，一个字节都不解析；
-    `race`（0x2d）走 `h_pvp_race`；`increase_rewards`（0x33）@0x4fc574 只回调
-    清 `PVPMatch+0x1c8`、`chips`（0x34）走 `h_pvp_chips`。
 
-    ★ `increase_rewards` 的 body 客户端**不解析**，但 body 本身含金量很高：它是
-      `PVPManager::checkMatchSpecialReward` @0x5e3f5c 发现「本局特殊奖励变了」时
-      主动上报的下一份特殊奖励，形如
-        {"race_id":0,"match_id":1,"coin":0,"gem":0,"special":0,
-         "reward_data":20008,"checksum":"…","timestamp":…}
-      这里把它记下来，下次 `_pvp_match_json` 会回显到本机槽的 `reward_data`
-      （见那条 `PVPMatch+0x1b8` 注释），免得服务器把客户端自己的进度写回 0。
-    """
-    b = _json_body(body) or {}
-    if isinstance(b, dict) and path.rstrip("/").endswith("increase_rewards"):
-        pid = _ghost_caller(headers)
-        rd = b.get("reward_data")
-        if isinstance(rd, int):
-            _pvp_reward_data[pid] = rd
-            print("[pvp] reward_data pid=%s -> %d" % (pid, rd), flush=True)
-    print("[pvp] %s <- %s -> data:[]" % (path, _json_body(body)), flush=True)
-    return 200, {"Content-Type": "application/json"}, {"data": []}
+def h_pvp_increase_rewards(path, query, body, headers):
+    data, pid, match = _pvp_post_match(body, headers)
+    if match is None:
+        return _pvp_error(404, "match-not-found")
+    semantic = {k: data.get(k) for k in ("race_id", "coin", "gem", "special", "reward_data")}
+    receipt = _pvp_receipt(pid, semantic)
+    seen = match.setdefault("reward_receipts", [])
+    if receipt in seen:
+        return 200, {"Content-Type": "application/json"}, {}
+    if match.get("_banked") or time.time() >= match["start"] + match["dur"]:
+        return _pvp_error(409, "match-ended")
+    if any(type(data.get(k)) is not int or not 0 <= data[k] <= 2147483647
+           for k in ("coin", "gem", "special", "reward_data", "race_id")):
+        return _pvp_error(400, "invalid-reward")
+    rid = data["race_id"]
+    # Native recovery/checkMatchSpecialReward sends only reward_data with race_id=0.
+    # Offline validation policy: monetary/special deltas need a completed paid race.
+    if rid == 0 and any(data[k] for k in ("coin", "gem", "special")):
+        return _pvp_error(409, "reward-without-race")
+    if rid and match.get("races", {}).get(str(rid)) != pid:
+        return _pvp_error(409, "unknown-race")
+    rewarded = match.setdefault("rewarded_races", [])
+    if rid and rid in rewarded:
+        return _pvp_error(409, "race-reward-already-recorded")
+    # Success callback increases the same shared PVPMatch pool; refresh returns totals.
+    rewards = [a + data[k] for a, k in zip(match.get("rewards", [0, 0, 0]), ("coin", "gem", "special"))]
+    if any(v > 2147483647 for v in rewards):
+        return _pvp_error(400, "reward-overflow")
+    match["rewards"] = rewards
+    match.setdefault("reward_data", {})[pid] = data["reward_data"]
+    seen.append(receipt)
+    # ponytail: 只留最近 128 个重试指纹 —— 客户端的重放窗口是「立刻重发」，
+    # 128 次请求之外的旧回执没有实用价值，留着只会让状态文件无限长大。
+    if len(seen) > 128:
+        del seen[:-128]
+    if rid:
+        rewarded.append(rid)
+    return 200, {"Content-Type": "application/json"}, {}
+
+
+def h_pvp_close(path, query, body, headers):
+    # OnlinePVP::endMatch @0x4fa87c -> /close, cmd0x2f; not a generic 200 stub.
+    data, pid, match = _pvp_post_match(body, headers)
+    if match is None:
+        return _pvp_error(404, "match-not-found")
+    closed = match.setdefault("closed", {})
+    if pid in closed:
+        return 200, {"Content-Type": "application/json"}, closed[pid]
+    if time.time() < match["start"] + match["dur"]:
+        return _pvp_error(409, "match-not-ended")
+    if data.get("create_new") not in ("True", "False") or data.get("ticket") not in ("True", "False"):
+        return _pvp_error(400, "invalid-close")
+    _pvp_bank_match_chips(match)
+    winner = next((p for p in match["players"] if _pvp_match_won(match, p)), "")
+    state = _pvp_player_state(pid)
+    rank = state["rank"]
+    caps = _pvp_star_array()
+    if winner == pid:
+        state["win_streak"] += 1
+        for _ in range(2 if state["win_streak"] >= 3 else 1):
+            rank = state["rank"]
+            if rank == 0:
+                state["star"] = 0
+            elif state["star"] >= caps[rank - 1]:
+                state["rank"], state["star"] = rank - 1, 1
+            else:
+                state["star"] += 1
+    elif winner:
+        state["win_streak"] = 0
+        if 0 < rank < 20:
+            if state["star"] == 0 and rank < 15:
+                state["rank"], state["star"] = rank + 1, max(0, caps[rank] - 1)
+            else:
+                state["star"] = max(0, state["star"] - 1)
+    result = {"ownership_changes": match.get("ownership_changes", {}).get(pid, 0)}
+    if winner:
+        result["last_match_winner"] = winner
+    closed[pid] = result
+    # 双方都领完了 → 瘦身（必须等最后一个人算完胜负，否则 _pvp_match_won 读不到成绩）。
+    if all(p in closed for p in (match.get("players") or [])):
+        _pvp_slim_match(match)
+    _pvp_search.pop(pid, None)
+    if data["create_new"] == "True":
+        # 客户端要求「再来一局」→ 和「全新对决」同一条路：打 new 标记后由
+        # _pvp_match_info 真开一条（并行上限见 matchmaking.ranked_match_slots）。
+        _pvp_search[pid] = {"at": int(time.time()), "match_id": None, "new": True}
+        _pvp_match_info(pid, allow_create=True)
+    # onMatchEndSent grants this match's coins/gems/special locally. Never add to save here.
+    return 200, {"Content-Type": "application/json"}, result
 
 
 def h_pvp_chips(path, query, body, headers):
-    """POST /public/pvp_matches/v1/chips —— 花筹码（cmd 0x34）。
-
-    `OnlinePVP::parseJsonResponse` 的 0x34 分支 @0x4fc5a8 遍历根对象成员，
-    只认键 `chips` @0xb49233（int），取到后回调
-    `listener->vtable[0x58]`（= `PVPManager::onChipsSpent(err, chips)` @0x5e6fdc）。
-    ⇒ 响应体**必须**是 `{"chips": <剩余筹码>}`，回 `{"data": []}` 会让余额变 0。
-    请求体形状未逆完，这里把常见键名都当成要扣的数量。
-    """
+    # OnlinePVP::spendChips @0x4fb1f8 sends exactly {"use_chips": N}.
+    data = _json_body(body)
+    amount = data.get("use_chips") if isinstance(data, dict) else None
+    if type(amount) is not int or not 0 < amount <= 2147483647:
+        return _pvp_error(400, "invalid-chip-amount")
     pid = _ghost_caller(headers)
-    b = _json_body(body)
-    amount = 0
-    if isinstance(b, dict):
-        for key in ("chips", "amount", "num", "value", "price"):
-            try:
-                amount = int(b.get(key) or 0)
-            except (TypeError, ValueError):
-                amount = 0
-            if amount:
-                break
-        if not amount:
-            # body 形如 {"items":[{"price":N},…]} / {"products":[…]} 时兜底累加
-            for key in ("items", "products", "chip_store_items"):
-                lst = b.get(key)
-                if isinstance(lst, list):
-                    for it in lst:
-                        if isinstance(it, dict):
-                            try:
-                                amount += int(it.get("price") or it.get("amount") or 0)
-                            except (TypeError, ValueError):
-                                pass
+    if not pid:
+        return _pvp_error(401, "unauthenticated")
+    if _pvp_chips_for(pid) < amount:
+        return _pvp_error(409, "insufficient-chips")
     left = _pvp_spend_chips(pid, amount)
-    print("[pvp] chips <- %s 扣 %d -> %d" % (b, amount, left), flush=True)
     return 200, {"Content-Type": "application/json"}, {"chips": left}
+
+
+def h_pvp_purchase_tickets(path, query, body, headers):
+    data = dict(parse_qsl(query or ""))
+    try:
+        num, price = int(data["num"]), int(data["price"])
+    except (KeyError, TypeError, ValueError):
+        return _pvp_error(400, "invalid-ticket-purchase")
+    unit_price = next((v["amount"] for v in _pvp_product_list()
+                       if v["product_id"] == "chip_shop.goldentickets"), 0)
+    # 客户端算法（`purchaseChipstoreItem @0x5e6e1c` + UI @0x6451f4）：
+    #     total = int(float(num * amount) * multiplier + 0.5) ; price = total // num
+    # multiplier 来自**玩家拥有的 type9 套装**（`getCurrentPVPChipStorePriceMultiplier
+    # @0x582040`），服务端不重建这套持有关系。所以合法的 price 是 `0 < price <= 基价`
+    # —— 上界由服务端价表钉死（不许抬价），下界只可能是客户端自己的折扣。
+    # 原来要求 price == unit_price，穿折扣套装买金票一律 400。
+    if num <= 0 or not 0 < price <= unit_price or num * price > 2147483647:
+        return _pvp_error(400, "invalid-ticket-purchase")
+    pid = _ghost_caller(headers)
+    if not pid:
+        return _pvp_error(401, "unauthenticated")
+    state = _pvp_player_state(pid)
+    if state["golden_ticket"] + num > 2147483647 or _pvp_chips_for(pid) < num * price:
+        return _pvp_error(409, "insufficient-chips")
+    left = _pvp_spend_chips(pid, num * price)
+    state["golden_ticket"] += num
+    return 200, {"Content-Type": "application/json"}, {"chips": left, "golden_ticket": state["golden_ticket"]}
 
 
 def h_ghost_upload(path, query, body, headers):
@@ -3680,6 +3987,10 @@ def h_gift(path, query, body, headers):
 
 
 DYNAMIC_EXACT = [
+    # gamecfg：启动序列的第一条（`GET /?product=101&portal=Google&version=…`）以及
+    # 游客设备注册（`POST /?action=register_device&deviceuid=…`）。见 h_gamecfg。
+    ("GET", "/", h_gamecfg),
+    ("POST", "/", h_gamecfg),
     ("POST", "/public/resultservice/v1/enhancestats/batch_update", h_result_stats),
     ("POST", "/public/resultservice/v1/enhancestats/track", h_result_stats),
     ("POST", "/public/playerprogress/v1/progress", h_progress),
@@ -3719,6 +4030,9 @@ DYNAMIC_EXACT = [
 ]
 
 DYNAMIC = [
+    # 应用配置：里面的 sandbox url 是客户端 `setserverAddress` 的基址，
+    # 必须按请求 Host 回显（否则 Java 侧永远拿 127.0.0.1）。见 h_app_configuration。
+    ("GET", "/v1/applications/", h_app_configuration),
     ("GET", "/public/timeservice/v1/gettime", h_timeservice),
     # 排行榜与玩家统计（板名在路径末段，只能用前缀匹配）：
     #   /public/playerstats/v1/ranking/{track66633|track1097|legends|global_stats…}
@@ -3767,11 +4081,12 @@ DYNAMIC = [
     ("POST", "/public/pvp_matches/v1/close_season", h_pvp_close_season),
     # 开赛（cmd 0x2c）：`OnlinePVP::startRace` @0x4fa22c 用 postJson 发
     # {"match_id":%d,"golden_ticket":"True"|"False","track":%d}；响应侧
-    # @0x4fc358 一个字节的 JSON 都不解析（只据 `[query+0x62]` 决定要不要
-    # 顺带拉一条 PVP 幽灵），所以回个 200 就够。
-    ("POST", "/public/pvp_matches/v1/start_race", h_pvp_accept),
+    # @0x4fc358 不解析回包，但成功会开赛；服务器仍必须验证并持久扣票。
+    ("POST", "/public/pvp_matches/v1/start_race", h_pvp_start_race),
     ("POST", "/public/pvp_matches/v1/race", h_pvp_race),
-    ("POST", "/public/pvp_matches/v1/increase_rewards", h_pvp_accept),
+    ("POST", "/public/pvp_matches/v1/increase_rewards", h_pvp_increase_rewards),
+    ("POST", "/public/pvp_matches/v1/close", h_pvp_close),
+    ("GET", "/public/pvp_matches/v1/purchase_tickets", h_pvp_purchase_tickets),
     # --- 礼物 / 战争房间 ------------------------------------------------------
     # URL 末段是 op（get_gifts / gifts / claim?type= / give_golden_ticket /
     # send_gifts / ad_reward），只能前缀匹配；GET 与 POST 都要注册。
@@ -3779,6 +4094,10 @@ DYNAMIC = [
     ("POST", "/public/gift/v1/", h_gift),
     ("POST", "/public/pvp_matches/v1/chips", h_pvp_chips),
 ]
+
+
+DYNAMIC = [(method, prefix, _pvp_request(fn) if prefix.startswith("/public/pvp_matches/v1/") else fn)
+           for method, prefix, fn in DYNAMIC]
 
 
 def pick_dynamic(method, path):
@@ -3812,6 +4131,11 @@ def pick_dynamic(method, path):
         return (h_ghost_upload if method == "POST" else h_ghost), "dyn:ghost"
     for m, prefix, fn in DYNAMIC:
         if m == method and path.startswith(prefix):
+            if prefix.startswith("/public/pvp_matches/v1/"):
+                # Mutations must match the endpoint, not e.g. /close_typo.
+                if not prefix.endswith("/") and stripped != prefix:
+                    if not (prefix.endswith("/matches") and _PVP_MATCH_RE.fullmatch(stripped)):
+                        continue
             return fn, "dyn:%s" % prefix
     return None, None
 

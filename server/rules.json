@@ -12,23 +12,7 @@
     "body": { "data": [] }
   },
 
-  "GET /v1/applications/": {
-    "status": 200,
-    "headers": { "Content-Type": "application/json" },
-    "body": {
-      "configuration": {
-        "sandboxes": {
-          "triag_an_lnch61_a_ws": {
-            "name": "triag_an_lnch61_a_ws",
-            "friendlyName": "triag_an_lnch61_a_ws",
-            "url": "http://127.0.0.1:8000/"
-          }
-        },
-        "Anticheating_Enabled": false,
-        "setOnlineConfigured": true
-      }
-    }
-  },
+  "//appconfig": "GET /v1/applications/<appid>/configuration 现在由 tf_server.py 的 h_app_configuration 动态处理：sandbox url 必须按请求 Host 回显，写死 127.0.0.1 会逼客户端开 adb reverse。这条静态规则已删除。",
 
   "POST /v3/profiles/sessions": {
     "status": 200,
