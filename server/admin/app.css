@@ -544,6 +544,19 @@ table.list.compact td { padding: 7px 14px; }
 }
 .chip:active { transform: scale(.9); }
 .chip[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: var(--accent-ink); font-weight: 600; }
+/* 好友芯片（账号页社交卡）：名字 + 一颗小小的移除按钮 */
+.friend {
+  display: inline-flex; align-items: center; gap: 4px; padding: 4px 6px 4px 10px;
+  border-radius: 999px; border: 1px solid var(--stroke); background: var(--field);
+  color: var(--text); font-size: 12px;
+}
+.friend button {
+  border: 0; background: none; color: var(--text-3); cursor: pointer;
+  font: inherit; font-size: 14px; line-height: 1; padding: 0 3px; border-radius: 999px;
+  transition: color var(--dur-quick) var(--spring), transform var(--dur-quick) var(--spring);
+}
+.friend button:hover { color: var(--danger); }
+.friend button:active { transform: scale(.88); }
 @media (max-width: 700px) { .tierrow { grid-template-columns: 1fr; } }
 
 /* 模板行 */

@@ -158,6 +158,16 @@
   （`_pvp_owner_of` ↔ `parseMatch` 0x4fe0dc）。2026-10-06 之前是「3 条里占住 ≥2 条」，在「到点被
   截断、只跑完 1 条」的真机局里会算出平局而与屏幕（判胜利）打架 —— 见 `[pvp] close …` 那行日志。
 
+- **昵称（`nameOnPlatform`）与好友关系**
+  昵称 = 别的玩家在排行榜 / 好友列表里看到的名字，存在 `accounts.json` / `devices.json`
+  （没注册账号的静默设备也有，默认 `Player-XXXXXX`）；**3–24 字符、大小写不敏感去重**。
+  好友关系存在 `server/data/friends.json`，**双向**（A 加 B ⇒ B 的列表里也有 A），
+  由 `/__admin` 的「账号」页（`GET|POST /__api/admin/social`）维护 ——
+  ★ 游戏里**没有**「加好友」这个动作：唯一接口 `tr::OnlineFriends::addFriend @0x51bed4`
+  的调用者只有育碧 UPlay 覆盖层那条线（原版就是把好友请求交给 UPlay），私服接不到。
+  客户端只负责**显示** `GET /v2/profiles/me/friends` 给的那份列表，服务器没给的条目会被它删掉。
+  空列表必须回 `{"friends":[]}`（回 `{}` 会让解析器读 NULL+0x10 直接 SIGSEGV）。
+
 - **车辆级别（tier）与图的车辆级别（`B`）**
   每辆车在原表 `/conf/bikes.txt` 里有 `Tier`（0 / 1 / 2，**255 = 不限**）；每张图在
   `/conf/levels.txt` 里有 `B` = 这张图要求的车辆级别（**255 = 不限**）。

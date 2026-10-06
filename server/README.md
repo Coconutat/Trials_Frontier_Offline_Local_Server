@@ -352,6 +352,17 @@ python -m unittest discover -s tests -v
 | POST | `/public/targeting/v1/vip_registration`、`/private/targeting/v1/direct_vip_registration` | `h_vip_registration` |
 | GET/POST | `/public/targeting/v1/vip_badge_option` | `h_vip_badge_option` |
 | POST | `/public/friends/v1/update` | `h_friends_update` |
+| GET | `/v2/profiles/me/friends` | `h_friends_list`（**不是** rules.json 的桩；按登录者查 `server/data/friends.json`）|
+
+> **好友列表是「后台维护的真关系」**（2026-10-07）。★ 游戏里**没有**加好友这回事：
+> 唯一接口 `tr::OnlineFriends::addFriend @0x51bed4` 的调用者全在 UPlay 覆盖层那条线上，
+> 私服接不到；客户端只负责**显示** —— `onFriendlistRecieved @0x51cee8` 收完立刻
+> `syncFriendList()`，**服务器没给的条目会被它从本地好友表删掉**。
+> 所以关系只能在 `/__admin` 的「账号」页维护（加/删好友、改昵称），游戏内立即可见。
+> 昵称（`nameOnPlatform`）也在那里改，落到 `accounts.json` / `devices.json`。
+> 形状约束（客户端会崩的那种）见 `rules.json` 的 `//friends2~4`：**空列表也必须回
+> `{"friends":[]}`**（`{}` 会让 `0x51cf18` 读 NULL+0x10 ⇒ SIGSEGV），三个值必须是字符串，
+> `pid` 必须排在 `nameOnPlatform` 之前。
 
 > ⚠ **真钱内购无法靠服务器伪造**。`receiptvalidation` 回成功只会让客户端再调
 > `IAPManager::purchase()` 去问 Google Play；真正发奖的入口是
@@ -551,6 +562,7 @@ python -m unittest discover -s tests -v
 | `GET\|POST /__api/admin/bunker` | 碉堡运营参数（GET = 8 张卡的字段表 + 当前值 + 现状（赛季/玩家/对局/队列/在线/警告）+ 赛道与 `rewards`（全 309 条，带 `official` 标记）、`bikes`（19 辆，带级别/剧情标记）目录 + 模板 + 最近改动；POST 同 weekly 的 `{fields:{…}}` 契约，空值 = 删键回默认） |
 | `POST /__api/admin/undo` | 撤销一条参数改动（`{id}` 来自 weekly / bunker 的 `audit`；按记录里的 `existed` 决定写回还是删键） |
 | `GET\|POST /__api/admin/templates` | 参数模板（GET `?page=weekly\|bunker`；POST `{page,action:save\|apply\|copy\|rename\|delete,name,new_name,parts}`，`parts` 可 `all` / `rewards`） |
+| `GET\|POST /__api/admin/social` | 昵称与好友（GET = 本服所有真人（账号 + 设备槽）及其好友、`links` 对数；POST `{action:"rename",profile,nameOnPlatform}` 改昵称 / `{action:"set_friends",profile,friends:[pid,…]}` 整表替换好友，**双向**写 `server/data/friends.json`）|
 
 ### 7.3 下发的两条通道（别搞混）
 
