@@ -184,6 +184,77 @@ def find_customization(packout):
     return None
 
 
+def _find_by_keys(packout, keys):
+    """按内容找表：raw 里同时出现这些字段名。返回路径 or None。"""
+    for p in sorted(glob.glob(os.path.join(packout, "*.bin"))):
+        raw = open(p, "rb").read()
+        if all(k in raw for k in keys):
+            return p
+    return None
+
+
+def load_levels(packout, en, cn):
+    """→ {str(LevelID): {key, en, cn}}；表 = /conf/levels.txt（`Levels` + `Villages`）。
+
+    后台的赛道下拉靠它：午夜杯的 `weekly.track_id`、碉堡的 `candidate_tracks`/
+    `track_ids` 都是这张表的 **Level ID**（1041 这类）。名字走 LOCF（`N` 就是键），
+    注意 382 条里有几条没有本地化文本，前端要能退化成显示编号。
+    """
+    path = _find_by_keys(packout, (b'"Levels"', b'"Villages"'))
+    if not path:
+        return {}
+    doc = load_json_tolerant(open(path, "rb").read()) or {}
+    out = {}
+    for node in doc.get("Levels") or []:
+        try:
+            lid = int(node.get("ID"))
+        except (TypeError, ValueError):
+            continue
+        key = (node.get("N") or "").strip()
+        out[str(lid)] = {"key": key,
+                         "en": en.get(gh(key), "") if key else "",
+                         "cn": cn.get(gh(key), "") if key else ""}
+    return out
+
+
+def load_rewards(packout, en, cn, items):
+    """→ {str(RewardID): {name, cn, item_id, type, cat}}；表 = /conf/pvp_match_rewards.txt。
+
+    ★ 这是「奖励 ID」空间，**不是物品栏 ItemId**：季奖里 `item_id:145, amount:RewardID`
+    的 amount 就取自这里（客户端 `getSpecialRewardById` 查同一张表）。
+    `cat` 是给下拉分组的（coin/gem/special + 物品目录里那一类）。
+    名字优先要官方本地化（`NameId`），没有就退回表里的 `Comment`。
+    """
+    path = _find_by_keys(packout, (b'"PVPMatchRewardTypes"',))
+    if not path:
+        return {}
+    doc = load_json_tolerant(open(path, "rb").read()) or {}
+    out = {}
+    for node in doc.get("PVPMatchRewardTypes") or []:
+        rid = node.get("ID")
+        if not isinstance(rid, int):
+            continue
+        iid = node.get("ItemId")
+        key = (node.get("NameId") or "").strip()
+        e = en.get(gh(key), "") if key else ""
+        c = cn.get(gh(key), "") if key else ""
+        comment = (node.get("Comment") or "").strip()
+        if iid == 1:
+            cat = "coin"
+        elif iid == 2:
+            cat = "gem"
+        elif iid == 145:
+            cat = "special"
+        else:
+            cat = (items.get(str(iid)) or {}).get("cat") or "other"
+        out[str(rid)] = {"name": e or comment or ("RewardID %d" % rid),
+                         "cn": c or e or comment or ("奖励 %d" % rid),
+                         "item_id": iid if isinstance(iid, int) else 0,
+                         "type": node.get("Type") if isinstance(node.get("Type"), int) else 0,
+                         "cat": cat}
+    return out
+
+
 def load_outfits(packout, en, cn):
     """→ {setKey: {...}}；setKey = "OUTFIT_34#116"（黑/橙两套共用同一个 OUTFIT 名）。"""
     path = find_customization(packout)
@@ -515,12 +586,18 @@ def main():
     # 涂装：108 款，编号不是 items2 的键（键 = 664 + 车号，位 = 该车第几款），单独一张表。
     paints = load_paints(args.packout, en, cn, shop)
 
+    # 赛道表（382 条 Level ID）与「奖励 ID」表（309 条）：后台的下拉数据。
+    # 都不进 items 键空间，另开顶层段（`items` 的数量断言不受影响）。
+    levels = load_levels(args.packout, en, cn)
+    rewards = load_rewards(args.packout, en, cn, items)
+
     # 赛道碎片 id 与「赛道」同族，合到一张卡里给运维看，别单开一类天天被点错。
     out = {
         "source": {"packout": os.path.basename(args.packout),
                    "en": "1516", "cn": "1523",
                    "items": len(items), "outfits": len(outfits), "paints": len(paints),
-                   "blueprints": len(blueprints),
+                   "blueprints": len(blueprints), "levels": len(levels),
+                   "rewards": len(rewards),
                    "blueprint_bikes": bp_have, "no_blueprint_bikes": bp_miss,
                    "overlap_ids": overlap, "skipped_files": bad},
         "categories": [
@@ -533,6 +610,8 @@ def main():
         ],
         "outfits": outfits,
         "paints": paints,
+        "levels": levels,
+        "rewards": rewards,
         "items": items,
     }
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -550,6 +629,10 @@ def main():
              len(paints), sum(1 for p in paints.values() if p["verified"]),
              len({p["bike"] for p in paints.values()}),
              len(blueprints), len(bp_have), len(bp_miss)))
+    print("赛道表 %d 条（有英文名 %d）、奖励 ID 表 %d 条（%s）"
+          % (len(levels), sum(1 for v in levels.values() if v["en"]),
+             len(rewards), dict(collections.Counter(
+                 v["cat"] for v in rewards.values()))))
     print("分类 %s；%d 个配置解析失败；%d 个 id 与赛道解锁撞车（已按服装归类）"
           % (dict(cats), len(bad), len(overlap)))
     for b in bad[:5]:

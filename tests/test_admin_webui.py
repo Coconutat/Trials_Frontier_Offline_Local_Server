@@ -854,13 +854,18 @@ class ItemCatalog(Base):
 
     def test_shape_and_count_agree(self):
         c = self.cat
-        self.assertEqual(sorted(c), ["categories", "items", "outfits", "paints", "source"])
+        self.assertEqual(sorted(c), ["categories", "items", "levels", "outfits", "paints",
+                                     "rewards", "source"])
         self.assertEqual(c["source"]["items"], len(c["items"]),
                          "source.items 与实际条数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertEqual(c["source"]["outfits"], len(c["outfits"]),
                          "source.outfits 与实际套数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertEqual(c["source"]["paints"], len(c["paints"]),
                          "source.paints 与实际款数不一致（重新跑 tools/build_item_catalog.py）")
+        self.assertEqual(c["source"]["levels"], len(c["levels"]),
+                         "source.levels 与实际赛道数不一致（重新跑 tools/build_item_catalog.py）")
+        self.assertEqual(c["source"]["rewards"], len(c["rewards"]),
+                         "source.rewards 与实际奖励 ID 数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertTrue(c["source"]["en"] and c["source"]["cn"], "没记本地化表来源")
         self.assertGreater(len(c["items"]), 300)
 
@@ -1157,10 +1162,10 @@ class Blueprints(Base):
 
 
 # ---------------------------------------------------------------- 运营参数
-class WeeklyOps(Base):
-    """`/__api/admin/weekly` · `/__api/admin/undo` · `/__api/admin/templates`。
+class _ParamOps(Base):
+    """运营屏（午夜杯 / 碉堡）共用的夹具。
 
-    ★ 这三个端点**真的会改 tf_config.json / templates.json / config_audit.jsonl**。
+    ★ 这些端点**真的会改 tf_config.json / templates.json / config_audit.jsonl**。
       所以每个用例都把这三条路径指到临时目录 —— 顺带证明它们是可注入的，
       谁也不许把线上一份参数改了。
     """
@@ -1192,11 +1197,6 @@ class WeeklyOps(Base):
         self.assertTrue(handled, path)
         return r
 
-    def set_fields(self, fields, expect=200):
-        r = self.post("/__api/admin/weekly", {"fields": fields})
-        self.assertEqual(r.status, expect, r.text)
-        return r
-
     def config_file(self):
         """磁盘上的 tf_config.json 原文 —— 端点必须真写盘，不是只改内存。"""
         try:
@@ -1212,6 +1212,15 @@ class WeeklyOps(Base):
         srv._CONFIG_CACHE["mtime"] = None
         srv._CONFIG_CACHE["data"] = None
         return node
+
+
+class WeeklyOps(_ParamOps):
+    """`/__api/admin/weekly` · `/__api/admin/undo` · `/__api/admin/templates`。"""
+
+    def set_fields(self, fields, expect=200):
+        r = self.post("/__api/admin/weekly", {"fields": fields})
+        self.assertEqual(r.status, expect, r.text)
+        return r
 
     # ---------------------------------------------------------------- 读
     def test_get_hands_out_everything_the_screen_needs(self):
@@ -1388,22 +1397,285 @@ class WeeklyOps(Base):
     # ---------------------------------------------------------------- 赛道目录
     def test_track_catalog_reads_the_levels_section(self):
         """赛道下拉：有 levels 段就给名字；没有就空表（界面退化成手填，绝不猜名字）。"""
-        self.assertEqual(srv.track_catalog(), [])
+        # 真目录里现在有 levels 段（382 条赛道），所以「没有那段」这条路要拿临时目录试。
+        self.assertTrue(srv.track_catalog())
         p = patch.object(srv, "_TRACK_CATALOG_PATH", str(Path(self.tmp.name) / "items.json"))
         p.start()
         self.addCleanup(p.stop)
-        with open(srv._TRACK_CATALOG_PATH, "w", encoding="utf-8") as fp:
-            json.dump({"levels": {"1042": {"en": "Docks", "cn": "码头"},
-                                  "1041": {"cn": "训练场"}}}, fp)
-        srv._TRACK_CACHE["mtime"] = None
-        srv._TRACK_CACHE["rows"] = []
-        self.assertEqual(srv.track_catalog(),
+
+        def catalog_with(doc):
+            with open(srv._TRACK_CATALOG_PATH, "w", encoding="utf-8") as fp:
+                json.dump(doc, fp)
+            srv._TRACK_CACHE["mtime"] = None
+            srv._TRACK_CACHE["rows"] = []
+            return srv.track_catalog()
+
+        self.assertEqual(catalog_with({"items": {}}), [])
+        self.assertEqual(catalog_with({"levels": {"1042": {"en": "Docks", "cn": "码头"},
+                                                 "1041": {"cn": "训练场"}}}),
                          [{"id": 1041, "name": "训练场", "name_cn": "训练场"},
                           {"id": 1042, "name": "Docks", "name_cn": "码头"}])
         self.assertEqual(self.get()["tracks"], srv.track_catalog())
 
 
 # ---------------------------------------------------------------- 文案
+# ---------------------------------------------------------------- 碉堡（PVP 运营）
+class Bunker(_ParamOps):
+    """`/__api/admin/bunker`，以及它复用的 `/__api/admin/undo` · `/__api/admin/templates`。
+
+    碉堡是跟午夜杯**各自独立**的第二张运营屏：字段表在服务端（`_BUNKER_FIELDS`），
+    前端照着 `kind` 画控件，写入仍然一条审计 + 一次撤销。
+    """
+
+    CARDS = ["now", "season", "duration", "rank", "match", "chips", "rewards", "templates"]
+    KINDS = ("int", "float", "bool", "text", "banner", "stars", "ids", "rewards", "products")
+
+    def bget(self):
+        return self.get("/__api/admin/bunker")
+
+    def bset(self, fields, expect=200):
+        r = self.post("/__api/admin/bunker", {"fields": fields})
+        self.assertEqual(r.status, expect, r.text)
+        return r
+
+    # ---------------------------------------------------------------- 读
+    def test_get_hands_out_every_card_and_field(self):
+        """界面要的东西一次给全：8 张卡 + 服务端字段表 + 现状 + 三个目录 + 模板 + 审计。"""
+        j = self.bget()
+        for key in ("cards", "fields", "values", "status", "tracks", "rewards", "bikes",
+                    "templates", "audit"):
+            self.assertIn(key, j)
+        self.assertEqual([c["id"] for c in j["cards"]], self.CARDS)
+        self.assertTrue(all(c["cn"] and c["en"] for c in j["cards"]))
+        self.assertEqual({f["key"] for f in j["fields"]}, set(srv._BUNKER_KEYS))
+        self.assertEqual(sorted(j["values"]), sorted(srv._BUNKER_KEYS))
+        ids = {c["id"] for c in j["cards"]}
+        for f in j["fields"]:
+            self.assertIn(f["card"], ids, f["key"])
+            self.assertIn(f["kind"], self.KINDS, f["key"])
+            self.assertTrue(f["cn"] and f["en"], "字段标签必须中英双语（不进 i18n）：" + f["key"])
+            self.assertIn("now", f, f["key"])
+        # 现状卡是只读、模板卡是列表：都没有表单字段
+        self.assertEqual([f["key"] for f in j["fields"] if f["card"] == "now"], [])
+        self.assertEqual([f["key"] for f in j["fields"] if f["card"] == "templates"], [])
+
+    def test_status_alone_writes_nothing(self):
+        self.bget()
+        self.assertEqual(self.config_file(), {})
+        self.assertEqual(srv.audit_log(20), [])
+
+    def test_status_reports_the_season_and_warns(self):
+        s = self.bget()["status"]
+        self.assertGreaterEqual(s["season"], 1)
+        self.assertEqual(s["display_id"], s["season"])            # 默认显示偏移 0
+        self.assertEqual(s["end"] - s["start"], s["duration_days"] * 86400)
+        self.assertTrue(s["warnings"], "现状卡必须带上警示")
+        for w in s["warnings"]:
+            self.assertTrue(w["cn"] and w["en"])
+        for p in s["players"]:                                     # 玩家档案表
+            self.assertEqual(set(p), {"profile", "rank", "star", "season", "this_season",
+                                      "golden_ticket", "win_streak", "chips"})
+            self.assertIsInstance(p["rank"], int)
+            self.assertIsInstance(p["this_season"], bool)
+
+    def test_catalogs_come_from_the_item_catalog(self):
+        """奖励下拉 = 客户端原表的 RewardID→名字（去掉金币/钻石，它们有专门的框）。"""
+        j = self.bget()
+        self.assertEqual(len(j["tracks"]), len(srv.track_catalog()))
+        self.assertTrue(all({"id", "name"} <= set(b) for b in j["bikes"]))
+        cat = [r for r in j["rewards"]]
+        self.assertTrue(len(cat) > 200, "奖励下拉只剩 %d 条" % len(cat))
+        self.assertEqual([r["id"] for r in cat], sorted(r["id"] for r in cat))
+        self.assertNotIn(1, [r["item_id"] for r in cat], "金币不该出现在特殊奖励下拉里")
+        self.assertNotIn(2, [r["item_id"] for r in cat], "钻石不该出现在特殊奖励下拉里")
+        self.assertTrue(all(r["name"] for r in cat))
+
+    def test_status_players_are_read_only(self):
+        """现状卡里的玩家档案只是看一眼：不许写配置，也不许在审计里留东西。"""
+        s = self.bget()["status"]
+        for p in s["players"]:
+            self.assertTrue(p["profile"])
+        self.assertEqual(self.config_file(), {})
+        self.assertEqual(srv.audit_log(20), [])
+
+    # ---------------------------------------------------------------- 写
+    def test_int_field_round_trips_and_says_what_changed(self):
+        self.write_config({"matchmaking": {"match_duration_seconds": 21600}})
+        j = self.bset({"matchmaking.match_duration_seconds": 7200}).json()
+        first = j["applied"][0]
+        self.assertEqual(first["key"], "matchmaking.match_duration_seconds")
+        self.assertEqual((first["before"], first["after"]), (21600, 7200))
+        self.assertTrue(first["audit"], "没给「撤销」留审计编号")
+        self.assertEqual(self.config_file()["matchmaking"]["match_duration_seconds"], 7200)
+        self.assertEqual(j["values"]["matchmaking.match_duration_seconds"], 7200)
+        rec = j["audit"][0]
+        self.assertEqual((rec["kind"], rec["path"]),
+                         ("bunker", ["matchmaking", "match_duration_seconds"]))
+
+    def test_friendly_match_duration_is_configurable_now(self):
+        """原来 `_pvp_season()` 里写死 3600，现在必须是配置键。"""
+        j = self.bset({"matchmaking.friendly_match_duration": 1800}).json()
+        self.assertEqual(j["values"]["matchmaking.friendly_match_duration"], 1800)
+        self.assertEqual(self.config_file()["matchmaking"]["friendly_match_duration"], 1800)
+
+    def test_apply_is_all_or_nothing(self):
+        r = self.bset({"season.duration_days": 400, "chips.max": 1}, expect=400)
+        self.assertEqual(r.json()["error"], "range:season.duration_days:1-365")
+        self.assertEqual(self.config_file(), {}, "非法请求居然写盘了")
+        self.assertEqual(srv.bunker_values()["season.duration_days"], 30)
+
+    def test_rejects_junk_and_translates_the_message(self):
+        cases = [({"nope": 1}, "unknown-key:nope"),
+                 ({"season.duration_days": 400}, "range:season.duration_days:1-365"),
+                 ({"season.duration_days": "abc"}, "bad-value:season.duration_days"),
+                 ({"season.duration_days": 3.5}, "bad-value:season.duration_days"),
+                 ({"season.title_text": "a|b"}, "bad-pipe"),
+                 ({"season.banner_path": "/etc/passwd"}, "bad-banner"),
+                 ({"season.banner_path": "/pvp_banner/x.jpg"}, "bad-banner"),
+                 ({"season.star_array": [1, 2, 3]}, "bad-stars"),
+                 ({"season.star_array": [3] * 25 + [101]}, "range:season.star_array:0-100"),
+                 ({"season.rewards": []}, "bad-rewards"),
+                 ({"season.rewards": [{"rank": 30, "item_id": 1, "amount": 1}]},
+                  "range:season.rewards(名次):0-25"),
+                 ({"season.rewards": [{"rank": 1, "item_id": 7, "amount": 1}]},
+                  "bad-reward-item:7"),
+                 ({"season.product_list": "nope"}, "bad-products"),
+                 ({"matchmaking.enabled": "maybe"}, "bad-value:matchmaking.enabled")]
+        for fields, code in cases:
+            r = self.bset(fields, expect=400)
+            self.assertEqual(r.json()["error"], code, fields)
+            msg = r.json()["message"]
+            self.assertTrue(msg, "错误没翻成中文：" + code)
+            self.assertNotIn(":", msg, "界面不该看到错误码：" + msg)
+        self.assertEqual(self.config_file(), {})
+
+    def test_bool_and_float_are_coerced(self):
+        j = self.bset({"matchmaking.enabled": 0, "season.chip_equation_x": "0.25"}).json()
+        self.assertIs(j["values"]["matchmaking.enabled"], False)
+        self.assertEqual(j["values"]["season.chip_equation_x"], 0.25)
+        self.assertIs(self.config_file()["matchmaking"]["enabled"], False)
+
+    def test_null_removes_the_key_and_the_default_comes_back(self):
+        self.bset({"season.display_offset": 5})
+        self.assertEqual(self.config_file()["season"]["display_offset"], 5)
+        self.bset({"season.display_offset": None})
+        self.assertNotIn("display_offset", self.config_file().get("season", {}))
+        self.assertEqual(self.bget()["values"]["season.display_offset"], 0)
+
+    def test_null_on_a_key_that_was_never_set_leaves_no_audit(self):
+        """本来就是默认值 ⇒ 不该留下一条"什么都没改"的审计。"""
+        j = self.bset({"season.display_offset": None}).json()
+        self.assertIsNone(j["applied"][0]["audit"])
+        self.assertEqual(self.config_file(), {})
+
+    def test_star_array_needs_25_cells_and_keeps_25(self):
+        j = self.bset({"season.star_array": [3] * 24 + [7]}).json()
+        self.assertEqual(len(j["values"]["season.star_array"]), 25)
+        self.assertEqual(j["values"]["season.star_array"][-1], 7)
+        self.assertEqual(len(self.config_file()["season"]["star_array"]), 25)
+        # 客户端原表是 26 格（末尾一格给 Legend），收得下，但只存 25 格
+        j = self.bset({"season.star_array": [3] * 25 + [9]}).json()
+        self.assertEqual(j["values"]["season.star_array"], [3] * 25)
+
+    def test_track_ids_keep_three_and_dedupe(self):
+        j = self.bset({"matchmaking.track_ids": [1041, 1041, 1001, 1002, 1003]}).json()
+        self.assertEqual(j["values"]["matchmaking.track_ids"], [1041, 1001, 1002])
+        self.assertEqual(self.config_file()["matchmaking"]["track_ids"], [1041, 1001, 1002])
+
+    def test_rewards_merge_coins_and_gems_but_refuse_a_second_special(self):
+        j = self.bset({"season.rewards": [{"rank": 1, "item_id": 1, "amount": 10},
+                                          {"rank": 1, "item_id": 1, "amount": 5},
+                                          {"rank": 0, "item_id": 2, "amount": 3}]}).json()
+        self.assertEqual(j["values"]["season.rewards"],
+                         [{"rank": 0, "item_id": 2, "amount": 3},
+                          {"rank": 1, "item_id": 1, "amount": 15}])
+        self.assertEqual(self.config_file()["season"]["rewards"], j["values"]["season.rewards"])
+        # 特殊奖（item 145 的 amount 是客户端原表的 RewardID）同档只能一条
+        r = self.bset({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 220},
+                                          {"rank": 1, "item_id": 145, "amount": 203}]}, expect=400)
+        self.assertEqual(r.json()["error"], "dup-special:1")
+        # 普通奖励表照样能存下特殊奖
+        j = self.bset({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 220}]}).json()
+        self.assertEqual(j["values"]["season.rewards"],
+                         [{"rank": 1, "item_id": 145, "amount": 220}])
+
+    def test_products_round_trip(self):
+        j = self.bset({"season.product_list": [{"product_id": "chip_shop.goldentickets",
+                                                "amount": 3}]}).json()
+        self.assertEqual(j["values"]["season.product_list"],
+                         [{"product_id": "chip_shop.goldentickets", "amount": 3}])
+        self.assertEqual(self.config_file()["season"]["product_list"],
+                         [{"product_id": "chip_shop.goldentickets", "amount": 3}])
+        j = self.bset({"season.product_list": []}).json()
+        self.assertEqual(j["values"]["season.product_list"], [])
+
+    def test_banner_path_must_point_into_the_served_folder(self):
+        j = self.bset({"season.banner_path": "/pvp_banner/season.png"}).json()
+        self.assertEqual(j["values"]["season.banner_path"], "/pvp_banner/season.png")
+        # 空字符串 = 回到内置占位图，允许
+        j = self.bset({"season.banner_path": ""}).json()
+        self.assertEqual(j["values"]["season.banner_path"], "")
+
+    def test_advance_button_moves_the_window_one_round(self):
+        """「推进到下一赛季」= `season.advance` 加一，内部届号跟着挪一轮，显示编号不动。"""
+        self.assertEqual(self.bget()["values"]["season.advance"], 0)
+        before = srv._pvp_season_window()
+        self.bset({"season.advance": 1})
+        after = srv._pvp_season_window()
+        self.assertEqual(after[0], before[0] + 1)
+        self.assertEqual(after[2] - after[1], before[2] - before[1])
+        self.assertEqual(self.bget()["values"]["season.advance"], 1)
+        # 显示编号只由 display_offset 决定
+        self.bset({"season.display_offset": 3})
+        self.assertEqual(self.bget()["status"]["display_id"],
+                         self.bget()["status"]["season"] + 3)
+
+    # ---------------------------------------------------------------- 撤销 / 模板
+    def test_undo_restores_the_previous_value(self):
+        self.bset({"season.display_offset": 5})
+        aid = self.bset({"season.display_offset": 9}).json()["applied"][0]["audit"]
+        r = self.post("/__api/admin/undo", {"id": aid})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(self.bget()["values"]["season.display_offset"], 5)
+
+    def test_templates_are_per_page(self):
+        """两个页面的模板互不可见（GET 按页筛，返回结构是 {页: [模板]}）。"""
+        self.post("/__api/admin/templates", {"page": "bunker", "action": "save", "name": "b1"})
+        self.post("/__api/admin/templates", {"page": "weekly", "action": "save", "name": "w1"})
+        self.assertEqual([p["id"] for p in self.get("/__api/admin/templates")["pages"]],
+                         ["weekly", "bunker"])
+        b = self.get("/__api/admin/templates", query="page=bunker")["templates"]
+        w = self.get("/__api/admin/templates", query="page=weekly")["templates"]
+        self.assertEqual([t["name"] for t in b["bunker"]], ["b1"])
+        self.assertEqual([t["name"] for t in w["weekly"]], ["w1"])
+        self.assertNotIn("weekly", b)
+
+    def test_template_apply_brings_the_saved_values_back(self):
+        self.bset({"season.display_offset": 5, "matchmaking.match_duration_seconds": 7200})
+        self.post("/__api/admin/templates", {"page": "bunker", "action": "save", "name": "s1"})
+        self.bset({"season.display_offset": 9, "matchmaking.match_duration_seconds": 3600})
+        r = self.post("/__api/admin/templates",
+                      {"page": "bunker", "action": "apply", "name": "s1", "parts": "all"})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(self.bget()["values"]["season.display_offset"], 5)
+        self.assertEqual(self.bget()["values"]["matchmaking.match_duration_seconds"], 7200)
+
+    def test_page_hooks_cover_both_screens(self):
+        """两个页面各自独立：模板 / 撤销端点全靠这张表知道「这页管哪些键」。"""
+        self.assertEqual(sorted(srv._PAGE_HOOKS), ["bunker", "weekly"])
+        for page, hook in srv._PAGE_HOOKS.items():
+            self.assertTrue(hook["label"], page)
+            self.assertTrue(hook["keys"], page)
+            self.assertTrue(callable(hook["values"]) and callable(hook["apply"]), page)
+        b = srv._PAGE_HOOKS["bunker"]
+        self.assertEqual(b["values"], srv.bunker_values)
+        self.assertEqual(b["apply"], srv.admin_bunker_apply)
+        # 「只套用奖励方案」看 reward_keys；普通套用（keys）不动奖励表
+        self.assertEqual(set(b["reward_keys"]), set(srv._BUNKER_REWARD_KEYS))
+        self.assertEqual(set(b["keys"]) | set(b["reward_keys"]), set(srv._BUNKER_KEYS))
+        self.assertFalse(set(b["keys"]) & set(b["reward_keys"]))
+
+
 class I18n(Base):
     @classmethod
     def setUpClass(cls):

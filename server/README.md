@@ -61,7 +61,7 @@ Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
 |---|---|
 | `tf_server.py` | HTTP 服务器：路由 + 全部动态端点处理器 + 请求日志 + 内嵌管理页。~4000 行 |
 | `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储 + 管理员账号 + 受控下发。纯数据层，不碰 HTTP。~1800 行 |
-| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
+| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 + 304 条奖励名，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
 | `rules.json` | 静态桩响应表（`"<METHOD> <路径前缀>"` → `{status, headers, body}`）。只服务那些「有响应就行」的端点 |
 | `data/tf_config.json` | 运营参数（匹配、赛季、周赛、奖励、筹码）。**唯一入库的 `data/` 文件** |
 | `data/ghosts/` | 幽灵仓库：`<赛道id>/*.bin`（游戏自带静态幽灵，入库）+ `store/` `index.json` `replays.json`（运行期，不入库） |
@@ -381,11 +381,15 @@ python -m unittest discover -s tests -v
   优先、否则跟随 `navigator.language`）。前端**只用 `textContent` 渲染玩家可控字符串**
   （账号名 / 平台名直接来自客户端上报，是信任边界）。
 * 「下发物品」屏的物品清单来自 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装
-  + 12 个蓝图，中英名直接取自游戏自己的本地化表），由 `tools/build_item_catalog.py` 从解包出的
-  `content.dat` 生成 —— 改物品表 / 套装表 / 车表 / 升级表就重跑它。每条带 `cat` 与 `verified`：
+  + 12 个蓝图 + 382 条赛道 + 304 条奖励名，中英名直接取自游戏自己的本地化表），由
+  `tools/build_item_catalog.py` 从解包出的 `content.dat` 生成 —— 改物品表 / 套装表 / 车表 /
+  升级表 / 赛道表就重跑它。每条带 `cat` 与 `verified`：
   只有**真机上确认过存档写法**的类（货币 / 消耗品 / 零件 / 服装 / 蓝图）不带「未验证」警告；
   赛道没有证据，会挂警告。`outfit` 在存档里是 0/1 标志（只能解锁，mode 固定 `set`），
   **蓝图和其余类一样是计数器**（这一条最初写错了，见下面那条）。
+  另外两段不参与下发、只喂下拉：`levels`（382 条赛道 → `track_catalog()`，午夜杯的
+  `weekly.track_id` 与碉堡的候选/固定赛道都用它）、`rewards`（`/conf/pvp_match_rewards.txt`
+  的 RewardID → 名字 → ItemId，碉堡「赛季奖励」的特殊奖励下拉用它）。
 * **服装按「套」列**（`outfits` 段，来自 `/conf/customization.txt`）：勾一套 = 头盔 / 上衣 /
   裤装三件一起解锁（`id = ItemType * 5 + tier`），行上带官方名 + 内部代号 +
   「已拥有 n/3」+ **套装效果文案**（`BonusPower`，集齐即账号级生效，例如 The High Roller
@@ -414,6 +418,23 @@ python -m unittest discover -s tests -v
   ★ 奖励卡**只暴露池子编号 1..15**：每池装什么在客户端的 `/conf/wts_rewards.txt` 里
   （`getRewardItemForSlot`），所以界面不预览内容；客户端**只在进入午夜杯时读一次**奖励配置，
   卡片上写明「改完让玩家退出午夜杯再进」（不用重启游戏）。
+* **碉堡（PVP）运营屏**（侧栏独立入口「碉堡」）：8 张卡（现状 / 赛季 / 对局时长 / 段位与星章 /
+  匹配与 AI / 筹码与曲线 / 赛季奖励 / 模板），字段表整张在服务端（`_BUNKER_CARDS` + `_bf()` +
+  `_BUNKER_FIELDS`：中英标签、说明、`kind`、范围），前端只按 `kind` 造控件 ⇒ **加一个运营参数
+  只改服务端**。写路径与审计/撤销/模板跟午夜杯完全共用（`_PAGE_HOOKS` 里多一条 `bunker`）。
+  几个必须记住的边界：
+  - **赛季显示编号**（`season.display_offset`）只在**下发边界**套偏移，内部届号（`_pvp_season_window()`
+    的时间派生值）、赛季窗口、玩家档案里的 `season` 都不动；`season.advance` = 推进计数，
+    让本届窗口整体往前挪一轮。
+  - **赛季名不能含 `|`**：`title_text` 是纯文本（本地化分支只在 NULL 时走），但客户端
+    `PopupStatePVPXGames::getPVPSeasonName` 只取第一个 `|` 之后的部分 ⇒ 含 `|` 直接 `bad-pipe`。
+    **换横幅图必须换 URL**（客户端拿 URL hash 跟 `season_banner%d.bnr` 里的 4 字节比，不符才重下）。
+  - **特殊奖励是 RewardID 不是 ItemId**：`item_id 145` 的 `amount` 由客户端的
+    `/conf/pvp_match_rewards.txt` 解释，界面给 304 个候选的下拉 + 允许手填编号。
+  - **段位名不存在**（客户端 `MenuzComponentPVPRank` 里零次本地化调用、LOCF 里也没有
+    `RANK_%d` 键）⇒ 只提供星章表与起始段位，卡里只读说明。
+  - **绝不直接编辑 `data/pvp_state.json`**：金票 / 筹码 / 段位 / 星 / 连胜只走 `/__api/admin/*`
+    （内部走 `_pvp_request` 事务），手改文件会被服务端下次写盘覆盖。
 
 ### 7.2 端点
 
@@ -433,8 +454,9 @@ python -m unittest discover -s tests -v
 | `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
 | `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
 | `GET\|POST /__api/admin/weekly` | 午夜杯运营参数（GET = 配置 + 现状 + 赛道目录 + 模板 + 最近改动；POST `{fields:{…}}` **逐键校验、全部合法才落盘**，每个键回 `{key,before,after,audit}`） |
-| `POST /__api/admin/undo` | 撤销一条参数改动（`{id}` 来自 weekly 的 `audit`；按记录里的 `existed` 决定写回还是删键） |
-| `GET\|POST /__api/admin/templates` | 参数模板（GET `?page=weekly`；POST `{page,action:save\|apply\|copy\|rename\|delete,name,new_name,parts}`，`parts` 可 `all` / `rewards`） |
+| `GET\|POST /__api/admin/bunker` | 碉堡运营参数（GET = 8 张卡的字段表 + 当前值 + 现状（赛季/玩家/对局/队列/在线）+ 赛道与奖励目录 + 模板 + 最近改动；POST 同 weekly 的 `{fields:{…}}` 契约，空值 = 删键回默认） |
+| `POST /__api/admin/undo` | 撤销一条参数改动（`{id}` 来自 weekly / bunker 的 `audit`；按记录里的 `existed` 决定写回还是删键） |
+| `GET\|POST /__api/admin/templates` | 参数模板（GET `?page=weekly\|bunker`；POST `{page,action:save\|apply\|copy\|rename\|delete,name,new_name,parts}`，`parts` 可 `all` / `rewards`） |
 
 ### 7.3 下发的两条通道（别搞混）
 

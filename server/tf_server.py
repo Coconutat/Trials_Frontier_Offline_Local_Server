@@ -80,6 +80,9 @@ _TF_CONFIG_DEFAULTS = {
         # ★ 必须同时让 start_time 稳定（见 `_pvp_make_match` 的 `start`）：每轮都回
         #   now 会让剩余时间永远是满值，症状就是「过几秒又跳回满值」。
         "match_duration_seconds": 21600,
+        # 友军对局（非排位）的时长。用户 m03981：这个值以前硬编码在 `_pvp_season()`
+        # 里（3600），现在搬进配置，WebUI 能改。
+        "friendly_match_duration": 3600,
         # 一局 3 条赛道（用户 m04404 引同服玩家 Assassins-Cry 实测：开一局 3 条赛道，
         # 倒计时结束前赢下 2 条就赢这一局）。
         # ★ `parseMatch` 的 tracks 循环没有边界检查（0x4fddc0 起 `madd x9,x28,#0x34,x21`），
@@ -120,6 +123,20 @@ _TF_CONFIG_DEFAULTS = {
         "title_text": "Trials Frontier",
         "banner_path": "/pvp_banner/season.png",
         "duration_days": 30,
+        # ── 碉堡运营（用户 m03981：要能写「这是第几个赛季」、要能推进赛季）──
+        # `advance` = 「推进到下一赛季」按了几次。届号本来是时间派生的
+        #   （`int(time.time())//duration + 1`），这里加一个整数偏移就够：窗口跟着
+        #   届号走（`_pvp_season_window` 由届号反推 start/end），所以推进一次 =
+        #   本届窗口整体前移一个 duration；玩家下次 `close_season` 时发现届号变了，
+        #   就按旧届结算并复位段位（`h_pvp_close_season`）。
+        #   ★ 只加在**自动推导**分支：显式传届号（`h_pvp_season_data` 的历史查询）
+        #     必须拿到自己那个届的真实窗口。
+        "advance": 0,
+        # `display_offset` = 只改**下发给客户端的届号**（= 能自己编号：内部第 692 届
+        #   想显示成第 1 赛季就填 -691）。内部届号、start/end、玩家档案里的 season
+        #   全都不动 —— 客户端只拿这个数字当横幅缓存文件名（`season_banner%d.bnr`），
+        #   真正的"第 N 赛季"文字在客户端里没有显示点（见 CONTEXT.md「赛季编号」）。
+        "display_offset": 0,
         # ★ `star_array` @0xb86be8 —— 扁平 int 数组，最多 26 个
         #   （`parseSeason` @0x4fd694：struct(0x00e21c78)+428+i*4，`cmp i,#0x19; b.gt` 停）。
         #   `PVPManager::getStarCountForRank(rank)` @0x5e16e8 读的是
@@ -822,7 +839,20 @@ def _placeholder_banner_png():
 
 
 def h_pvp_banner(path, query, body, headers):
-    """GET /pvp_banner/season.png —— 赛季横幅原图（cmd 0x32 的响应体）。"""
+    """GET /pvp_banner/<名字>.png —— 赛季横幅原图（cmd 0x32 的响应体）。
+
+    想换成自己的图：把 PNG 放进 `server/data/banner/`，再把 `season.banner_path`
+    指到 `/pvp_banner/<文件名>`。★ 路径（URL）本身是客户端的缓存键
+    （`OnlinePVP::getSeasonBanner` 比对 URL hash），所以换图必须换文件名。
+    文件不在就回内置占位图（客户端不会因为 404 报错，但会看到同一张图）。
+    """
+    name = os.path.basename(path or "")
+    if name.endswith(".png") and name not in (".", ".."):
+        try:
+            with open(os.path.join(os.path.dirname(CONFIG_PATH), "banner", name), "rb") as fh:
+                return 200, {"Content-Type": "image/png"}, fh.read()
+        except OSError:
+            pass
     return 200, {"Content-Type": "image/png"}, _placeholder_banner_png()
 
 
@@ -2673,6 +2703,11 @@ def _param_message(err):
         return "不认识的参数：%s" % err.split(":", 1)[1]
     if err.startswith("bad-value:"):
         return "这个参数要填整数：%s" % err.split(":", 1)[1]
+    if err.startswith("bad-reward-item:"):
+        return ("奖励物品只能选金币（1）/ 钻石（2）/ 特殊奖励（145），"
+                "收到的是 %s" % err.split(":", 1)[1])
+    if err.startswith("dup-special:"):
+        return "第 %s 名的特殊奖励写了两遍（客户端会发两次，请删掉一条）" % err.split(":", 1)[1]
     return {"bad-request": "请求不合法",
             "bad-page": "没有这一页",
             "bad-name": "模板名不能为空或带换行，最长 %d 个字" % _TEMPLATE_NAME_MAX,
@@ -2683,7 +2718,498 @@ def _param_message(err):
             "bad-reward-ids": "奖励池子要写成 {档位: [池子编号]}",
             "empty": "这个模板里没有这一页认识的参数",
             "save-failed": "模板文件写不进去（看服务器日志）",
+            "bad-pipe": "赛季名里不能有竖线 |（客户端只显示第一个 | 后面的部分）",
+            "bad-banner": "横幅路径要写成 /pvp_banner/xxx.png（图片放 server/data/banner/）",
+            "bad-stars": "星章表要正好 25 格整数（每格 0..100）",
+            "bad-rewards": "奖励表要写成 [{名次, 物品, 数量}]（名次 0..25）",
+            "bad-products": "礼包要写成 [{product_id, 数量}]",
             }.get(err, "改不动：" + err)
+
+
+# ── 碉堡（PVP 运营）后台 ──────────────────────────────────────────────────
+# ★ 字段表是唯一事实来源：服务器拿它校验、WebUI 拿它画输入框。加一个参数 =
+#   在 `_BUNKER_FIELDS` 里加一行（界面不用动）。
+#   标签是中英双语写在表里的，**不是** i18n.json —— 那里面只放静态界面文案，
+#   而且前台约定不许动态拼 t() 的 key（tests 的 FeatureInvariants 盯着）。
+# kind 决定控件：int/float/bool = 数字与开关、text = 单行文本、banner = 图片路径、
+#   ids = 赛道编号多选、stars = 星章表（25 格）、rewards = 赛季奖励表、
+#   products = 礼包表。
+# ★ 故意**不**暴露的死键：`season.track_id`、`matchmaking.bot_name`（代码里没有
+#   任何地方读它们，摆到界面上等于骗运营）。
+
+
+def _bf(card, key, kind, lo, hi, cn, en, hint_cn="", hint_en=""):
+    """一条碉堡参数。`key` 用 "段.键"（= 配置路径），text/banner 的 hi 是长度上限。"""
+    return {"card": card, "key": key, "kind": kind, "min": lo, "max": hi,
+            "cn": cn, "en": en, "hint_cn": hint_cn, "hint_en": hint_en}
+
+
+_BUNKER_CARDS = (
+    ("now", "现状", "Status"),
+    ("season", "赛季", "Season"),
+    ("duration", "对局时长", "Match duration"),
+    ("rank", "段位与星章", "Ranks & stars"),
+    ("match", "匹配与 AI", "Matchmaking & AI"),
+    ("chips", "筹码与曲线", "Chips & curve"),
+    ("rewards", "赛季奖励", "Season rewards"),
+    ("templates", "模板", "Templates"),
+)
+
+_BUNKER_FIELDS = (
+    _bf("duration", "matchmaking.match_duration_seconds", "int", 60, 2592000,
+        "排位对局时长（秒）", "Ranked match duration (s)",
+        "只影响改动之后新开的局：进行中的局在开赛时就把时长发给客户端了。",
+        "Only affects matches created after the change."),
+    _bf("duration", "matchmaking.friendly_match_duration", "int", 60, 2592000,
+        "友军对局时长（秒）", "Friendly match duration (s)",
+        "原来写死在代码里的 3600，现在能改。", "Was hardcoded to 3600."),
+    _bf("season", "season.duration_days", "int", 1, 365,
+        "赛季长度（天）", "Season length (days)",
+        "届号按「开服以来的天数」推导：改长度会让届号重新对齐，只影响之后的届。",
+        "The season number derives from elapsed days; affects future seasons only."),
+    _bf("season", "season.display_offset", "int", -1000000, 1000000,
+        "显示编号偏移", "Display number offset",
+        "只改客户端看到的届号：想让它显示「第 1 赛季」就填 -(现在内部第几届 - 1)。"
+        "内部届号、窗口起止、玩家档案全都不动。",
+        "Only changes the number clients see; internal id and window stay put."),
+    _bf("season", "season.advance", "int", 0, 999,
+        "推进计数", "Advance counter",
+        "「推进到下一赛季」每按一次 +1：本届窗口整体往前挪一轮，玩家下次进碉堡时"
+        "按旧届结算并复位段位。", "Incremented by the advance-season button."),
+    _bf("season", "season.title_text", "text", 0, 60,
+        "赛季名", "Season title",
+        "原样显示、不走翻译。★ 不能含竖线 | —— 客户端只显示第一个 | 后面的部分。",
+        "Shown verbatim. Must not contain '|'."),
+    _bf("season", "season.banner_path", "banner", 0, 80,
+        "横幅图片路径", "Banner image path",
+        "★ 换图必须换路径：客户端按 URL 的 hash 判缓存。把 PNG 放进 "
+        "server/data/banner/ 再把这里指过去，就能用自己的图。",
+        "Changing the image requires changing the path."),
+    _bf("rank", "season.star_array", "stars", 0, 100,
+        "升阶星章表（25 档）", "Stars per rank (25 cells)",
+        "第 1 格 = rank 1（最高），第 25 格 = rank 25（最低）。每格 0..100。",
+        "Cell 1 = rank 1 (highest); each cell 0..100."),
+    _bf("rewards", "season.rewards", "rewards", 0, 0,
+        "赛季奖励表", "Season rewards",
+        "金币/钻石的「数量」就是发多少；特殊奖励的「数量」是原表 RewardID（下拉里挑）。"
+        "★ 金额是**每档增量**：客户端会把名次 R 及以上的档位累加起来发。",
+        "Amounts are per-rank increments; the client sums rank R and above."),
+    _bf("rewards", "season.product_list", "products", 0, 0,
+        "礼包（商城商品）", "Bundles (store products)",
+        "product_id 是商城商品 id（chip_shop.goldentickets = 金票）。原表里没有的 id "
+        "客户端会静默忽略。", "Unknown product ids are silently ignored by the client."),
+    _bf("chips", "season.chip_equation_x", "float", 0, 10,
+        "筹码曲线 x", "Chip curve x",
+        "筹码 = pow(经过的秒数, x) × y。x=0 是固定总量（不随时间涨），x=1 才是线性。",
+        "chips = pow(elapsed, x) * y; x=0 gives a flat total."),
+    _bf("chips", "season.chip_equation_y", "float", 0, 1000000,
+        "筹码曲线 y", "Chip curve y", "见 x 的说明。", "See x."),
+    _bf("rank", "matchmaking.start_rank", "int", 1, 25,
+        "起始段位", "Starting rank",
+        "25 = 最低。0 = 传奇，不能当新号初始值（晋级动画永远不触发）。",
+        "25 = lowest. Never 0: the promotion animation would never fire."),
+    _bf("match", "matchmaking.enabled", "bool", 0, 1,
+        "匹配总开关", "Matchmaking master switch",
+        "关掉后所有匹配请求都不放行（调试用）。", "Off blocks every matchmaking request."),
+    _bf("match", "matchmaking.bot_wait_seconds", "int", 0, 3600,
+        "等真人多久后放 AI（秒）", "Wait before a bot joins (s)",
+        "排队超过这么多秒就塞一个 AI 进来。", "A bot joins after this long in the queue."),
+    _bf("match", "matchmaking.active_window_seconds", "int", 0, 86400,
+        "在线判定窗口（秒）", "Online window (s)",
+        "多久没请求就算离线。", "How long after the last request a player counts as offline."),
+    _bf("match", "matchmaking.search_ttl_seconds", "int", 0, 86400,
+        "排队条目过期（秒）", "Queue entry TTL (s)",
+        "排队条目放太久就清掉。", "Stale queue entries are dropped."),
+    _bf("match", "matchmaking.track_ids", "ids", 1, 1000000,
+        "固定赛道", "Fixed tracks",
+        "填了就每局固定用这几条（一局最多 3 条，多的会被丢掉；留空 = 每局随机）。",
+        "One match uses up to 3 tracks; empty = random."),
+    _bf("match", "matchmaking.candidate_tracks", "ids", 1, 1000000,
+        "候选赛道池", "Candidate track pool",
+        "随机时从这个池里抽 3 条。必须是幽灵库里真有幽灵的赛道，否则 AI 成绩会很假。",
+        "3 tracks are sampled from this pool."),
+    _bf("match", "matchmaking.track_id", "int", 0, 1000000,
+        "兜底赛道", "Fallback track",
+        "上面两个都空的时候用它。", "Used when both lists above are empty."),
+    _bf("match", "matchmaking.bot_time_margin_pct", "float", 0.5, 10,
+        "AI 成绩倍率", "Bot time multiplier",
+        "AI 成绩 = 玩家成绩 × 倍率 + 毫秒数。★ 要 ≥ 1，否则 AI 比玩家快，"
+        "客户端会把赛道判给 AI。",
+        "Must be >= 1, otherwise the bot beats the player."),
+    _bf("match", "matchmaking.bot_time_margin_ms", "int", -600000, 600000,
+        "AI 成绩增减（毫秒）", "Bot time delta (ms)", "", ""),
+    _bf("match", "matchmaking.bike_id", "int", 1, 64,
+        "固定车辆", "Fixed bike",
+        "★ 不能填 0：客户端拿到空车再解引用，直接崩。", "Never 0: the client crashes."),
+    _bf("match", "matchmaking.ranked_match_slots", "int", 0, 8,
+        "并行对局槽", "Parallel match slots",
+        "同时能开几局。", "How many matches a player can keep open."),
+    _bf("match", "matchmaking.ranked_match_limit", "int", 0, 99,
+        "排位局上限", "Ranked match limit", "", ""),
+    _bf("match", "matchmaking.additional_match_cost", "int", 0, 99,
+        "加时局金票价", "Extra match ticket cost", "", ""),
+    _bf("match", "matchmaking.free_tickets_initial", "int", 0, 99,
+        "新玩家送票", "Free tickets on join", "", ""),
+    _bf("match", "matchmaking.free_tickets_max", "int", 0, 99,
+        "免费票上限", "Free ticket cap", "", ""),
+    _bf("match", "matchmaking.free_tickets_interval_seconds", "int", 0, 604800,
+        "免费票恢复间隔（秒）", "Free ticket refill (s)", "", ""),
+    _bf("match", "matchmaking.bot_profile_id", "text", 0, 40,
+        "AI 用哪个档案", "Bot profile id",
+        "空 = 用内置的 GhostRider。", "Empty = the built-in GhostRider."),
+    _bf("chips", "chips.start", "int", 0, 10000000,
+        "起始筹码", "Starting chips", "", ""),
+    _bf("chips", "chips.per_track_seconds", "int", 0, 1000000,
+        "每条赛道产币周期（秒）", "Chip gain period (s)",
+        "0 = 关闭挂机产币（现在就是关的）。填 3600 = 每小时每条赛道回一批。",
+        "0 disables idle chip farming."),
+    _bf("chips", "chips.max", "int", 0, 10000000,
+        "筹码上限", "Chip cap", "0 = 不设上限。", "0 = no cap."),
+    _bf("chips", "chips.match_loser_keeps_pct", "int", 0, 100,
+        "败方保留比例（%）", "Loser keeps (%)", "", ""),
+)
+
+_BUNKER_KEYS = tuple(f["key"] for f in _BUNKER_FIELDS)
+_BUNKER_REWARD_KEYS = ("season.rewards", "season.product_list")
+_BUNKER_BY_KEY = {f["key"]: f for f in _BUNKER_FIELDS}
+_BUNKER_STARS = 25                    # 客户端能读 26 格，我们按 25 档存
+
+
+class _BadParam(Exception):
+    """参数没通过校验；`code` 交给 `_param_message()` 翻成人话。"""
+
+    def __init__(self, code):
+        Exception.__init__(self, code)
+        self.code = code
+
+
+def _bunker_rewards_read():
+    """赛季奖励表的**扁平**读法（编辑器用）：配置里怎么写就怎么读，只清洗类型。
+
+    跟 `_pvp_season_rewards()`（下发用的分组/补档/去重）分开：这里是给人看的原始表。
+    """
+    vals = cfg("season", "rewards", default=None) or []
+    out = []
+    for it in vals:
+        if not isinstance(it, dict):
+            continue
+        try:
+            out.append({"rank": int(it.get("rank")), "item_id": int(it.get("item_id")),
+                        "amount": int(it.get("amount", 1))})
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _bunker_get(key):
+    """当前生效值（配置合并后的结果；缺的补代码默认值）。"""
+    sec, k = key.split(".", 1)
+    if k == "star_array":
+        return _pvp_star_array()
+    if k == "rewards":
+        return _bunker_rewards_read()
+    if k == "product_list":
+        return _pvp_product_list()
+    raw = cfg(sec, k, default=None)
+    if raw is None:
+        return _bunker_default(key)
+    return raw
+
+
+def _bunker_default(key):
+    sec, k = key.split(".", 1)
+    return (_TF_CONFIG_DEFAULTS.get(sec) or {}).get(k)
+
+
+def _bunker_check(spec, raw):
+    """校验并归一化一个值；不合法就抛 `_BadParam`。"""
+    key, kind = spec["key"], spec["kind"]
+    lo, hi = spec["min"], spec["max"]
+    if kind == "rewards":
+        return _bunker_rewards_check(raw)
+    if kind == "products":
+        return _bunker_products_check(raw)
+    if kind == "stars":
+        if not isinstance(raw, (list, tuple)) or not _BUNKER_STARS <= len(raw) <= _BUNKER_STARS + 1:
+            raise _BadParam("bad-stars")
+        out = []
+        for v in raw:
+            if isinstance(v, bool):
+                raise _BadParam("bad-stars")
+            try:
+                iv = int(v)
+            except (TypeError, ValueError):
+                raise _BadParam("bad-stars")
+            if not lo <= iv <= hi:
+                raise _BadParam("range:%s:%s-%s" % (key, lo, hi))
+            out.append(iv)
+        return out[:_BUNKER_STARS]
+    if kind == "ids":
+        if raw is None or raw == "":
+            return []
+        if not isinstance(raw, (list, tuple)):
+            raise _BadParam("bad-value:" + key)
+        out = []
+        for v in raw:
+            if isinstance(v, bool):
+                raise _BadParam("bad-value:" + key)
+            try:
+                iv = int(str(v).strip() if isinstance(v, str) else v)
+            except (TypeError, ValueError):
+                raise _BadParam("bad-value:" + key)
+            if not lo <= iv <= hi:
+                raise _BadParam("range:%s:%s-%s" % (key, lo, hi))
+            if iv not in out:
+                out.append(iv)
+        return out[:3] if key == "matchmaking.track_ids" else out
+    if kind == "bool":
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, int) and raw in (0, 1):
+            return bool(raw)
+        if isinstance(raw, str) and raw.strip() in ("0", "1", "true", "false"):
+            return raw.strip() in ("1", "true")
+        raise _BadParam("bad-value:" + key)
+    if kind in ("text", "banner"):
+        if raw is None:
+            raw = ""
+        if not isinstance(raw, str):
+            raise _BadParam("bad-value:" + key)
+        val = raw.strip()
+        if len(val) > hi or "\n" in val or "\r" in val:
+            raise _BadParam("range:%s:0-%s" % (key, hi))
+        if key == "season.title_text" and "|" in val:
+            raise _BadParam("bad-pipe")
+        if kind == "banner" and val:
+            if not (val.startswith("/pvp_banner/") and val.endswith(".png")):
+                raise _BadParam("bad-banner")
+        return val
+    # int / float
+    if isinstance(raw, bool):
+        raise _BadParam("bad-value:" + key)
+    try:
+        val = float(raw) if kind == "float" else int(str(raw).strip() if isinstance(raw, str) else raw)
+        if kind == "int" and isinstance(raw, float) and raw != int(raw):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise _BadParam("bad-value:" + key)
+    if not lo <= val <= hi:
+        raise _BadParam("range:%s:%s-%s" % (key, lo, hi))
+    return val
+
+
+def _bunker_rewards_check(raw):
+    """赛季奖励表：整表替换。金币/钻石同档相加；特殊奖励同档重复直接报错。"""
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise _BadParam("bad-rewards")
+    if len(raw) > 200:
+        raise _BadParam("bad-rewards")
+    acc = {}
+    for row in raw:
+        if not isinstance(row, dict):
+            raise _BadParam("bad-rewards")
+        if isinstance(row.get("rank"), bool) or isinstance(row.get("item_id"), bool):
+            raise _BadParam("bad-rewards")
+        try:
+            rank = int(row.get("rank"))
+            item = int(row.get("item_id"))
+            amt = int(row.get("amount"))
+        except (TypeError, ValueError):
+            raise _BadParam("bad-rewards")
+        if not 0 <= rank <= 25:
+            raise _BadParam("range:season.rewards(名次):0-25")
+        if item not in (1, 2, 145):
+            raise _BadParam("bad-reward-item:%d" % item)
+        if not 0 <= amt <= 1000000000:
+            raise _BadParam("range:season.rewards(数量):0-1000000000")
+        if (rank, item) in acc:
+            if item == 145:
+                # 客户端会把两条都发出去（`getCombinedSeasonRewards` 是纯累加）
+                raise _BadParam("dup-special:%d" % rank)
+            acc[(rank, item)] += amt
+        else:
+            acc[(rank, item)] = amt
+    return [{"rank": r, "item_id": i, "amount": a} for (r, i), a in sorted(acc.items())]
+
+
+def _bunker_products_check(raw):
+    """礼包表：`[{"product_id": str, "amount": int}]` 整表替换。"""
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)) or len(raw) > 20:
+        raise _BadParam("bad-products")
+    out = []
+    for row in raw:
+        if not isinstance(row, dict):
+            raise _BadParam("bad-products")
+        pid = row.get("product_id")
+        if not isinstance(pid, str) or not pid.strip() or len(pid.strip()) > 60:
+            raise _BadParam("bad-products")
+        if isinstance(row.get("amount"), bool):
+            raise _BadParam("bad-products")
+        try:
+            amt = int(row.get("amount", 1))
+        except (TypeError, ValueError):
+            raise _BadParam("bad-products")
+        if not 0 <= amt <= 1000000:
+            raise _BadParam("range:season.product_list(数量):0-1000000")
+        out.append({"product_id": pid.strip(), "amount": amt})
+    return out
+
+
+def bunker_values():
+    """碉堡页的「当前生效值」（模板存的也是这个扁平结构）。只读。"""
+    return {key: _bunker_get(key) for key in _BUNKER_KEYS}
+
+
+def admin_bunker_apply(fields):
+    """碉堡页写入：`fields = {"season.duration_days": 30, …}`（列表类整表替换）。
+
+    -> (结果, 错误码)。跟午夜杯一样**先全部校验、再动手**。
+    错误码：bad-request / unknown-key:<k> / bad-value:<k> / range:<k>:<lo>-<hi> /
+            bad-pipe / bad-banner / bad-stars / bad-rewards / bad-reward-item:<i> /
+            dup-special:<rank> / bad-products
+    """
+    if not isinstance(fields, dict) or not fields or len(fields) > len(_BUNKER_FIELDS) + 4:
+        return None, "bad-request"
+    ops = []
+    for raw_key, raw_val in fields.items():
+        key = str(raw_key)
+        spec = _BUNKER_BY_KEY.get(key)
+        if spec is None:
+            return None, "unknown-key:" + key
+        if raw_val is None and spec["kind"] in ("int", "float"):
+            ops.append((key, key.split(".", 1), None))     # 清空数字框 = 删掉这个键，回到代码默认值
+            continue
+        try:
+            val = _bunker_check(spec, raw_val)
+        except _BadParam as exc:
+            return None, exc.code
+        ops.append((key, key.split(".", 1), val))
+    applied = []
+    for key, path, val in ops:
+        before = _bunker_get(key)
+        if val is None:
+            _, existed = cfg_unset(path, kind="bunker")
+            if not existed:                  # 本来就是默认值，没什么可撤的
+                applied.append({"key": key, "before": before, "after": before, "audit": None})
+                continue
+        else:
+            cfg_set(path, val, kind="bunker")
+        applied.append({"key": key, "before": before, "after": _bunker_get(key),
+                        "audit": _latest_audit_id(path)})
+    return {"applied": applied, "values": bunker_values()}, None
+
+
+_BUNKER_CATALOG = {"mtime": None, "rewards": [], "bikes": []}
+
+
+def _bunker_catalogs():
+    """`items.json` 派生的两个下拉：特殊奖励（原表 RewardID）与车辆（`paints[].bike`）。"""
+    try:
+        stamp = os.path.getmtime(_TRACK_CATALOG_PATH)
+    except OSError:
+        return [], []
+    if _BUNKER_CATALOG["mtime"] == stamp:
+        return _BUNKER_CATALOG["rewards"], _BUNKER_CATALOG["bikes"]
+    rewards, bikes = [], {}
+    try:
+        with open(_TRACK_CATALOG_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        for raw_id, node in (data.get("rewards") or {}).items():
+            if not isinstance(node, dict):
+                continue
+            try:
+                rid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if node.get("item_id") in (1, 2):
+                continue                    # 金币/钻石条目走「金币」「钻石」两行
+            rewards.append({"id": rid, "name": node.get("name") or "",
+                            "name_cn": node.get("cn") or node.get("name") or "",
+                            "item_id": node.get("item_id"), "cat": node.get("cat") or ""})
+        for node in (data.get("paints") or {}).values():
+            if not isinstance(node, dict):
+                continue
+            bid, name = node.get("bike"), node.get("bike_en")
+            if isinstance(bid, int) and bid > 0 and name and bid not in bikes:
+                bikes[bid] = name
+        rewards.sort(key=lambda r: r["id"])
+    except (OSError, ValueError, AttributeError):
+        return [], []
+    rows = [{"id": bid, "name": bikes[bid]} for bid in sorted(bikes)]
+    if rewards or rows:
+        _BUNKER_CATALOG.update(mtime=stamp, rewards=rewards, bikes=rows)
+    return rewards, rows
+
+
+def bunker_audit(limit=30):
+    """碉堡页管着的三段（season/matchmaking/chips）最近被改了什么。"""
+    secs = ("season", "matchmaking", "chips")
+    out = []
+    for rec in audit_log(AUDIT_KEEP):
+        path = rec.get("path") or []
+        if path and path[0] in secs:
+            out.append(rec)
+            if len(out) >= max(1, int(limit)):
+                break
+    return out
+
+
+def admin_bunker_status():
+    """碉堡「现状卡」：届号/窗口、玩家档案、对局与队列、票与筹码池、警示。只读。"""
+    sid, start, end = _pvp_season_window()
+    now = int(time.time())
+    players = []
+    for pid in sorted(_pvp_players):
+        st = _pvp_players.get(pid) or {}
+        players.append({"profile": pid, "rank": st.get("rank"), "star": st.get("star"),
+                        "season": st.get("season"), "this_season": st.get("season") == sid,
+                        "golden_ticket": st.get("golden_ticket"),
+                        "win_streak": st.get("win_streak"), "chips": _pvp_chips_for(pid)})
+    tickets = [{"profile": p, "tickets": (st or {}).get("tickets")}
+               for p, st in sorted(_pvp_tickets.items())]
+    matches = [{"id": mid, "players": m.get("players"), "track": m.get("track"),
+                "bot": m.get("bot"), "age": now - m.get("at", now)}
+               for mid, m in sorted(_pvp_matches.items())]
+    queue = [{"profile": p, "waited": now - (e.get("at", now) if isinstance(e, dict)
+                                             else int(e or now))}
+             for p, e in _pvp_search.items()]
+    win = cfg_int("matchmaking", "active_window_seconds", default=300) or 300
+    active = [{"profile": p, "seen_ago": now - ts}
+              for p, ts in sorted(ACTIVE_PLAYERS.items()) if now - ts <= win]
+    warnings = []
+    if (cfg_int("matchmaking", "match_duration_seconds", default=21600) or 0) == 300:
+        warnings.append({"cn": "排位对局时长现在是 300 秒（测试值），正式玩请改回 21600（6 小时）。",
+                         "en": "Ranked match duration is 300 s (a test value); use 21600 (6 h) for real play."})
+    if not (cfg_int("chips", "per_track_seconds", default=0) or 0):
+        warnings.append({"cn": "挂机产币是关的（每条赛道产币周期 0）：玩家自己不会涨筹码，只能靠对局赢。",
+                         "en": "Idle chip farming is off (period 0): players only gain chips from matches."})
+    warnings.append({"cn": "玩家的段位/星章/金票只走这个页面改；直接编辑 pvp_state.json 会被服务器下次写盘覆盖。",
+                     "en": "Change player rank/star/tickets here only; editing pvp_state.json gets overwritten."})
+    return {"now": now, "season": sid, "display_id": _pvp_display_season(sid),
+            "duration_days": max(1, cfg_int("season", "duration_days", default=30)),
+            "start": start, "end": end,
+            "players": players, "matches": matches, "matches_total": len(matches),
+            "queue": queue, "tickets": tickets, "active": active,
+            "chips_pool": sum(p["chips"] for p in players if p["chips"]),
+            "tickets_pool": sum(t["tickets"] or 0 for t in tickets),
+            "warnings": warnings}
+
+
+def bunker_payload():
+    """碉堡页要的全部只读数据：界面照着它画，不用自己拼默认值。"""
+    rewards, bikes = _bunker_catalogs()
+    return {"cards": [{"id": c, "cn": cn, "en": en} for c, cn, en in _BUNKER_CARDS],
+            "fields": [dict(f, default=_bunker_default(f["key"]), now=_bunker_get(f["key"]))
+                       for f in _BUNKER_FIELDS],
+            "values": bunker_values(),
+            "status": admin_bunker_status(),
+            "tracks": track_catalog(),
+            "rewards": rewards,
+            "bikes": bikes,
+            "templates": templates_for("bunker").get("bunker", []),
+            "audit": bunker_audit(30)}
 
 
 # 页面注册表：模板 / 撤销端点靠它知道"这一页管哪些键、怎么读、怎么写"。
@@ -2695,6 +3221,13 @@ _PAGE_HOOKS = {
         "reward_keys": _WEEKLY_REWARD_KEYS,
         "values": weekly_values,
         "apply": admin_weekly_apply,
+    },
+    "bunker": {
+        "label": "碉堡",
+        "keys": tuple(k for k in _BUNKER_KEYS if k not in _BUNKER_REWARD_KEYS),
+        "reward_keys": _BUNKER_REWARD_KEYS,
+        "values": bunker_values,
+        "apply": admin_bunker_apply,
     },
 }
 
@@ -2835,8 +3368,23 @@ def _pvp_player_info(chips=None, tickets=3, rank=None, pid=None):
 
 def _pvp_season_window(season_id=None):
     duration = max(1, cfg_int("season", "duration_days", default=30)) * 86400
-    sid = int(season_id) if season_id is not None else int(time.time()) // duration + 1
+    if season_id is not None:
+        sid = int(season_id)
+    else:
+        # `season.advance` 是「推进到下一赛季」按出来的偏移：届号是时间派生的，
+        # 加一个整数就够（窗口由届号反推，所以推进一次 = 本届整体前移一轮）。
+        adv = cfg_int("season", "advance", default=0) or 0
+        sid = int(time.time()) // duration + 1 + adv
     return sid, (sid - 1) * duration, sid * duration
+
+
+def _pvp_display_season(sid):
+    """内部届号 -> 下发给客户端的显示编号（`season.display_offset`）。只影响那个数字。"""
+    try:
+        off = cfg_int("season", "display_offset", default=0) or 0
+    except (TypeError, ValueError):
+        off = 0
+    return int(sid) + int(off)
 
 
 # 新玩家初始金票数。老服务器的广告值就是 3，`_pvp_player_state()` 建新档要用，
@@ -2982,7 +3530,7 @@ def _pvp_season(banner_url=""):
         "winner_chip_heritage": 100,
         "loser_chip_heritage": cfg_int("chips", "match_loser_keeps_pct", default=50),
         "ranked_match_duration": cfg_int("matchmaking", "match_duration_seconds", default=3600) or 3600,
-        "friendly_match_duration": 3600,
+        "friendly_match_duration": cfg_int("matchmaking", "friendly_match_duration", default=3600) or 3600,
         "ranked_match_slots": cfg_int("matchmaking", "ranked_match_slots", default=3),
         "ranked_match_limit": cfg_int("matchmaking", "ranked_match_limit", default=10),
         "game_mode": 0,
@@ -3001,7 +3549,11 @@ def _pvp_season(banner_url=""):
     if pl:
         settings["product_list"] = pl
     season = {
-        "id": season_id, "start_time": season_start, "end_time": season_end,
+        # ★ 发出去的是**显示编号**（内部届号 + `season.display_offset`）：用户 m03981
+        #   要求能自己写「这是第几个赛季」。内部届号 / start / end / 玩家档案里的
+        #   season 全不动，所以赛季边界与结算逻辑一点没变。
+        "id": _pvp_display_season(season_id),
+        "start_time": season_start, "end_time": season_end,
         "title_text": cfg("season", "title_text", default=None) or "Trials Frontier",
         "banner_url": banner_url,
         "rank": 0,
@@ -4277,6 +4829,7 @@ def h_pvp_season_data(path, query, body, headers):
         sid = _pvp_player_state(pid)["season"]
     current = _pvp_season(_banner_url(headers))["current_season"]
     current["id"], current["start_time"], current["end_time"] = _pvp_season_window(sid)
+    current["id"] = _pvp_display_season(current["id"])
     state = _pvp_player_state(pid)
     current["rank"] = state.get("season_history", {}).get(str(sid), {}).get("rank", state["rank"])
     return 200, {"Content-Type": "application/json"}, current
@@ -5853,6 +6406,18 @@ class Handler(BaseHTTPRequestHandler):
                 "audit": audit_for(["weekly"], 20),
             })
             return js(payload)
+        if path == "/__api/admin/bunker":
+            # 碉堡运营页：GET = 读（字段表 + 现状 + 赛道/奖励/车辆下拉 + 模板 + 最近改动），
+            # POST {fields:{…}} = 改参数。字段表在 `_BUNKER_FIELDS`，界面照着它画。
+            payload = {"ok": True, "applied": []}
+            if self.command == "POST":
+                form = _json_body(body) or {}
+                res, err = admin_bunker_apply(form.get("fields") or {})
+                if res is None:
+                    return js({"ok": False, "error": err, "message": _param_message(err)}, 400)
+                payload.update(res)
+            payload.update(bunker_payload())
+            return js(payload)
         if path == "/__api/admin/undo":
             # 一条审计记录的撤销（两页共用；撤销本身也记审计，所以能来回切）。
             form = _json_body(body) or {}
@@ -5886,9 +6451,10 @@ class Handler(BaseHTTPRequestHandler):
                 if res is None:
                     return js({"ok": False, "error": err, "message": _param_message(err)}, 400)
                 # 套用会改配置 ⇒ 顺手把刷新过的生效值一起回给界面。
+                hook = _PAGE_HOOKS.get(page) or {}
                 return js({"ok": True, **res,
                            "templates": templates_for(page).get(page, []),
-                           "config": weekly_values() if page == "weekly" else None})
+                           "config": hook["values"]() if hook.get("values") else None})
             res, err = admin_templates(q.get("page"))
             if res is None:
                 return js({"ok": False, "error": err, "message": _param_message(err)}, 400)
@@ -6050,8 +6616,9 @@ class Handler(BaseHTTPRequestHandler):
                     "POST /__api/admin/grant {profile,items:[{item_id,amount,mode}]}（存档物品，要玩家选「用云端」）",
                     "GET|POST /__api/admin/pvp {profile,fields:{golden_ticket,chips},mode}（竞技场余额，即时生效）",
                     "GET|POST /__api/admin/weekly（午夜杯运营：GET 配置+现状+模板+最近改动；POST {fields:{…}} 即改即生效）",
+                    "GET|POST /__api/admin/bunker（碉堡运营：GET 字段表+现状+赛道/奖励/车辆下拉；POST {fields:{…}}，列表类整表替换）",
                     "POST /__api/admin/undo {id}（撤销一条参数改动，id 来自上面的 audit）",
-                    "GET|POST /__api/admin/templates（参数模板：GET ?page=weekly；POST {page,action:save|apply|copy|rename|delete,name,new_name,parts}）",
+                    "GET|POST /__api/admin/templates（参数模板：GET ?page=weekly|bunker；POST {page,action:save|apply|copy|rename|delete,name,new_name,parts}）",
                     "POST /__api/admin/rollback {profile,ts} -> {snapshot}",
                     "POST /__api/admin/revert {profile,snapshot}",
                     "POST /__api/admin/sessions/clear {username?}",
