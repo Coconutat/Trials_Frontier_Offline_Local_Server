@@ -13,7 +13,7 @@
 | 2 | 修复账号管理（注册 / 登录分离） | ✅ **已实现并 curl 实测（含内置注册页）** | 85% |
 | 2b | VIP 下发（买了 VIP 就激活 VIP 事件） | ✅ **已实机验证（m16）** | 100% |
 | 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **部分实现；本轮补齐碉堡奖励/结赛及基础货币链，21项隔离回归通过，待真机到账验证** | 不再沿用旧95%估计 |
-| 4 | WebUI 管理界面 | 🟡 **前三屏已交付（`/__admin`：登录／账号／存档／下发，CN+EN，101 项后台回归 + headless 冒烟）；余 4 屏待真机验穿冲突下发后做** | 45% |
+| 4 | WebUI 管理界面 | 🟡 **前三屏已交付（`/__admin`：登录／账号／存档／下发，CN+EN，107 项后台回归 + headless 冒烟）；余 4 屏待真机验穿冲突下发后做** | 45% |
 | 5 | 一键开服打包成 exe | ⚪ 未开始 | 0% |
 | 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
 
@@ -678,19 +678,22 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
 | 登录 | 管理员口令（首启 12 位随机口令只打到控制台）；`--reset-admin` 兜底 |
 | 账号 | 会话卡（总数 / 一键清空）+ 账号表 9 列（含封禁徽标、可复制的 profileId、记住我用量）+ 设备表 + 改口令 |
 | 存档 | 槽位表（kind 徽标 / 物品数 / 赛道记录 / richness / 写入时间）+ 详情（关键余额 + 历史快照）+ 逐个「回滚到此」 |
-| 下发物品 | 存档槽下拉 + 竞技场卡（金票 / 筹码，服务端即时生效）+ 醒目警示卡（如实写明要玩家在游戏里点「用云端」）+ **按类折叠的官方物品清单**（477 条，勾选 + 填数量 + 搜索；货币 / 消耗品 / 零件 / 服装 / 蓝图 / 赛道与碎片）。**服装按「套」列**：80 套（含 46 套从未上架的隐藏套装），勾一套 = 头盔 / 上衣 / 裤装一起解锁，行上显示官方名 + 内部代号 + 已拥有 n/3 + 套装效果（The High Roller = 无限汽油）。**涂装按「车」列**：108 款分 17 辆车，勾一款 = 给 `items2[664+BikeID]` 的位掩码置位（位 = SkinIndex），与真机存档逐位吻合 |
+| 下发物品 | 存档槽下拉 + 竞技场卡（金票 / 筹码，服务端即时生效）+ 醒目警示卡（如实写明要玩家在游戏里点「用云端」）+ **按类折叠的官方物品清单**（478 条，勾选 + 填数量 + 搜索；货币 / 消耗品 / 零件 / 服装 / 蓝图 / 赛道与碎片）。**服装按「套」列**：80 套（含 46 套从未上架的隐藏套装），勾一套 = 头盔 / 上衣 / 裤装一起解锁，行上显示官方名 + 内部代号 + 已拥有 n/3 + 套装效果（The High Roller = 无限汽油）。**涂装按「车」列**：108 款分 17 辆车，勾一款 = 给 `items2[664+BikeID]` 的位掩码置位（位 = SkinIndex），与真机存档逐位吻合。**蓝图按「车」列**：碎片是**计数器**（不是 0/1 标志），12 辆车的需求量各不同（Tango 4、Bronco 20、KTM 450 RALLY 30、Stallion / Donkey 50…），行上显示「需要 N 片 / 已拥有 n/N」、勾选默认填「还差几片」，另外 7 辆车没有碎片编号（只能金币买，界面说明） |
 
 - **鉴权**：管理员账号独立于玩家账号，存 `data/admin.json`（`_hash_pw`，不入库）；登录发
   `tf_admin` Cookie（`HttpOnly; SameSite=Strict`，**故意不加 `Secure`** —— 只能走明文 HTTP）。
   门禁用 `startswith("/__") and not in _PUBLIC`，**新增端点默认是关的**。
 - **受控写档**：`grant_items()` 只动 `items2` + `version` + 审计字段，先埋 `pre_grant_` 快照；
-  可下发的物品集合由 `admin/items.json`（477 条物品 + 80 套服装 + 108 款涂装，`tools/build_item_catalog.py`
-  生成）决定，读不到目录就退回只放金币/钻石 —— 宁可少发也不能因为文件丢了把下发全放开。
+  可下发的物品集合由 `admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图，
+  `tools/build_item_catalog.py` 生成）决定，读不到目录就退回只放金币/钻石 —— 宁可少发也不能因为
+  文件丢了把下发全放开。
   ★ 涂装走 `paints` 参数（`grantable_paints()` + `_paint_value()`）：**涂装不占 `items2` 的键**，
   而是写 `items2[664 + BikeID]` 里 `1 << SkinIndex` 那一位，所以界面按车分组。
+  ★ 蓝图是计数器（真机档里 379 = 7 片、404 = 3 片），走普通 `items` 通道、`mode` 可 `add`/`set`，
+  编号 `(车号 + 72) * 5 + 4`、需求量来自 `/conf/upgrades.txt` 的 `BP`。
   `rollback_save()` 埋 `pre_restore_` 快照（回滚本身不可逆）；两者都能一键撤销。
   带前缀的快照名在 `sorted()` 里排在纯数字时间戳之后，所以不会被 `SAVE_HISTORY_MAX` 的裁剪丢掉。
-- **回归**：`tests/test_admin_webui.py`（101 项，全库 169 项）+ `tools/ui_smoke.mjs`（headless Edge + CDP
+- **回归**：`tests/test_admin_webui.py`（107 项，全库 175 项）+ `tools/ui_smoke.mjs`（headless Edge + CDP
   逐屏断言，对 `Runtime.exceptionThrown` / console error 零容忍）。
   ⚠ 教训：只调 `_introspect` 的门禁测试会给**假绿灯** —— `_handle` 里在它之前的内联近路
   就是绕过访问控制的洞（`/__log` 曾经这么裸奔过），所以门禁必须用真路由 `request_handle()` 测。
@@ -938,6 +941,55 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 ### 8.5 仍未收敛的一条
 
 `POST basic_info` 在真机上**每次 `GET basic_info` 后面都跟一次**（两种 body 交替），即使服务端已回 `last_participated_week = 2961 == week_index`。逐条量时间后确认**不是风暴**：00:46–00:59 只有 10 次、13:19 与 13:24 各一次，节奏 = 每次进界面/回前台一次。所以 `updateLastWeekIndex` 的 `w8 == week_index → 不发` 不是唯一触发点，`submitLastWeekData` 另有调用者。**暂不处理**（无害，且 `last_participated_week` 现在能正确往返）。
+
+## 9. 第三轮修复（2026-10-06，用户 m02696 / m03026 / m03499 提的三条物品清单 bug）
+
+> 三条都是「后台下发的物品清单不对」，根因同一类：**只按奖励/商店配置里的 `ItemId` 抓 id，漏掉了真源表**。
+> 全部靠 `content.dat` 里的真源表 + 反汇编 + 真机存档三方交叉验证。
+
+### 9.1 服装缺件（m02696：「衣服还缺少一部分…有个衣服叫 high Roll 之类，集齐套装效果是无限汽油」）
+
+- **根因**：隐藏/未上架套装（High Roller、Henchman 黑/橙、Polar Vortex、KTM Gear…）**在任何奖励或商店配置里都不出现**，
+  按 `ItemId` 抓永远抓不到。真源是 `/conf/customization.txt`（`0007_*.bin`）：`Rider` 数组 80 条。
+- **公式**：套装部件 `id = ItemType * 5 + tier`（tier 0/1/2 = 头盔/上衣/裤装）；Rider ID 0–19 那批记录没有
+  `ItemType` 字段，用 `type = 40 + Rider ID`（靠 `ITEM_57_0` = "The Eggman Helmet Piece" 这类部件名反查印证）。
+  80 套 × 3 件 = 240 个编号，其中 **99 个此前从没进过目录**，**165 个在真机存档里出现过**（可下发）。
+- **顺带**：`UnlockType` 全 4 = 没上架过 → 46 套隐藏；`BonusPower` = 套装效果（24 套），**集齐即账号级生效**
+  （文案自己写着 "Outfit does not need to be equipped"），High Roller = `MULTIPLY_FUEL_REFILL_TIME 0.006`
+  → 界面文案「全套奖励：无限汽油！」（官方中文名就是「摩天轮」，用户的记忆是对的）。与「赛道解锁」撞车的
+  20 个编号按服装归类、旧名留 `alias`。提交 `1bf32c3`。
+
+### 9.2 涂装只有 53 条（m03026：「研究一下涂装怎么下发」）
+
+- **根因**：那 53 条是按奖励表 `ItemId` 抓出来的伪条目，而且 13 个编号同时是零件号。
+- **真源**：`/conf/bikes.txt` 的 `SkinData` = **108 款**（`ID` 连续 0..107）。
+- **★ 涂装不进 `items2` 的键空间**：存档里每辆车只有一条
+  `items2[664 + BikeID] = ((当前装备的 SkinIndex + 1) << 24) | 已拥有位掩码`（位 = SkinIndex，24 位）。
+  反汇编（`getCustomBikeTextureItemId` @`0x0061d350`、`hasCustomBikeTexture` @`0x0061d4e8` 等 8 个符号）
+  + ccb 真机存档 6 条逐位对照确认；反汇编里的 XOR/rotate 只是内存混淆，JSON 是明文。
+  所以下发走独立的 `paints` 参数（`grantable_paints()` + `_paint_value()`），后台按「车」分组。提交 `ec3b6aa`。
+
+### 9.3 蓝图（m03499：「蓝图没问题，但是蓝图是碎片。每个车的蓝图碎片要求数量不一样。而且车数量也对不上」）
+
+- **三条症状的根因**：① 界面把 `blueprint` 当 0/1 标志（`FLAG_CATS`），而真机存档里它是**计数器**
+  （ccb 档 379 = 7 片、404 = 3 片、429 = 1004 片）；② 需求量没进目录；③ 11 条里 3 条（374/379/439）的官方名
+  被 RedLynx 复制粘贴成了 Tango 的 Redlynx 涂装名，界面三行同名；④ 缺 **404 Berserker** ——
+  它只以紧凑形式 `{IID,IL,IC}` 出现在 `/conf/giftbox.txt`，而生成器原来只收有整数 `ItemId` 的节点。
+- **编号**：`id = (车号 + 72) * 5 + 4`。反汇编印证：`hadleBlueprintPurchase()` @`0x00663110` 里
+  `bikeID + 0x48` → `×5` → `+4` 后调 `PlayerItems::add(...)`；`MenuzBlueprintRenderer::init()` @`0x007c3060`
+  用 `BikeUpgrade::getUpgradeID(bikeID, 4)` 读已拥有、车记录 `[+0x58]` 读需求量，`blueprintComplete()`
+  @`0x007c4e5c` 比两者是否相等。
+- **需求量真源**：`/conf/upgrades.txt` 的 `BP`（Tango 4、Bronco 20、KTM 450 RALLY 30、Stallion / Donkey 50…），
+  与官方文案里 7 处 "Collect N to build" 逐条吻合。
+- **车辆名单**：19 辆车里只有 12 辆有碎片编号；另外 7 辆（Armadillo / Jackal / Mantis / Marauder / Riptide /
+  Phantom / Moonrover）的编号 369/384/389/394/399/409/424 在任何配置和真机存档里都不存在 —— **只能金币买，
+  不是漏挖**，界面照实说明、不造条目。
+- **★ 紧凑形式不能一律套公式**：`{IID,IL,IC}` 的 `IC` 各家含义不同 —— 计数器类是数量，赛道（`IID 170`）装的是
+  **赛道 id**、涂装（`IID 133/134/136`）装的是**涂装序号**、零件礼包（`IID 70`）装的是**零件号**。
+  先放宽成「所有 `{IID,IL}` 都收」时目录立刻多出 25 条垃圾（503 条 / 撞车 46）；收窄成「只收蓝图那一族」
+  后回到 478 条 / 撞车 20。
+- **界面**：蓝图按「车」列一行，显示官方名 + 车名 + 「需要 N 片」+「已拥有 n/N」+ 旧名（`alias`），
+  勾选时数量框默认填「还差几片」；`FLAG_CATS` 只剩 `outfit`。
 
 ---
 

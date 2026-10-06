@@ -61,7 +61,7 @@ Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
 |---|---|
 | `tf_server.py` | HTTP 服务器：路由 + 全部动态端点处理器 + 请求日志 + 内嵌管理页。~4000 行 |
 | `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储 + 管理员账号 + 受控下发。纯数据层，不碰 HTTP。~1800 行 |
-| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：477 条物品 + 80 套服装 + 108 款涂装，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
+| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
 | `rules.json` | 静态桩响应表（`"<METHOD> <路径前缀>"` → `{status, headers, body}`）。只服务那些「有响应就行」的端点 |
 | `data/tf_config.json` | 运营参数（匹配、赛季、周赛、奖励、筹码）。**唯一入库的 `data/` 文件** |
 | `data/ghosts/` | 幽灵仓库：`<赛道id>/*.bin`（游戏自带静态幽灵，入库）+ `store/` `index.json` `replays.json`（运行期，不入库） |
@@ -380,11 +380,12 @@ python -m unittest discover -s tests -v
 * 页面是静态四件套（`server/admin/`），CN/EN 双语（`i18n.json`，`localStorage.tf_lang`
   优先、否则跟随 `navigator.language`）。前端**只用 `textContent` 渲染玩家可控字符串**
   （账号名 / 平台名直接来自客户端上报，是信任边界）。
-* 「下发物品」屏的物品清单来自 `server/admin/items.json`（477 条物品 + 80 套服装 + 108 款涂装，
-  中英名直接取自游戏自己的本地化表），由 `tools/build_item_catalog.py` 从解包出的 `content.dat`
-  生成 —— 改物品表 / 套装表 / 车表就重跑它。每条带 `cat` 与 `verified`：只有**真机上确认过
-  存档写法**的类（货币 / 消耗品 / 零件 / 服装 / 蓝图）不带「未验证」警告；赛道没有证据，会挂警告。
-  `outfit` / `blueprint` 在存档里是 0/1 标志（只能解锁，mode 固定 `set`），其余是计数器。
+* 「下发物品」屏的物品清单来自 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装
+  + 12 个蓝图，中英名直接取自游戏自己的本地化表），由 `tools/build_item_catalog.py` 从解包出的
+  `content.dat` 生成 —— 改物品表 / 套装表 / 车表 / 升级表就重跑它。每条带 `cat` 与 `verified`：
+  只有**真机上确认过存档写法**的类（货币 / 消耗品 / 零件 / 服装 / 蓝图）不带「未验证」警告；
+  赛道没有证据，会挂警告。`outfit` 在存档里是 0/1 标志（只能解锁，mode 固定 `set`），
+  **蓝图和其余类一样是计数器**（这一条最初写错了，见下面那条）。
 * **服装按「套」列**（`outfits` 段，来自 `/conf/customization.txt`）：勾一套 = 头盔 / 上衣 /
   裤装三件一起解锁（`id = ItemType * 5 + tier`），行上带官方名 + 内部代号 +
   「已拥有 n/3」+ **套装效果文案**（`BonusPower`，集齐即账号级生效，例如 The High Roller
@@ -394,6 +395,14 @@ python -m unittest discover -s tests -v
   ★ 涂装**不占 `items2` 的键**（一半涂装编号同时是零件号，按 id 发下去会写到零件计数上）。
   存档里每辆车只有一条 `items2[664 + BikeID] = ((当前装备的 SkinIndex + 1) << 24) | 已拥有位掩码`，
   所以界面按车分组、勾一款 = 给那一位置 1（`tflocal_accounts._paint_value()`），
+* **蓝图按「车」列**（`blueprints` 段，来自 `/conf/upgrades.txt` 的 `BP`，12 辆车）：
+  ★ 蓝图是**碎片计数器**，不是 0/1 标志（真机档里 379 = 7 片、404 = 3 片、429 = 1004 片）。
+  编号 `id = (车号 + 72) * 5 + 4`，需求量每辆车不同（Tango 4 片、Bronco 20、KTM 450 RALLY 30、
+  Stallion / Donkey 50…，与官方文案里 7 处 "Collect N to build" 逐条吻合），行上显示
+  「需要 N 片 / 已拥有 n/N」，勾选时数量框默认填「还差几片」。19 辆车里只有 12 辆有碎片编号，
+  另外 7 辆（Armadillo / Jackal / Mantis / Marauder / Riptide / Phantom / Moonrover）在任何
+  配置里都没有编号、只能金币买，界面会说明、不造条目。374/379/439 的官方名被 RedLynx 写成了
+  Tango 的 Redlynx 涂装名，目录里换成规范名并把旧名留在 `alias`（仍然可按旧名搜到）。
 
 ### 7.2 端点
 
@@ -409,7 +418,7 @@ python -m unittest discover -s tests -v
 | `POST /__api/admin/login` `logout` `me` | 管理员登录 / 登出 / 当前身份（`me` 未登录也 200） |
 | `GET /__api/admin/info` | 后台要展示的两条外发地址：玩家注册 `/__ui`、手机上的后台 `/__admin`（基址走 `_public_host()`，**绝不回环**） |
 | `POST /__api/admin/password` | 改口令（<8 位拒；改完**重签 Cookie**，否则把自己踢掉） |
-| `POST /__api/admin/grant` | 存档下发（可下发项 = `admin/items.json` 的 477 条，服装按套勾；`paints` 字段 = 涂装 id 数组，写 `items2[664+BikeID]` 的位掩码；每次先埋快照） |
+| `POST /__api/admin/grant` | 存档下发（可下发项 = `admin/items.json` 的 478 条，服装按套勾，蓝图按车勾、可填片数；`paints` 字段 = 涂装 id 数组，写 `items2[664+BikeID]` 的位掩码；每次先埋快照） |
 | `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
 | `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
 

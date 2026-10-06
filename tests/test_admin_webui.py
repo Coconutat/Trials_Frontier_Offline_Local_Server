@@ -890,6 +890,7 @@ class ItemCatalog(Base):
         self.assertTrue(flags <= keys, "FLAG_CATS 里有不存在的分类：" + str(flags - keys))
         self.assertIn("outfit", flags)          # 真机看过：服装部件 0/1
         self.assertNotIn("parts", flags)        # 零件是计数器，不能被当成标志
+        self.assertNotIn("blueprint", flags)    # 蓝图是碎片计数器：真机档里有 0/1/3/7 片
         self.assertNotIn("currency", flags)
 
     def test_currency_is_present_and_tickets_are_not(self):
@@ -1079,6 +1080,76 @@ class Paints(Base):
         self.assertEqual(r.status, 200)
         self.assertEqual(r.json()["paint_applied"][0]["paint_id"], 3)
         self.assertEqual(acct.load_progress_items(PID)[671], 0x01000001)
+
+
+class Blueprints(Base):
+    """蓝图是**碎片计数器**：`id = (车号 + 72) * 5 + 4`，每辆车要求的片数不同。
+
+    片数来自 `/conf/upgrades.txt` 的 `BP`；反汇编里 `MenuzBlueprintRenderer::init` 拿
+    `BikeUpgrade::getUpgradeID(bikeID, 4)`（已拥有）与车记录 `[+0x58]`（需要）比大小，
+    `blueprintComplete()` 就是两者相等。代号写错会把碎片写到别的物品上，所以钉死。
+    """
+
+    # 官方文案里写明的 7 辆（"Collect N to build"）+ 只在 upgrades.txt 里有数字的 5 辆。
+    NEED = {374: 4, 379: 20, 404: 20, 414: 50, 419: 50, 429: 20,
+            434: 30, 439: 20, 444: 50, 449: 50, 454: 50, 459: 50}
+    # 有 LOCF 文案可交叉验证的 7 辆（英文文案里的 "Collect N to build"）。
+    LOCF_SAID = {439: 20, 429: 20, 434: 30, 414: 50, 444: 50, 449: 50, 454: 50}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cat = json.loads((ADMIN_DIR / "items.json").read_text(encoding="utf-8"))
+        cls.items = cls.cat["items"]
+        cls.bp = {int(k): v for k, v in cls.items.items() if v["cat"] == "blueprint"}
+
+    def test_only_the_twelve_bikes_that_have_pieces_are_listed(self):
+        self.assertEqual(len(self.bp), 12, "有碎片的车变多了/少了（重新跑生成器）")
+        for iid, it in self.bp.items():
+            self.assertEqual(it["id"], iid)
+            self.assertEqual(iid, (it["bike"] + 72) * 5 + 4, "编号公式算错了：%d" % iid)
+            self.assertTrue(1 <= it["bike"] <= 19, "车号越界：%d" % it["bike"])
+            self.assertTrue(it["bike_en"].strip(), "没记车名：%d" % iid)
+            self.assertTrue(it["en"].strip(), "没名字：%d" % iid)
+
+    def test_needs_come_from_the_upgrade_table(self):
+        self.assertEqual({i: it.get("need") for i, it in self.bp.items()}, self.NEED,
+                         "每辆车要的碎片数变了（/conf/upgrades.txt 的 BP）")
+        # 生成器漏读 upgrades.txt 时会退回统一值 —— 那就说明 BP 没读到。
+        self.assertGreater(len(set(self.NEED.values())), 2, "片数全是同一个值，八成读错了表")
+
+    def test_needs_agree_with_the_official_text(self):
+        """官方文案 "Collect N to build" 里写明的 7 辆必须与 BP 一致（两路独立取证）。"""
+        self.assertTrue(set(self.LOCF_SAID) <= set(self.NEED))
+        for iid, n in self.LOCF_SAID.items():
+            self.assertEqual(self.bp[iid].get("need"), n, "文案与 BP 不一致：%d" % iid)
+
+    def test_bikes_without_pieces_are_reported_not_invented(self):
+        src = self.cat["source"]
+        self.assertEqual(len(src["blueprint_bikes"]), 12)
+        self.assertEqual(len(src["no_blueprint_bikes"]), 7, "没碎片的车数是 7（19 辆里）")
+        for name in src["no_blueprint_bikes"]:
+            self.assertTrue(name.strip())
+        # 缺碎片的车不能凭空出现在目录里：369/384/389/394/399/409/424 都不该有条目。
+        for iid in (369, 384, 389, 394, 399, 409, 424):
+            self.assertNotIn(iid, self.bp, "没碎片的车被造了编号：%d" % iid)
+
+    def test_the_redlynx_copy_paste_name_is_gone(self):
+        """374/379/439 的 NameId 被 RedLynx 写成了 Tango 的 Redlynx 涂装名，必须换掉。"""
+        for iid in (374, 379, 439):
+            it = self.items[str(iid)]
+            self.assertEqual(it["cat"], "blueprint")
+            self.assertNotIn("Redlynx", it["en"], "旧名字没换掉：" + it["en"])
+            self.assertEqual(it.get("alias"), "Redlynx Paint Job for Tango",
+                             "撞车/错名没留证：%s" % iid)
+        for it in self.items.values():
+            self.assertNotIn("Redlynx Paint Job", it["en"],
+                             "Redlynx 涂装名还在蓝图里当名字：" + it["en"])
+
+    def test_every_piece_is_grantable(self):
+        allowed = acct.grantable_items()
+        for iid in self.bp:
+            self.assertIn(iid, allowed, "碎片不在白名单里，下发给它会 not-grantable：%d" % iid)
+        self.assertIn(404, allowed, "Berserker 碎片（只在 giftbox 的紧凑形式里出现）漏了")
 
 
 # ---------------------------------------------------------------- 文案

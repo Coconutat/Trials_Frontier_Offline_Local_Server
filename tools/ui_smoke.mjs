@@ -187,6 +187,11 @@ const SCREENS = [
             g.click();
           })()`,
     mustAfter4: ['车漆涂装', 'Riptide', 'Riptide SnakeBite skin', '位 0'],
+    // 再点开「摩托蓝图」：碎片是计数器（一辆车一个编号、每辆车要的片数不同），
+    // 行上要能看到「需要 N 片」，Berserker 只在 giftbox 的紧凑形式里出现过、最容易漏。
+    act5: `[...document.querySelectorAll('#pane .acchead')]
+             .find(b => b.innerText.includes('摩托蓝图')).click()`,
+    mustAfter5: ['需要 20 片', 'Berserker Blueprint Piece', '已拥有', '只能金币买'],
   },
 ];
 
@@ -220,6 +225,7 @@ for (const s of SCREENS) {
     { act: s.act2, must: s.mustAfter2, suffix: '-清单', wait: 900 },
     { act: s.act3, must: s.mustAfter3, suffix: '-服装', wait: 900 },
     { act: s.act4, must: s.mustAfter4, suffix: '-涂装', wait: 900 },
+    { act: s.act5, must: s.mustAfter5, suffix: '-蓝图', wait: 900 },
   ];
   for (let i = 0; i < steps.length; i++) {
     const st = steps[i];
