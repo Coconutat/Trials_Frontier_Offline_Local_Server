@@ -330,6 +330,28 @@ python tools/re/locdump.py key M_RACE_GHOST # english 'Race Ghost'
 * 从 `.init_array` 起（VA `0xdb9dc8`）全部 **VA − 0x10000 = 文件偏移**：
   `.data.rel.ro` VA `0xdba140`、`.got` VA `0xe08eb0`、`.data` VA `0xe23000`。
 
+### 4.7 `pack_write.py` —— `datapack::DataFilePack` 容器读写
+
+```powershell
+python tools/re/pack_write.py selftest                      # 内置往返自检（不需要任何输入文件）
+python tools/re/pack_write.py read <pack.dat> <内部路径>     # 解出某个成员到 stdout / 文件
+python tools/re/pack_write.py build <out.dat> <内部路径>=<本地文件> [...] [--word0 0x...]
+```
+
+容器格式（`0x00 u32 word0` / `0x04 u32 count` / `0x08 u32 recsize` / 表项
+`{u32 uncompressedSize, u32 dataOffset, u32 nameHash}` / blob `{u32 size, u8 flag, 3 pad, payload}`，
+16 字节对齐、`0xba` 填充，`nameHash = mt::String::getHashCode(path)`）见
+`work/trials-frontier/notes/item-ids.md` §0；`getHashCode` 在脚本里是逐字节移植的。
+
+**用途：做「覆盖包」** —— 往设备的 `/data/data/<pkg>/files/` 里丢一个
+`TrialsContentExtraDL_*.dat`（例如只放改过的 `/conf/pvp_match_rewards.txt` 或 LOCF），
+引擎会把它一起挂载，**不用重打 `content.dat`、不用重签 APK**。
+挂载顺序：`GlobalData::initAdditionalDataPacks @0x4cfdd0` 把找到的名字排序后 `reverse` 逐个挂载，
+`DataFilePack::searchFile @0x844a78` 从末尾往前扫 ⇒ **文件名字典序最小的那个赢**（所以探针叫
+`_0probe`）。真机验证与回滚方式见 `work/trials-frontier/notes/selfcontained-apk.md`「覆盖包的插槽」节、
+赛季奖励的实验见 `work/trials-frontier/notes/pvp-reward-contract.md` §5d。
+`selftest` 会拿 `tmp/obb/content.dat`（若在）做往返比对，不在也能跑（只用合成数据）。
+
 ---
 
 ## 5. 素材与中间产物
@@ -423,11 +445,13 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 * **奖励下拉 ← `/conf/pvp_match_rewards.txt`**：`PVPMatchRewardTypes` 是 `RewardID → 名字 → ItemId`
   的映射（1..4 是金币、5 是钻石、100 = 占位问号、20000..20049 是零件）。
   后台「赛季奖励」的特殊奖励下拉用它（`item_id 145` 的 `amount` 装的是这里面那个 **RewardID**）；
-  金币/钻石（`item_id 1/2`）从下拉里排除。输出 `rewards = {"<RewardID>": {...}}`，304 条。
-  ⚠ **但客户端只认 `PVPMatchSpecialRewards` 那 7 组 43 个编号**（`202/203/220` + 零件 4 档）：
-  别的编号 `PVPManager::getSpecialRewardById` 会就地插一个空奖励 ⇒ 真机上显示同一个占位物
-  （毛驴轮胎）。所以服务端 `_PVP_SPECIAL_GROUPS` 只用这 43 个当白名单，`rewards` 段里其余的
-  条目仍然保留（做名字/交叉核对用），但不进下拉、也不允许填写。
+  金币/钻石（`item_id 1/2`）从下拉里排除。输出 `rewards = {"<RewardID>": {...}}`，309 条。
+  ⚠ 客户端固定表 `PVPMatchSpecialRewards` 里只有 7 组 **43 个**编号（`202/203/220` + 零件 4 档），
+  这是「官方赛季发过哪些」的清单，**不是**可填范围的限制 ——
+  2026-10-06 真机实验（覆盖包）证明：填别的编号客户端**照样解析**，玩家看到「毛驴轮胎」的真因是
+  **已经拥有**该物品时改画它自带的兜底奖励（`Fallback`，237 行里有 215 行是 `221` Doughnut）。
+  所以现在后台下拉给**全部 309 条**（按类别分组、43 个官方编号标 ★），服务端只拒
+  「物品表里查不到」的编号。详见 `work/trials-frontier/notes/pvp-reward-contract.md` §5d。
 * `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
   所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试（最多 16 次，
   `0010_1854657d.bin` 需要 12 次）。**还有 3 个文件解析不了**，如实记进 `source.skipped_files`：
@@ -439,7 +463,7 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 **金票（135）被显式跳过**：它不在存档 `items2` 里，走 `server/data/pvp_state.json`。
 
 生成的 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 +
-304 条奖励名）同时被这些地方消费：
+309 条奖励名）同时被这些地方消费：
 后台的折叠清单与物品选择器、`tflocal_accounts.grantable_items()`、`tflocal_accounts.grantable_paints()`
 （可下发集合）、`tf_server.track_catalog()`（午夜杯/碉堡的赛道下拉）、`tf_server._bunker_catalogs()`
 （碉堡的奖励与车辆下拉）、`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints` /

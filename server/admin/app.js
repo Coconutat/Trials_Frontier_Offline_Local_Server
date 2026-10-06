@@ -1239,11 +1239,21 @@ function wSub(labelKey, ...body) {
   return el('div', { class: 'grp' }, el('div', { class: 'sub', text: t(labelKey) }), ...body);
 }
 
+// 「怎么运作」引导卡：静态规则，一句一行。★ 这类文案跟界面语言走、放在 i18n 里；
+// 服务端字段表里只放「参数」的标签与说明。凡是「改了参数以后坏了」的坑都写在这里。
+function guideCard(titleKey, ...lines) {
+  return wCard(titleKey, null, ...lines.map(l => el('p', { class: 'hint', text: l })));
+}
+
 async function screenWeekly() {
   const data = await api('/__api/admin/weekly');
   const cfg = data.config || {}, st = data.status || {}, tracks = data.tracks || [];
   const draft = Object.assign({}, cfg);   // 只有本屏改得动的键；保存时只发真的变了的
   const nodes = [el('p', { class: 'lead', text: t('weekly.lead') })];
+  // ── ⓪ 引导：午夜杯没有开关（届号是算出来的）。先说清楚，再动参数。
+  nodes.push(guideCard('weekly.guide.title',
+    t('weekly.guide.l1'), t('weekly.guide.l2'), t('weekly.guide.l3'),
+    t('weekly.guide.l4'), t('weekly.guide.l5'), t('weekly.guide.l6')));
   const trackName = id => {
     const hit = tracks.filter(x => Number(x.id) === Number(id))[0];
     return hit ? ((LANG === 'cn' ? hit.name_cn : hit.name) || hit.name || '') : '';
@@ -1288,12 +1298,16 @@ async function screenWeekly() {
     kvItem(t('weekly.now.entries'), fmtNum(st.entries) + ' · ' + t('weekly.now.fake') + ' ' + fmtNum(st.fake)),
     kvItem(t('weekly.now.rules'), fmtNum(st.retry_limit) + ' × / ' + spanText(st.cooldown_seconds)),
     kvItem(t('weekly.now.base'), fmtNum(st.base_ms) + ' ms'),
+    kvItem(t('weekly.now.health'), fmtNum(st.ghosts) + ' / ' + fmtNum(st.board_rows)),
     kvItem(t('weekly.now.days'), t('app.days', { n: st.window_days })));
   nodes.push(el('section', { class: 'card' },
     el('div', { class: 'card-head' }, el('h2', { class: 'grow', text: t('weekly.now.title') }), expBadge),
     el('div', { class: 'card-body' },
       nowKv,
       el('p', { class: 'lead p-warn', text: t('weekly.now.warn') }),
+      // 预检：赛道没幽灵 / 周榜 ID 指到空榜 / 窗口不是 7 天 —— 都是「改完就进不去」的坑。
+      ...(st.warnings || []).map(w => el('p', { class: 'lead p-warn',
+        text: (LANG === 'cn' ? w.cn : (w.en || w.cn)) || '' })),
       wSub('weekly.now.playersTitle',
         (st.players || []).length
           ? table([
@@ -1590,20 +1604,21 @@ function rewardsEditor(rows, cat, onChange) {
     onChange(out);
   };
   const nm = c => (LANG === 'cn' ? c.name_cn : c.name) || c.name || '';
-  const names = {};
-  cat.forEach(c => { names[String(c.id)] = nm(c); });
-  // 原表的赛季特殊奖励只有 43 个编号、分 7 组（零件 4 档 / 两款涂装 / 毛驴图纸），
-  // 用 <optgroup> 分组给下拉；不在这张表里的编号客户端只会发一个占位物。
+  const names = {}, official = {};
+  cat.forEach(c => { names[String(c.id)] = nm(c); official[String(c.id)] = !!c.official; });
+  // ★ 下拉里是物品表里**全部**奖励编号（按类别分组），带 ★ 的是官方赛季特殊奖表里的 43 个。
+  //   表外编号照样能填 —— 显示什么由「玩家有没有这件物品」决定（见 pvp-reward-contract §5d），
+  //   所以这里只提示、不拦，最下面那行会写清楚规则。
   const groups = [];
   cat.forEach(c => {
-    const label = (LANG === 'cn' ? c.group_cn : c.group_en) || c.group_cn || '';
+    const label = (LANG === 'cn' ? c.cat_cn : c.cat) || c.cat || '';
     let g = groups[groups.length - 1];
     if (!g || g.label !== label) groups.push(g = { label: label, rows: [] });
     g.rows.push(c);
   });
   const dl = el('datalist', { id: 'tfRewardIds' }, groups.map(g =>
     el('optgroup', { label: g.label }, g.rows.map(c => el('option', {
-      value: String(c.id), text: '#' + c.id + ' ' + nm(c) })))));
+      value: String(c.id), text: (c.official ? '★ ' : '') + '#' + c.id + ' ' + nm(c) })))));
   const head = el('div', { class: 'rwrow rwhead' },
     el('div', { class: 'rwrank', text: t('bunker.rewards.rank') }),
     el('div', { text: t('bunker.rewards.coin') }),
@@ -1628,8 +1643,12 @@ function rewardsEditor(rows, cat, onChange) {
     const spName = el('span', { class: 'hint' });
     const mark = v => {
       const seen = !!v && !!names[String(v)];
-      spName.textContent = v ? (seen ? names[String(v)] : t('bunker.rewards.unknown')) : '';
+      const off = seen && !official[String(v)];
+      spName.textContent = !v ? ''
+        : (seen ? names[String(v)] + (off ? ' · ' + t('bunker.rewards.nonofficial') : '')
+                : t('bunker.rewards.unknown'));
       spName.classList.toggle('bad', !!v && !seen);
+      spName.classList.toggle('p-warn', off);
       sp.classList.toggle('bad', !!v && !seen);
     };
     if (by[r][145]) sp.value = String(by[r][145]);
@@ -1692,11 +1711,15 @@ function productsEditor(rows, onChange) {
 async function screenBunker() {
   const data = await api('/__api/admin/bunker');
   const st = data.status || {}, fields = data.fields || [], values = data.values || {};
-  const ctx = { tracks: data.tracks || [], rewards: data.specials || [] };
+  const ctx = { tracks: data.tracks || [], rewards: data.rewards || [] };
   const byKey = {};
   fields.forEach(f => { byKey[f.key] = f; });
   const draft = Object.assign({}, values);
   const nodes = [el('p', { class: 'lead', text: t('bunker.lead') })];
+  // ── ⓪ 引导：赛季怎么算、奖励怎么显示（★ 玩家已拥有 = 画兜底物）、什么只能在这一页改。
+  nodes.push(guideCard('bunker.guide.title',
+    t('bunker.guide.l1'), t('bunker.guide.l2'), t('bunker.guide.l3'),
+    t('bunker.guide.l4'), t('bunker.guide.l5'), t('bunker.guide.l6')));
   const set = (k, v) => { draft[k] = v; };
 
   function diffFields(keys) {

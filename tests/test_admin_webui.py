@@ -1234,6 +1234,23 @@ class WeeklyOps(_ParamOps):
         self.assertEqual(j["status"]["week_end"] - j["status"]["week_start"], 7 * 86400)
         self.assertEqual(j["status"]["retry_limit"], 3)
 
+    def test_status_warns_when_the_track_has_no_ghost(self):
+        """★ 用户实测的坑：`track_id` 换成本服没有幽灵的赛道 ⇒ 玩家卡在「加入午夜杯」。
+
+        此时服务端只能给出 `replay_id=0`，客户端反复去要 `ghost/0/payload`（404），界面看起来
+        就是转圈/回到加入屏。现状卡必须先把「这条赛道几个幽灵 / 榜上几行真数据」摆出来，并在
+        为 0 时明确警告，而不是让人自己猜。
+        """
+        self.write_config({"weekly": {"track_id": 1258}})
+        s = self.get()["status"]
+        self.assertEqual(s["track_id"], 1258)
+        self.assertEqual(s["ghosts"], 0)
+        self.assertEqual(s["board_rows"], 0)
+        self.assertTrue(any("幽灵" in w["cn"] for w in s["warnings"]),
+                        "空赛道必须警告：%r" % (s["warnings"],))
+        for w in s["warnings"]:
+            self.assertTrue(w["cn"] and w["en"], w)
+
     def test_status_alone_writes_nothing(self):
         """现状卡只是看一眼，不该在配置或审计里留下东西。"""
         self.get()
@@ -1442,7 +1459,7 @@ class Bunker(_ParamOps):
     def test_get_hands_out_every_card_and_field(self):
         """界面要的东西一次给全：8 张卡 + 服务端字段表 + 现状 + 三个目录 + 模板 + 审计。"""
         j = self.bget()
-        for key in ("cards", "fields", "values", "status", "tracks", "specials", "bikes",
+        for key in ("cards", "fields", "values", "status", "tracks", "rewards", "bikes",
                     "templates", "audit"):
             self.assertIn(key, j)
         self.assertEqual([c["id"] for c in j["cards"]], self.CARDS)
@@ -1479,30 +1496,32 @@ class Bunker(_ParamOps):
             self.assertIsInstance(p["this_season"], bool)
 
     def test_catalogs_come_from_the_item_catalog(self):
-        """特殊奖励下拉 = 客户端原表 `PVPMatchSpecialRewards` 里客户端真认的 43 个编号。
+        """奖励下拉 = 物品表 `server/admin/items.json` 的**全部** 309 个奖励编号，按类别分组。
 
-        客户端对未知编号会**就地插一个空 WheelReward**（`PVPManager::getSpecialRewardById
-        @0x5e231c` 是 get-or-create），列表里于是塌成同一个占位物（毛驴轮胎）⇒ 下拉只给
-        原表里这 43 个，别的一律拒绝。
+        2026-10-06 真机实验（覆盖包改了 `/conf/pvp_match_rewards.txt` 再挂载）推翻了「填表外
+        编号一定变毛驴轮胎」的旧说法：兜底奖励是**该编号自己声明的 `Fallback`**，玩家**已经
+        拥有**这件物品时才画（`257`/`220` 行都带 `Fallback:221` = Doughnut）。所以现在不拦
+        表外编号，只把它们标出来（`official=false`），并在界面上写清显示规则。
         """
         j = self.bget()
         self.assertEqual(len(j["tracks"]), len(srv.track_catalog()))
         self.assertTrue(all({"id", "name"} <= set(b) for b in j["bikes"]))
-        cat = j["specials"]
-        self.assertEqual(len(cat), 43)
+        cat = j["rewards"]
+        items = json.loads((ADMIN_DIR / "items.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(cat), len(items["rewards"]), "下拉必须是物品表全量")
         self.assertEqual(len(srv._PVP_SPECIAL_IDS), 43)
-        # 顺序照原表：按组连续（下拉用 <optgroup> 分组，所以必须是组内连续的）
-        order = [i for _, _, ids in srv._PVP_SPECIAL_GROUPS for i in ids]
-        self.assertEqual([r["id"] for r in cat], order)
-        groups = []
-        for r in cat:
-            if not groups or groups[-1] != (r["group_en"], r["group_cn"]):
-                groups.append((r["group_en"], r["group_cn"]))
-            self.assertTrue(r["name"], "%d 没有名字" % r["id"])
-        self.assertEqual(len(groups), 7, "7 组特殊奖励：零件 4 档 + 两款涂装 + 毛驴图纸")
-        self.assertEqual(len({r["id"] for r in cat}), 43)
-        # 用户报的「加了喷漆结果是毛驴轮胎」：205 这类涂装编号不在原表里
-        self.assertNotIn(205, srv._PVP_SPECIAL_IDS)
+        # 官方 43 个必须都在，而且恰好标出 43 个
+        official = {r["id"] for r in cat if r["official"]}
+        self.assertEqual(official, set(srv._PVP_SPECIAL_IDS))
+        # 按类别分组：同类别必须连续（下拉用 <optgroup> 分组）
+        cats = [r["cat"] for r in cat]
+        self.assertEqual(cats, sorted(cats, key=lambda c: srv._REWARD_CAT_ORDER.index(c)))
+        self.assertTrue(all(r["cat_cn"] and r["name"] for r in cat))
+        self.assertTrue(all(isinstance(r["item_id"], int) for r in cat))
+        # 用户报的「加了喷漆结果是毛驴轮胎」：205/257 这类不在官方 43 个里，但现在允许填
+        for rid in (205, 257, 258, 259, 221):
+            self.assertIn(rid, {r["id"] for r in cat})
+            self.assertNotIn(rid, srv._PVP_SPECIAL_IDS)
 
     def test_status_players_are_read_only(self):
         """现状卡里的玩家档案只是看一眼：不许写配置，也不许在审计里留东西。"""
@@ -1553,13 +1572,11 @@ class Bunker(_ParamOps):
                   "range:season.rewards(名次):0-25"),
                  ({"season.rewards": [{"rank": 1, "item_id": 7, "amount": 1}]},
                   "bad-reward-item:7"),
-                 # 用户报的 bug：喷漆/衣服编号不是赛季特殊奖励，客户端会发成毛驴轮胎
-                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 205}]},
-                  "bad-special:205"),
-                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 257}]},
-                  "bad-special:257"),
-                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 20049}]},
-                  "bad-special:20049"),
+                 # 奖励编号只挡「物品表里查不到」的（205/257 这些现在能填，见下一条用例）
+                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 999}]},
+                  "bad-special:999"),
+                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 12345}]},
+                  "bad-special:12345"),
                  ({"season.product_list": "nope"}, "bad-products"),
                  ({"matchmaking.enabled": "maybe"}, "bad-value:matchmaking.enabled")]
         for fields, code in cases:
@@ -1598,22 +1615,24 @@ class Bunker(_ParamOps):
         j = self.bset({"season.star_array": [3] * 25 + [9]}).json()
         self.assertEqual(j["values"]["season.star_array"], [3] * 25)
 
-    def test_only_the_specials_the_client_knows_are_accepted(self):
-        """白名单：原表 `PVPMatchSpecialRewards` 那 43 个编号能存，别的必须 400。
+    def test_every_reward_id_in_the_item_table_is_accepted(self):
+        """奖励编号只挡「物品表里查不到」的，物品表里有的一律放行（含官方 43 个之外）。
 
-        用户实测：填了喷漆/衣服编号（205/257/258/259）后真机上整条奖励轨道都变成毛驴轮胎 ——
-        客户端 `PVPManager::getSpecialRewardById @0x5e231c` 是 get-or-create，未知编号会就地
-        插一个空 WheelReward，所有不认识的编号塌成同一个占位物。
+        旧版按客户端原表 `PVPMatchSpecialRewards` 的 43 个编号做白名单，理由是「表外编号会塌成
+        占位物」。2026-10-06 真机实验推翻了它：把覆盖包里的 `220` 改成指向 Stallion 图纸后，
+        只有**已经拥有**该物品的账号画兜底物（`Fallback:221` = 甜甜圈），没拥有的账号正常显示
+        ⇒ 显示什么由「玩家有没有」决定，与编号是否在原表里无关。所以白名单撤掉，只留物品表校验。
         """
-        for good in (202, 203, 220, 20000, 20040, 20048):
+        for good in (202, 203, 205, 220, 221, 257, 258, 259, 20000, 20040, 20048):
             j = self.bset({"season.rewards": [{"rank": 1, "item_id": 145, "amount": good}]}).json()
             self.assertEqual(j["values"]["season.rewards"],
                              [{"rank": 1, "item_id": 145, "amount": good}])
-        for bad in (205, 257, 258, 259, 221, 20004, 20049):
+        # 物品表（`items.json` 的 rewards）里没有的编号：客户端解析不出来，仍然 400
+        for bad in (0, 999, 12345, 99999):
             r = self.bset({"season.rewards": [{"rank": 1, "item_id": 145, "amount": bad}]},
                           expect=400)
             self.assertEqual(r.json()["error"], "bad-special:%d" % bad)
-            self.assertIn("毛驴轮胎", r.json()["message"])
+            self.assertIn("物品表", r.json()["message"])
 
     def test_track_ids_keep_three_and_dedupe(self):
 

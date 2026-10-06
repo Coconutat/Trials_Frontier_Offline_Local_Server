@@ -153,6 +153,24 @@ cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.in
 
 > `/data/data/<pkg>/files/` 里那些 `TrialsContentExtraDL_*.dat` / `TrialsTexturesDL_*.dat` 是**引擎自己**从 OBB 展开出来的（我们的载荷里没有这些文件），这反过来证明引擎确实找到了 OBB 并正常消费了它。
 
+### ★ 追加：这个目录就是「覆盖包」的插槽（2026-10-06 真机验证）
+
+想改客户端 `/conf` 表（例如 `pvp_match_rewards.txt`）或 LOCF 文案，**不需要重打 `content.dat` / 重签 APK**：
+往 `/data/data/<pkg>/files/` 丢一个 `TrialsContentExtraDL_<任意名>.dat` 就行，引擎会把它一起挂载。
+
+- **证据**：造 `TrialsContentExtraDL_0probe.dat`（1 060 160 B，sha256 `36099a2a…9baec1`）推进去后，
+  `su -c 'ls -l /proc/<pid>/fd'` 里出现 **`298 -> /data/user/0/com.ubisoft.redlynx.trialsfrontier.ggp/files/TrialsContentExtraDL_0probe.dat`**（`lr-x------` 只读）；
+  同批 fd：`283` = 外部 `content.dat`，`258–282` = 25 个 `TrialsTexturesDL_android_*.dat`，
+  `284–297` = 13 个原 `TrialsContentExtraDL_*.dat`（Swamp→LevelPack2→…→Cave，降序），
+  **`298` = 我们的包（最后一个）**。
+- **为什么最后一个 = 优先级最高**：`tr::GlobalData::initAdditionalDataPacks() @0x4cfdd0` 先把找到的包 `std::sort`
+  再 `std::reverse` 逐个挂载，而 `datapack::DataFilePack::searchFile(const char*, int&) @0x844a78`
+  是从 `m_instances` **末尾往前**扫、先命中先赢（详见 `work/trials-frontier/notes/pvp-reward-contract.md` §5c）。
+- **实效验证**：包内把 3 条 LOCF 文案改成 `PACK-OK`、把赛季奖励第 220 行改指向 Stallion 图纸并删掉 `Fallback`，
+  两处在游戏里都生效（详见同笔记 §5d）。
+- **回滚**：删掉那个 `.dat` 文件即可，不动 `content.dat`，也不动存档。
+- `maps` 里没有它（不是 mmap，是 `read`）。
+
 ## 已知边界
 
 - 载荷清单是**构建时快照**。若今后改了 `tmp/pack/TrialsFrontier-clean-pack/` 的内容，必须重跑构建，否则 APK 里还是旧数据。

@@ -124,12 +124,26 @@
   ⚠ `item_id 145` 的 `amount` 是 `RewardID`（不是库存物品 id、不是数量）；金币/钻石才是真 `item_id`。
   **每局**的金币/钻石/特殊奖励不在服务端，由客户端本地发放。
 
-- **特殊奖励白名单（special reward whitelist）与占位物（placeholder item）**
-  赛季奖励里 `item_id 145` 能填的 `RewardID` **只有 43 个**（原表 `/conf/pvp_match_rewards.txt`
-  的 `PVPMatchSpecialRewards` 7 组：零件 4 档 + `202` Soylent 涂装 + `203` Luchador 涂装 +
-  `220` 毛驴图纸）。客户端查不到别的编号时不会报错，而是**就地插一个空奖励**，
-  玩家看到的永远是同一个**占位物**（实测「毛驴轮胎」）⇒ 服务端直接拒绝白名单外的编号。
-  ★ 喷漆 / 衣服 / 赛道**只能**在「下发物品」页发，它们当不了赛季奖励。
+- **特殊奖励编号（`item_id 145` 的 `amount`）与官方 43 个**
+  赛季奖励里 `item_id 145` 的 `amount` 是客户端原表 `/conf/pvp_match_rewards.txt` 的 `RewardID`。
+  原表 `PVPMatchSpecialRewards` 固定 7 组共 **43 个**编号（零件 4 档 + `202` Soylent 涂装 +
+  `203` Luchador 涂装 + `220` 毛驴图纸），运营页给它们标 ★。
+  这只是「官方赛季会发哪些」，**不是**可填范围的限制：物品表里存在的编号现在都能填
+  （服务端只拒物品表里查不到的编号）。
+
+- **兜底奖励（`Fallback`）与显示规则**
+  原表每条奖励可以声明一个 `Fallback`。客户端画赛季奖励时先看玩家**有没有**这件物品：
+  没有就画真实图标，**已经有了**就画该编号自己的兜底奖励 ——
+  原表 309 行里 237 行带 `Fallback`，其中 215 行是 `221`（Doughnut = 「毛驴轮胎」）、22 行是 `-2`。
+  ⇒ 同一个编号在不同账号上长得不一样，**这不是配置坏了**。
+  （2026-10-06 用覆盖包 `TrialsContentExtraDL_0probe.dat` 真机验证：把 `220` 改指向 Stallion 图纸
+  并删掉它的 `Fallback` 后，游戏里那一档就画出了 Stallion 图纸。）
+  ★ 想稳定发喷漆 / 衣服 / 整车，仍然走「下发物品」页。
+
+- **幽灵与榜行预检（`ghosts` / `board_rows`）**
+  午夜杯现状卡上的两个只读计数 + 警告。赛道上一个幽灵都没有时服务端只能回 `replay_id=0`，
+  客户端会反复去要一个不存在的幽灵（表现：卡在「加入午夜杯」）——
+  所以换赛道前先看这两个数，或者先让玩家在这条赛道上跑一圈。
 
 - **对局时长（match duration）**
   碉堡的一局长度（`matchmaking.match_duration_seconds`，同时当 `total_time` 与 `ranked_match_duration` 用）。

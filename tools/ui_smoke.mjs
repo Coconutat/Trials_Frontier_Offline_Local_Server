@@ -119,11 +119,12 @@ await send('Emulation.setEmulatedMedia',
   { features: [{ name: 'prefers-color-scheme', value: 'dark' }] });
 
 let shotN = 0;
-if (SHOT) {
-  mkdirSync(SHOT, { recursive: true });
-  await send('Emulation.setDeviceMetricsOverride',
-    { width: 1440, height: 1000, deviceScaleFactor: 2, mobile: false });
-}
+// ★ 固定视口跟截图没关系，是**为了让断言可重复**：默认窗口小的时候，`#pane` 的
+//   innerText 会随布局变（折叠区/换行不同），曾经出现「同一次改动，带截图跑绿、
+//   不带截图跑红」。所以无论如何都钉死视口。
+await send('Emulation.setDeviceMetricsOverride',
+  { width: 1440, height: 1000, deviceScaleFactor: 2, mobile: false });
+if (SHOT) mkdirSync(SHOT, { recursive: true });
 const shot = async name => {
   if (!SHOT) return;
   const { data } = await send('Page.captureScreenshot',
@@ -245,13 +246,14 @@ const SCREENS = [
             row.click();
           })()`,
     mustAfter: ['已选 1 条'],
-    // 特殊奖励：手填一个原表里没有的编号 ⇒ 名字位置要如实说客户端会忽略。
+    // 奖励编号：填一个「物品表里有、但不在官方 43 个里」的编号（257 = 忍者服装）
+    // ⇒ 名字位置要如实说显示什么由「玩家有没有这件物品」决定（兜底物 = 毛驴轮胎）。
     act2: `(() => {
              const inp = [...document.querySelectorAll('#pane .rwsp')][0];
-             inp.value = '999';
+             inp.value = '257';
              inp.dispatchEvent(new Event('input'));
            })()`,
-    mustAfter2: ['毛驴轮胎'],
+    mustAfter2: ['忍者', '毛驴轮胎'],
     suffixes: ['-选路', '-奖励'],
   },
 ];
