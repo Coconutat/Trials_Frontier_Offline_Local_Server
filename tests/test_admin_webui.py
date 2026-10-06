@@ -118,7 +118,8 @@ class Base(unittest.TestCase):
         d = Path(self.tmp.name)
         for name, rel in (("ACCOUNTS", "accounts.json"), ("SESSIONS", "sessions.json"),
                           ("DEVICES", "devices.json"), ("REMEMBER", "remember.json"),
-                          ("BINDINGS", "bindings.json"), ("ADMIN", "admin.json")):
+                          ("BINDINGS", "bindings.json"), ("ADMIN", "admin.json"),
+                          ("FRIENDS", "friends.json")):
             p = patch.object(acct, name, str(d / rel))
             p.start()
             self.addCleanup(p.stop)
@@ -792,9 +793,163 @@ class Endpoints(Base):
                    "/__api/admin/rollback", "/__api/admin/info",
                    "/__api/admin/revert", "/__api/admin/password",
                    "/__api/admin/weekly", "/__api/admin/undo", "/__api/admin/templates",
-                   "/__api/admin/sessions/clear"):
+                   "/__api/admin/social", "/__api/admin/sessions/clear"):
             self.assertIn(ep, blob, "%s 没登记进 /__help" % ep)
         self.assertIn("[public]", blob)     # 门禁边界要能自解释
+
+
+# ---------------------------------------------------------------- 昵称 / 好友
+class Social(Base):
+    """昵称 + 好友。
+
+    ★ 游戏里加不了好友：唯一的加好友接口 tr::OnlineFriends::addFriend @0x51bed4
+    的调用者全在 UPlay 那条线上（育碧覆盖层），私服接不到。客户端只负责
+    **显示** —— 它读 GET /v2/profiles/me/friends，然后 syncFriendList() 把服务器
+    没给的条目从本地好友表删掉。所以关系只能在后台维护，这里测的就是那条链。
+    """
+
+    def mk(self, username, name=None):
+        acc, err = acct.register_account(username, "pw-123456", name)
+        self.assertIsNone(err, "建号失败：%s" % err)
+        return acc
+
+    def ticket(self, acc):
+        return {"Authorization": "Ubi_v1 t=" + acct.issue_session(acc)}
+
+    def player_call(self, path, acc):
+        """像客户端那样带票据走动态路由（不经 rules.json）。"""
+        fn, tag = srv.pick_dynamic("GET", path)
+        self.assertTrue(fn, "%s 没有动态处理器，会掉回 rules.json 的死桩" % path)
+        return tag, fn(path, "", b"", self.ticket(acc))[2]
+
+    def social(self, body, token=None):
+        handled, r = request("/__api/admin/social", token=token or self.login(),
+                             method="POST", body=body)
+        self.assertTrue(handled)
+        return r
+
+    def test_needs_admin(self):
+        handled, r = request("/__api/admin/social")
+        self.assertTrue(handled)
+        self.assertEqual(r.status, 401)
+
+    def test_lists_players_with_names_and_links(self):
+        a = self.mk("zhangsan", "张三")
+        self.mk("lisi", "李四")
+        handled, r = request("/__api/admin/social", token=self.login())
+        self.assertTrue(handled)
+        self.assertEqual(r.status, 200)
+        j = r.json()
+        bypid = {p["profileId"]: p for p in j["players"]}
+        self.assertEqual(bypid[a["profileId"]]["nameOnPlatform"], "张三")
+        self.assertEqual(bypid[a["profileId"]]["kind"], "account")
+        self.assertEqual(j["links"], 0)
+        self.assertEqual(bypid[a["profileId"]]["friends"], [])
+
+    def test_rename_reaches_the_player_facing_surfaces(self):
+        a = self.mk("zhangsan", "张三")
+        r = self.social({"action": "rename", "profile": a["profileId"],
+                         "nameOnPlatform": "  李 四  "})
+        self.assertEqual(r.status, 200)
+        # 掐首尾空白、中间连续空白压成一个
+        self.assertEqual(r.json()["result"]["nameOnPlatform"], "李 四")
+        self.assertEqual(acct.name_for_profile(a["profileId"]), "李 四")
+        # 游戏里看到的自己（GET /v2/profiles/me）
+        st, _, body = srv.h_profile_me("/v2/profiles/me", "", b"", self.ticket(a))
+        self.assertEqual(st, 200)
+        self.assertEqual(body["nameOnPlatform"], "李 四")
+
+    def test_rename_device_slot(self):
+        """没注册账号的静默设备也有名字（Player-XXXXXX），也得能改。"""
+        dev = acct.ensure_device("DEVICE-ABC12345")
+        r = self.social({"action": "rename", "profile": dev["profileId"],
+                         "nameOnPlatform": "小霸王"})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.json()["result"]["kind"], "device")
+        self.assertEqual(acct.name_for_profile(dev["profileId"]), "小霸王")
+        self.assertEqual(acct.device_by_profile(dev["profileId"])["nameOnPlatform"], "小霸王")
+
+    def test_rename_rejects_bad_names(self):
+        a = self.mk("zhangsan", "张三")
+        b = self.mk("lisi")                       # 默认昵称就是用户名 "lisi"
+        for name, err in (("ab", "bad-name"), ("x" * 30, "bad-name"),
+                          ("", "bad-name"), ("   ", "bad-name"),
+                          ("王\u0007五", "bad-name"),
+                          ("LiSi", "name-taken"), ("lisi", "name-taken")):
+            r = self.social({"action": "rename", "profile": a["profileId"],
+                             "nameOnPlatform": name})
+            self.assertEqual(r.status, 400, name)
+            self.assertEqual(r.json()["error"], err, name)
+        r = self.social({"action": "rename", "profile": "no-such-pid",
+                         "nameOnPlatform": "孙悟空"})
+        self.assertEqual(r.json()["error"], "not-found")
+        # 失败绝不能留下半截改动
+        self.assertEqual(acct.name_for_profile(a["profileId"]), "张三")
+        self.assertEqual(acct.name_for_profile(b["profileId"]), "lisi")
+
+    def test_friends_are_two_way_and_reach_the_game(self):
+        a = self.mk("zhangsan", "张三")
+        b = self.mk("lisi", "李四")
+        r = self.social({"action": "set_friends", "profile": a["profileId"],
+                         "friends": [b["profileId"]]})
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.json()["links"], 1)
+        # 双向：不然会出现「我这边有你、你那边没我」的鬼影
+        self.assertEqual(acct.friends_of(a["profileId"]), [b["profileId"]])
+        self.assertEqual(acct.friends_of(b["profileId"]), [a["profileId"]])
+        # 游戏内好友列表：客户端读的就是这条，名字必须跟着昵称走
+        tag, body = self.player_call("/v2/profiles/me/friends", a)
+        self.assertEqual(tag, "dyn:GET /v2/profiles/me/friends")
+        self.assertEqual(list(body.keys()), ["friends"])
+        self.assertEqual([f["pid"] for f in body["friends"]], [b["profileId"]])
+        self.assertEqual(body["friends"][0]["nameOnPlatform"], "李四")
+        self.assertEqual(body["friends"][0]["state"], "Friend")
+        self.assertEqual(body["friends"][0]["userId"], b["profileId"])
+        self.assertEqual(body["friends"][0]["platformType"], "ubimobile")
+        # 解除：两边都清空，且空列表必须还是 {"friends": []}
+        r = self.social({"action": "set_friends", "profile": a["profileId"], "friends": []})
+        self.assertEqual(r.json()["links"], 0)
+        self.assertEqual(acct.friends_of(a["profileId"]), [])
+        self.assertEqual(acct.friends_of(b["profileId"]), [])
+        _, body = self.player_call("/v2/profiles/me/friends", a)
+        # ★ {} 会让客户端崩（0x51cf18 ldr 空指针 +0x10），空数组才是安全的
+        self.assertEqual(body, {"friends": []})
+
+    def test_anon_caller_gets_an_empty_list_not_a_crash(self):
+        fn, _ = srv.pick_dynamic("GET", "/v2/profiles/me/friends")
+        st, _, body = fn("/v2/profiles/me/friends", "", b"", {})
+        self.assertEqual(st, 200)
+        self.assertEqual(body, {"friends": []})
+
+    def test_friends_reject_self_unknown_and_too_many(self):
+        a = self.mk("zhangsan", "张三")
+        b = self.mk("lisi", "李四")
+        for friends, err in (([a["profileId"]], "self-friend"),
+                             ([b["profileId"], "no-such-pid"], "unknown-profile"),
+                             (["no-such-pid"], "unknown-profile")):
+            r = self.social({"action": "set_friends", "profile": a["profileId"],
+                             "friends": friends})
+            self.assertEqual(r.status, 400, friends)
+            self.assertEqual(r.json()["error"], err, friends)
+        r = self.social({"action": "set_friends", "profile": "no-such-pid",
+                         "friends": []})
+        self.assertEqual(r.json()["error"], "unknown-profile")
+        self.assertEqual(acct.friends_of(a["profileId"]), [])       # 一条都没写进去
+        # 上限（客户端只画得下有限几个）
+        c = self.mk("wangwu", "王五")
+        with patch.object(acct, "FRIENDS_MAX", 1):
+            r = self.social({"action": "set_friends", "profile": a["profileId"],
+                             "friends": [b["profileId"], c["profileId"]]})
+            self.assertEqual(r.json()["error"], "too-many")
+        self.assertEqual(acct.friends_of(a["profileId"]), [])
+        self.assertEqual(acct.friends_of(b["profileId"]), [])
+        r = self.social({"action": "nonsense"})
+        self.assertEqual(r.json()["error"], "bad-action")
+
+    def test_rules_stub_is_really_gone(self):
+        """以前 rules.json 里那条死桩固定回两个假好友，别再长回来。"""
+        rules = json.loads((ROOT / "server" / "rules.json").read_text(encoding="utf-8"))
+        self.assertNotIn("GET /v2/profiles/me/friends", rules)
 
 
 # ---------------------------------------------------------------- 静态页

@@ -1086,6 +1086,118 @@ def list_devices():
             for v in db.values()]
 
 
+# --------------------------------------------------- 社交：昵称与好友关系
+# ★ 好友关系由后台维护，游戏里没有「加好友」这个动作：客户端唯一的加好友接口
+#   tr::OnlineFriends::addFriend @0x0051bed4 的调用者全在 UPlay 那条线上（育碧
+#   覆盖层），私服接不到。游戏自己只负责**显示**：每次进社交界面它都
+#   GET /v2/profiles/me/friends，拿到结果后 syncFriendList() 会把服务器没给的
+#   条目从本地好友表删掉 —— 所以这张表就是客户端能看到的唯一真相。
+FRIENDS = os.path.join(DATA, "friends.json")
+# 客户端自己的校验文案是「昵称至少需要包含3个字符。」（LOCF hash 78d4b7de），照抄这个下限。
+NAME_MIN = 3
+NAME_MAX = 24
+FRIENDS_MAX = 50
+
+
+def list_players():
+    """本服所有能当好友的真人：注册账号 + 设备槽（含没登录过的静默设备）。"""
+    out = []
+    for acc in list_accounts_public():
+        out.append({"kind": "account", "profileId": acc.get("profileId"),
+                    "username": acc.get("username"),
+                    "nameOnPlatform": acc.get("nameOnPlatform") or acc.get("username")})
+    for dev in list_devices():
+        out.append({"kind": "device", "profileId": dev.get("profileId"),
+                    "username": dev.get("username"), "deviceId": dev.get("deviceId"),
+                    "nameOnPlatform": dev.get("nameOnPlatform") or dev.get("username")})
+    return [p for p in out if p.get("profileId")]
+
+
+def friends_map():
+    """{profileId: [profileId, …]} 全量好友表（只读快照）。"""
+    db = _load(FRIENDS, {})
+    if not isinstance(db, dict):
+        return {}
+    return {k: [x for x in v if isinstance(x, str)]
+            for k, v in db.items() if isinstance(v, list) and v}
+
+
+def friends_of(profile_id):
+    """某人的好友 pid 列表（按存盘顺序）。"""
+    return list(friends_map().get(str(profile_id or ""), []))
+
+
+def set_friends(profile_id, pids):
+    """整表替换某人的好友，并**双向**维护（A 加 B ⇒ B 列表里也有 A）。
+
+    客户端只信自己那份列表，单向关系会造成「我这边有你、你那边没我」的鬼影，
+    所以两边一起写。返回 (saved_pids, err)。
+    """
+    pid = str(profile_id or "").strip()
+    known = {p["profileId"] for p in list_players()}
+    if not pid or pid not in known:
+        return None, "unknown-profile"
+    want, seen = [], set()
+    for raw in (pids or []):
+        other = str(raw or "").strip()
+        if not other or other in seen:
+            continue
+        if other == pid:
+            return None, "self-friend"
+        if other not in known:
+            return None, "unknown-profile"
+        seen.add(other)
+        want.append(other)
+        if len(want) > FRIENDS_MAX:
+            return None, "too-many"
+    with _LOCK:
+        db = friends_map()
+        old = set(db.get(pid, []))
+        for other in old - seen:                      # 断开的：两边都删
+            db[other] = [x for x in db.get(other, []) if x != pid]
+        for other in seen - old:                      # 新加的：两边都加
+            db[other] = [x for x in db.get(other, []) if x != pid] + [pid]
+        db[pid] = want
+        for k in [k for k, v in db.items() if not v]:
+            db.pop(k, None)
+        _store(FRIENDS, db)
+    return want, None
+
+
+def rename_profile(profile_id, name):
+    """改昵称（nameOnPlatform）。注册账号与设备槽都支持。
+
+    昵称唯一：`GET /v1/profiles?nameOnPlatform=<名字>` 是拿名字反查人的老接口，
+    重名会让玩家在榜上/好友里分不清。返回 (info, err)。
+    """
+    pid = str(profile_id or "").strip()
+    if not pid:
+        return None, "not-found"
+    new = " ".join(str(name or "").split())  # 掐首尾空白，中间连续空白压成一个
+    if len(new) < NAME_MIN or len(new) > NAME_MAX or any(ord(c) < 32 for c in new):
+        return None, "bad-name"
+    low = new.lower()
+    for p in list_players():
+        if p["profileId"] != pid and (p.get("nameOnPlatform") or "").strip().lower() == low:
+            return None, "name-taken"
+    with _LOCK:
+        db = _load(ACCOUNTS, {})
+        for acc in db.get("users", {}).values():
+            if acc.get("profileId") == pid:
+                acc["nameOnPlatform"] = new
+                _store(ACCOUNTS, db)
+                print("[acct] 昵称 %s -> %s" % (pid[:8], new), flush=True)
+                return {"kind": "account", "profileId": pid, "nameOnPlatform": new}, None
+        devs = _load(DEVICES, {})
+        for dev in devs.values():
+            if dev.get("profileId") == pid:
+                dev["nameOnPlatform"] = new
+                _store(DEVICES, devs)
+                print("[acct] 设备昵称 %s -> %s" % (pid[:8], new), flush=True)
+                return {"kind": "device", "profileId": pid, "nameOnPlatform": new}, None
+    return None, "not-found"
+
+
 def list_saves():
     out = []
     if not os.path.isdir(SAVE_DIR):

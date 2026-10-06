@@ -149,7 +149,11 @@ await send('Network.setCookie',
 // 改文案时要同步这里 —— 宁可失败也不要让检查悄悄变成空断言。
 const SCREENS = [
   { hash: '#/accounts', title: '账号',
-    must: ['玩家注册入口', '复制', '登录会话', '设备', '管理员口令'] },
+    // ★ 「对好友 / 加好友 / 改昵称」来自社交卡（2026-10-07 新增）：游戏内加不了好友
+    //   （addFriend 只走育碧 Uplay 覆盖层），关系与昵称只能在这张卡上维护。
+    //   只钉这些**结构性**字样，不钉「还没有好友」这类随关系变化的行内文案。
+    must: ['玩家注册入口', '复制', '登录会话', '设备', '管理员口令',
+           '对好友', '加好友', '改昵称'] },
   {
     hash: '#/saves', title: '存档', must: ['存档槽', '内容丰富度', '写入时间'],
     act: `[...document.querySelectorAll('#pane tbody tr')]
@@ -162,14 +166,15 @@ const SCREENS = [
     must: ['竞技场', '金票', '筹码', '存档物品', '云端',
            '货币', '消耗品', '摩托车零件', '骑手服装', '摩托蓝图', '车漆涂装', '已选 0 项'],
     // 默认选中是列表第一个（<anonymous>）。切到 ccb 那个真档上，确认竞技场卡
-    // 读到的是服务端 pvp_state.json 里的真值。★ 别写死余额：那是随时可改的线上
-    // 数值（改过一次就把断言变成假失败），所以只钉「段位 24」这种结构性的东西。
+    // 读到的是服务端 pvp_state.json 里的真值。★ 别写死余额或段位数字：那是随时
+    // 会变的线上数值（玩家打一局就变），写死过一次就变成假失败（2026-10-07：段位
+    // 从 24 掉回 23，断言就红了）。这里只钉「有段位这一行」这种结构性的东西。
     act: `(() => {
             const s = document.getElementById('grantSlot');
             s.value = [...s.options].find(o => o.value.startsWith('53ebbd18')).value;
             s.dispatchEvent(new Event('change'));
           })()`,
-    mustAfter: ['竞技场', '当前', '段位 24', '下发到竞技场'],
+    mustAfter: ['竞技场', '当前', '段位', '下发到竞技场'],
     // 再点开第一个分类（货币），确认折叠清单真的展开出物品行（未展开时 innerText 里没有这些）。
     act2: `document.querySelector('#pane .acchead').click()`,
     mustAfter2: ['金币', '钻石', '已选 0 项'],

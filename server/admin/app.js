@@ -405,8 +405,9 @@ function richCell(n) {
 }
 
 async function screenAccounts() {
-  const [accs, devs, ses, info] = await Promise.all([
-    api('/__accounts'), api('/__devices'), api('/__sessions'), api('/__api/admin/info')]);
+  const [accs, devs, ses, info, social] = await Promise.all([
+    api('/__accounts'), api('/__devices'), api('/__sessions'), api('/__api/admin/info'),
+    api('/__api/admin/social')]);
   const perUser = {};
   for (const s of Object.values(ses.sessions || {})) {
     const u = s && s.user;
@@ -416,6 +417,31 @@ async function screenAccounts() {
   async function clearSessions(username) {
     const r = await post('/__api/admin/sessions/clear', username ? { username } : {});
     toast(t('accounts.sessions.cleared', { n: r.removed }), { kind: 'good' });
+    show('accounts');
+  }
+
+  // 昵称与好友都是「后台维护、游戏里只显示」：游戏内加好友走的是育碧 Uplay
+  // 覆盖层（tr::OnlineFriends::addFriend 没有 HTTP 端点），私服收不到请求，
+  // 所以关系只能在这里加，游戏每次登录都拿服务器这份覆盖本地备份。
+  async function renamePlayer(p) {
+    const cur = p.nameOnPlatform || p.username || p.deviceId || '';
+    const name = await confirmDialog({
+      title: t('accounts.renameTitle', { name: cur }),
+      body: t('accounts.renameBody'),
+      input: { label: t('accounts.renameLabel'), value: p.nameOnPlatform || cur,
+               placeholder: t('accounts.renamePlaceholder'), maxlength: 24 },
+      okLabel: t('accounts.rename') });
+    if (!name) return;
+    const r = await post('/__api/admin/social',
+      { action: 'rename', profile: p.profileId, nameOnPlatform: name });
+    toast(t('accounts.renameDone', { name: r.result.nameOnPlatform }), { kind: 'good' });
+    show('accounts');
+  }
+
+  async function setFriends(p, ids) {
+    await post('/__api/admin/social',
+      { action: 'set_friends', profile: p.profileId, friends: ids });
+    toast(t('accounts.friends.saved', { name: p.nameOnPlatform }), { kind: 'good' });
     show('accounts');
   }
 
@@ -440,7 +466,11 @@ async function screenAccounts() {
         el('b', { text: a.username }),
         a.banned ? el('span', { class: 'badge bad', style: 'margin-left:6px', text: t('accounts.banned') }) : null) },
     { label: t('accounts.col.profile'), render: a => idCell(a.profileId) },
-    { label: t('accounts.col.platform'), render: a => a.nameOnPlatform || dash() },
+    { label: t('accounts.col.platform'), render: a => el('span',
+        { style: 'display:inline-flex;gap:6px;align-items:center' },
+        el('span', { text: a.nameOnPlatform || dash() }),
+        el('button', { class: 'btn tiny', text: t('accounts.rename'),
+                       onclick: () => guarded(() => renamePlayer(a)) })) },
     { label: t('accounts.col.created'), cls: 'nowrap', render: a => fmtTime(a.created) },
     { label: t('accounts.col.lastLogin'), cls: 'nowrap', render: a => fmtTime(a.last_login) },
     { label: t('accounts.col.logins'), cls: 'r num', render: a => fmtNum(a.logins) },
@@ -474,7 +504,11 @@ async function screenAccounts() {
   const devCols = [
     { label: t('accounts.devices.col.device'), render: d => el('span', { class: 'mono', text: d.deviceId }) },
     { label: t('accounts.devices.col.profile'), render: d => idCell(d.profileId) },
-    { label: t('accounts.devices.col.platform'), render: d => d.nameOnPlatform || dash() },
+    { label: t('accounts.devices.col.platform'), render: d => el('span',
+        { style: 'display:inline-flex;gap:6px;align-items:center' },
+        el('span', { text: d.nameOnPlatform || dash() }),
+        el('button', { class: 'btn tiny', text: t('accounts.rename'),
+                       onclick: () => guarded(() => renamePlayer(d)) })) },
     { label: t('accounts.devices.col.lastSeen'), cls: 'nowrap', render: d => fmtTime(d.last_seen) },
     { label: t('accounts.devices.col.sessions'), cls: 'r num', render: d => fmtNum(d.sessions) },
   ];
@@ -516,7 +550,44 @@ async function screenAccounts() {
     el('p', { class: 'lead', text: t('accounts.admin.lead') }),
     el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, pwInput, pwBtn));
 
-  return [regCard, sessCard, accCard, devCard, pwCard];
+  // 社交卡：玩家「互相加好友」的唯一入口。游戏内加不了（走 Uplay 覆盖层），
+  // 这里加的名单会通过 GET /v2/profiles/me/friends 下发，客户端拿它覆盖本地备份。
+  const people = social.players || [];
+  const friendCols = [
+    { label: t('accounts.friends.col.player'), render: p => el('span', null,
+        el('b', { text: p.nameOnPlatform || p.profileId.slice(0, 8) }),
+        el('span', { class: 'muted', style: 'margin-left:6px',
+                     text: p.kind === 'device' ? t('accounts.friends.device')
+                                               : (p.username || '') })) },
+    { label: t('accounts.friends.col.list'), render: p => (p.friends || []).length
+        ? el('span', { class: 'chips' }, p.friends.map(f => el('span', { class: 'friend' },
+            el('span', { text: f.nameOnPlatform }),
+            el('button', { type: 'button', title: t('accounts.friends.remove'), text: '×',
+                           onclick: () => guarded(() => setFriends(p,
+                             p.friends.filter(x => x.profileId !== f.profileId)
+                                      .map(x => x.profileId))) }))))
+        : el('span', { class: 'muted', text: t('accounts.friends.empty') }) },
+    { label: t('accounts.friends.col.add'), cls: 'act', render: p => {
+        const have = new Set((p.friends || []).map(f => f.profileId));
+        const pool = people.filter(q => q.profileId !== p.profileId && !have.has(q.profileId));
+        if (!pool.length) return dash();
+        const sel = el('select', null, pool.map(q => el('option',
+          { value: q.profileId, text: q.nameOnPlatform || q.profileId.slice(0, 8) })));
+        return el('span', { style: 'display:inline-flex;gap:6px;align-items:center' }, sel,
+          el('button', { class: 'btn tiny primary', text: t('accounts.friends.add'),
+                         onclick: () => guarded(() => setFriends(p,
+                           (p.friends || []).map(x => x.profileId).concat([sel.value]))) }));
+      } },
+  ];
+  const socialCard = el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('accounts.friends.title') }),
+      el('span', { class: 'badge', text: t('accounts.friends.links', { n: social.links || 0 }) })),
+    el('div', { class: 'card-body' },
+      el('p', { class: 'lead', text: t('accounts.friends.lead') })),
+    table(friendCols, people));
+
+  return [regCard, sessCard, accCard, socialCard, devCard, pwCard];
 }
 
 // ─────────────────────────────────────────────── 屏 · 存档

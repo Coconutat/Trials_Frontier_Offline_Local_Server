@@ -1233,6 +1233,42 @@ def h_profile_me(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, acct.profile_body(acc)
 
 
+def h_friends_list(path, query, body, headers):
+    """GET /v2/profiles/me/friends —— 当前登录者的好友列表（后台维护的真关系）。
+
+    ★ 这条以前是 rules.json 里的死桩：固定回 GhostRider / TangoPro 两个假好友，
+    纯摆设、跟账号无关。现在按调用者查 server/data/friends.json。
+    客户端侧：OnlineFriends::onFriendlistRecieved @0x51cee8 收完立刻
+    syncFriendList() @0x51d0ac，**服务器没给的条目会被它从本地好友表删掉**，
+    所以我们给什么，玩家就看到什么。字段名照抄原来那个桩
+    （pid/userId/idOnPlatform 同值、platformType=ubimobile、state=Friend），
+    别改：客户端用本地条目的 pid 跟这里的 pid 比字符串。
+    """
+    pid = _caller_profile(headers)
+    names = {p["profileId"]: p.get("nameOnPlatform") for p in acct.list_players()}
+    out = []
+    for fid in acct.friends_of(pid):
+        nm = names.get(fid) or acct.name_for_profile(fid) or ("Player" + fid[:4])
+        out.append({"pid": fid, "userId": fid, "idOnPlatform": fid,
+                    "nameOnPlatform": nm, "platformType": "ubimobile",
+                    "state": "Friend"})
+    return 200, {"Content-Type": "application/json"}, {"friends": out}
+
+
+def _social_payload():
+    """后台「账号社交」页的数据：每个真人 + 他的好友（带名字，界面直接画）。"""
+    players = acct.list_players()
+    names = {p["profileId"]: (p.get("nameOnPlatform") or p.get("username") or p["profileId"])
+             for p in players}
+    fmap = acct.friends_map()
+    for p in players:
+        p["friends"] = [{"profileId": f,
+                         "nameOnPlatform": names.get(f) or acct.name_for_profile(f) or f[:8]}
+                        for f in fmap.get(p["profileId"], [])]
+    return {"ok": True, "players": players,
+            "links": sum(len(p["friends"]) for p in players) // 2}
+
+
 def h_profiles_query(path, query, body, headers):
     """OnlineFriends::resolveOnlineIds 走 %s/v1/profiles?profileId=…（.rodata @0xb89064）。"""
     me = h_profile_me(path, query, body, headers)[2]
@@ -6382,6 +6418,9 @@ DYNAMIC_EXACT = [
     ("GET", "/public/playerprogress/v1/progress/status", h_progress_status),
     ("POST", "/public/playerprogress/v1/swap", h_progress_swap),
     ("GET", "/v2/profiles/me", h_profile_me),
+    # 好友列表：以前是 rules.json 里的死桩（固定两个假好友），现在按登录者查
+    # server/data/friends.json（后台维护的真关系）。玩家侧只显示，不能加好友。
+    ("GET", "/v2/profiles/me/friends", h_friends_list),
     # ★ 会话端点必须注册为动态处理，否则会落到 rules.json 里那条写死的匿名桩：
     #   返回固定 profileId 11111111-… 且**没有 rememberMeTicket**，
     #   症状就是「每次重启都要重新登录」「登录了也没有分数记录和在线服务」。
@@ -6892,6 +6931,33 @@ class Handler(BaseHTTPRequestHandler):
                                        "no-items2": "这个存档没有 items2",
                                        }.get(err, "下发失败：" + str(err))}, 400)
             return js({"ok": True, **res})
+        if path == "/__api/admin/social":
+            # 账号社交页：GET = 读（所有真人 + 好友关系），POST = 改昵称 / 改好友。
+            # ★ 加好友只能在这里做：客户端的加好友接口只接 UPlay 覆盖层
+            #   (tr::OnlineFriends::addFriend @0x0051bed4)，私服收不到；游戏里
+            #   只负责显示 GET /v2/profiles/me/friends 给的内容。
+            if self.command == "GET":
+                return js(_social_payload())
+            form = _json_body(body) or {}
+            action = str(form.get("action") or "")
+            if action == "rename":
+                res, err = acct.rename_profile(form.get("profile"), form.get("nameOnPlatform"))
+                msg = {"bad-name": "昵称要 %d–%d 个字符" % (acct.NAME_MIN, acct.NAME_MAX),
+                       "name-taken": "这个昵称已经被别人用了",
+                       "not-found": "找不到这个账号（可能已被删）",
+                       }.get(err)
+            elif action == "set_friends":
+                res, err = acct.set_friends(form.get("profile"), form.get("friends"))
+                msg = {"unknown-profile": "名单里有不存在的账号",
+                       "self-friend": "不能把自己加为好友",
+                       "too-many": "好友上限 %d 个" % acct.FRIENDS_MAX,
+                       }.get(err)
+            else:
+                res, err, msg = None, "bad-action", None
+            if res is None:
+                return js({"ok": False, "error": err,
+                           "message": msg or ("操作失败：" + str(err))}, 400)
+            return js({"ok": True, "result": res, **_social_payload()})
         if path == "/__api/admin/pvp":
             # 竞技场余额：改的是服务端 pvp_state.json，不需要玩家做任何操作。
             form = _json_body(body) or {}
@@ -7142,6 +7208,7 @@ class Handler(BaseHTTPRequestHandler):
                     "GET|POST /__api/admin/bunker（碉堡运营：GET 字段表+现状+赛道/奖励/车辆下拉；POST {fields:{…}}，列表类整表替换）",
                     "POST /__api/admin/undo {id}（撤销一条参数改动，id 来自上面的 audit）",
                     "GET|POST /__api/admin/templates（参数模板：GET ?page=weekly|bunker；POST {page,action:save|apply|copy|rename|delete,name,new_name,parts}）",
+                    "GET|POST /__api/admin/social（账号社交：GET 所有真人+好友；POST {action:rename,profile,nameOnPlatform} 或 {action:set_friends,profile,friends:[pid…]}，即时生效）",
                     "POST /__api/admin/rollback {profile,ts} -> {snapshot}",
                     "POST /__api/admin/revert {profile,snapshot}",
                     "POST /__api/admin/sessions/clear {username?}",

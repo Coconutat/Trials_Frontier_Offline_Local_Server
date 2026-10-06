@@ -78,33 +78,9 @@
   },
 
   "//friends": "tr::OnlineFriends::onFriendlistRecieved 遍历 root->child->child 再读每项的 pid / nameOnPlatform / state。",
-  "//friends2": "形状必须是 {\"<任意键>\": [ {..}, .. ]}；root 第一个成员就是好友数组。⚠ 别改成空数组或省略 —— 只影响显示，但真正的坑是下面这条：",
-  "//friends3": "⚠⚠ 本端点绝不能回空 body / `{}` / 非 JSON：cmd 0x50 分支 (0x5182a8) 没有 `cbz x21`，NULL 会进解析器，0x51cf18 `ldr x8,[x1,#0x10]` 直接读地址 0x10 ⇒ SIGSEGV；`{}` 同样崩（0x51cf1c 读 NULL+0x10，`cbz x28`@0x51cf20 只保护 x28）。另外三个值必须是字符串（不检查类型标签 +0x30，pid 直接进 strlen），且 `pid` 必须排在 `nameOnPlatform` **之前**（否则 strcmp(buf,\"0\")==0 整条被静默跳过）。pid ≥ 43 字节会让 addFriend 的 strcpy 堆溢出。",
+  "//friends2": "★ 原来这条路径写死了两个假好友（GhostRider / TangoPro），现已删除：GET /v2/profiles/me/friends 改由 tf_server.py 的 h_friends_list 动态返回（后台维护的好友关系，存 server/data/friends.json）。真要在这里兜底，形状必须是 {\"friends\": [ {..}, .. ]}：root 第一个成员就是好友数组。",
+  "//friends3": "⚠⚠ 绝不能回空 body / 非 JSON：cmd 0x50 分支 (0x5182a8) 没有 `cbz x21`，NULL 会进解析器；也不能回 `{}` —— 0x51cf18 `ldr x8,[x1,#0x10]` 取 root 第一个成员，`{}` ⇒ x8=NULL ⇒ 0x51cf1c `ldr x28,[x8,#0x10]` 直接读地址 0x10 ⇒ SIGSEGV。**但 `{\"friends\":[]}`（空数组）是安全的**：x8 非空、x28=NULL，会被 0x51cf20 `cbz x28` 拦到 0x51d050 走「好友数 0」的正常回调（2026-10-07 复核 0x51cee8–0x51d060）。另外三个值必须是字符串（不检查类型标签 +0x30，pid 直接进 strlen），且 `pid` 必须排在 `nameOnPlatform` **之前**（否则 strcmp(buf,\"0\")==0 整条被静默跳过）。pid ≥ 43 字节会让 addFriend 的 strcpy 堆溢出。",
   "//friends4": "好友同步 POST /public/friends/v1/update 由 tf_server.py 的 h_friends_update 原样回显 uplay —— 回 {} / {\"data\":[]} 等于回 {\"uplay\":[]}，客户端会把本地好友**删光**。",
-  "GET /v2/profiles/me/friends": {
-    "status": 200,
-    "headers": { "Content-Type": "application/json" },
-    "body": {
-      "friends": [
-        {
-          "pid": "44444444-4444-4444-4444-444444444444",
-          "userId": "44444444-4444-4444-4444-444444444444",
-          "idOnPlatform": "44444444-4444-4444-4444-444444444444",
-          "nameOnPlatform": "GhostRider",
-          "platformType": "ubimobile",
-          "state": "Friend"
-        },
-        {
-          "pid": "55555555-5555-5555-5555-555555555555",
-          "userId": "55555555-5555-5555-5555-555555555555",
-          "idOnPlatform": "55555555-5555-5555-5555-555555555555",
-          "nameOnPlatform": "TangoPro",
-          "platformType": "ubimobile",
-          "state": "Friend"
-        }
-      ]
-    }
-  },
 
   "//policies": "libubiservices 的 /v3/policies/<COUNTRY>，返回策略列表。",
   "GET /v3/policies/": {

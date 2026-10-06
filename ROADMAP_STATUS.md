@@ -336,14 +336,29 @@ am_proc_died: [0,<pid>,com.ubisoft.redlynx.trialsfrontier.ggp,0,2]
     **未匹配就清零该条目标志位**（`0x51d864 str wzr,[x9,#0xac]`），收尾 `0x51da30 tbnz #3`
     判定失败 ⇒ **好友被删**。所以原来落 `*` 兜底的 `{"data": []}` 等于回 `{"uplay":[]}`，
     会把好友列表清空。
-  - `GET /v2/profiles/me/friends` 由 `rules.json:98` 的桩提供（`GhostRider` / `TangoPro`）。
-    这个桩的**形状是对的**，但有三个隐含硬约束（已写进 `rules.json` 的 `//friends2~4` 注释）：
+  - `GET /v2/profiles/me/friends` **已从死桩改成动态**（2026-10-07）：`h_friends_list` 按登录者查
+    `server/data/friends.json`，名字走 `name_for_profile()`（真人名字要排在兜底池前面）。
+    以前 `rules.json:98` 那个桩固定回 `GhostRider` / `TangoPro` 两个假好友，纯摆设、跟账号无关。
+    形状的硬约束（已写进 `rules.json` 的 `//friends2~4` 注释）：
     ① cmd 0x50 分支 `0x5182a8` **没有 `cbz x21`**，空 body / 非法 JSON 会让 NULL 进解析器，
     `0x51cf18 ldr x8,[x1,#0x10]` 直接读地址 `0x10` ⇒ **SIGSEGV**；`{}` 同样崩
-    （`0x51cf1c` 读 NULL+0x10，`cbz x28`@0x51cf20 只保护 x28）。
+    （`0x51cf1c` 读 NULL+0x10，`cbz x28`@0x51cf20 只保护 x28）。**但 `{"friends":[]}` 是安全的**：
+    那条 `0x51cf20 cbz x28` 会跳到 `0x51d050 mov w19, wzr` 走「好友数 0」的正常回调
+    ⇒ 新实现里「没有好友」就回它（2026-10-07 复核 `0x51cee8–0x51d060`）。
     ② 不检查 JSON 类型标签 `+0x30`，`pid`/`nameOnPlatform`/`state` 必须是**字符串**，否则进 `strlen` 崩。
     ③ **`pid` 必须排在 `nameOnPlatform` 之前**，否则 `strcmp(buf,"0")==0` 整条被静默跳过。
     另：`pid` ≥ 43 字节会让 `addFriend` 的 `strcpy(x20+0x81,key)` 堆溢出。
+  - **昵称与好友的维护入口**（2026-10-07 落地，用户 m09885 拍板「两个都做」）：
+    `GET|POST /__api/admin/social` + `/__admin` 的「账号」页社交卡片（谁的好友、加/删、改名）。
+    - ★ 游戏内**做不到**加好友：唯一接口 `tr::OnlineFriends::addFriend @0x51bed4` 的调用者
+      只有 UPlay 覆盖层那条线（`getPendingFriendRequestNum @0x51bda8` 的调用者是
+      `MenuzComponentMenuHeaderButton::update @0x67f004`，靠 UPlay 推送），私服接不到。
+      真机 16942 条请求日志里**没有任何**加好友 / 改名写请求。
+    - 关系**双向**维护（A 加 B ⇒ B 的列表里也有 A）：客户端只信自己那份列表，
+      单向会造出「我这边有你、你那边没我」的鬼影。存在 `server/data/friends.json`。
+    - 昵称 3–24 字符、大小写不敏感去重（下限照抄客户端文案「昵称至少需要包含3个字符。」，
+      LOCF `78d4b7de`）；账号表与静默设备槽（`Player-XXXXXX`）都能改，落在
+      `accounts.json` / `devices.json` 的 `nameOnPlatform`。
   - ⚠ 部署要点：`/v2/profiles/me/friends` 与 `/v1/profiles` 的 base 是**硬编码字面量**
     `https://public-ubiservices.ubi.com` @`0xb85565`，**不走** `[OnlineCore+0x28]`，
     只能靠 DNS/hosts 劫持接管；只有 `friends/v1/update` 走可变的私服地址。两者不是同一 host。
@@ -568,8 +583,10 @@ F/libc: Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0xb0
 `around=`（全球页，服务端本来就不过滤）能拿到全部行。
 
 **仍未闭环**：`66666666-…`(IronGear) 只拿到 1 条赛道（要第 3 条内置幽灵的赛道才有），
-且它**不在 `rules.json` 的好友桩里**，所以只在「全球 / around」页可见。
-若要让它是常驻对手，把 `server/rules.json:100` 的 `friends` 数组补一条即可。
+且它**不在好友表里**，所以只在「全球 / around」页可见。
+若要让它是常驻对手，在 `/__admin` 的「账号」页把他的 pid 加进某个玩家的好友
+（写进 `server/data/friends.json`；`rules.json` 里那条写死 `GhostRider`/`TangoPro` 的桩
+2026-10-07 已删除）。
 
 ### 3.4 「比赛幽灵」按钮永远是灰的（2026-10-05 修复）—— `replay_id` 响应缺键
 > 用户反馈（原话）：「我想挑战这个幽灵，但是呢，比赛幽灵按钮是灰色的」
@@ -729,7 +746,8 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
     每个键回 `{key, before, after, audit}`。
   - `POST /__api/admin/undo {id}` 按审计条目回滚**单个键**；`/__api/admin/templates`
     支持 `save / apply / copy / rename / delete`（`apply` 的 `parts` 可选 `all` / `rewards`）。
-    三个端点都登记进 `/__help`，并且**默认都在门禁里**（门禁是 `startswith("/__")` 减白名单）。
+    `GET|POST /__api/admin/social`（昵称 / 好友，见 §2 的好友链）也是同样的 `{action:…}` 契约。
+    四个端点都登记进 `/__help`，并且**默认都在门禁里**（门禁是 `startswith("/__")` 减白名单）。
   - **审计与撤销**：`cfg_set()` 记 `existed`/`before`，新增 `cfg_unset()`（删键，让代码默认值重新生效），
     `_audit_append()` 追加到 `server/data/config_audit.jsonl`（`AUDIT_KEEP = 300`，写失败只打日志）。
     模板的存/改名/复制/删除**不进审计**（只有套用会改配置，那时按键各记一条）。
