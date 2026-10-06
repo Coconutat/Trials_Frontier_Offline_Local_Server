@@ -693,7 +693,7 @@ catalog in this build**, so those IDs are inferred from the formula only and are
 > 再要 `BikeUpgrade::getBikeStatus(id) == 0`，才 `mask |= 1 << index`，最后
 > `sprintf(..., ",\"bikes\":%d", mask)`。而 `UpgradeManager::getBikeIDbyIndex @0x62c4d8`
 > **只有 `add w0, w1, #1; ret` 两条指令**（静态符号 size = 8）⇒ **bit i = 车号 i+1**。
-> 真机（`<DEVICE_SERIAL>`）抓到的 `bikes = 521227 = 0x7F40B` ⇒ 车号 {1,2,4,11,13,14,15,16,17,18,19}，
+> 真机（`<设备序列号>`）抓到的 `bikes = 521227 = 0x7F40B` ⇒ 车号 {1,2,4,11,13,14,15,16,17,18,19}，
 > 与用户存档吻合（`BikeUpgrade::getBikeStatus @0x61c310`：车不在库里 → `-2`，升级状态不匹配 → `-1`）。
 >
 > **单车名在 LOCF 里不存在**：`/gen/lang/{english,simp_chinese}_strings.bin` 两份各 7705 条里

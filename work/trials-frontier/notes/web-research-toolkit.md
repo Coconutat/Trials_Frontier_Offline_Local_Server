@@ -7,7 +7,7 @@
 > **死胡同已记录在下面「Blocked / useless」一节** —— 尤其：Reddit 主站全线 403（只能走 redlib 镜像，且十个切题帖仍读不到，ID 见 `online-rules-evidence.md` §5）；Wayback **回放**被 IP 封（429 bot flag）但 **CDX API 可用**，赛季/事件目录就是靠它拿到的；`trialsfrontier.fandom.com` 根本不存在。
 
 Session: danger-full-access file policy, approval prompts DISABLED (never request sandbox escalation).
-OS: Windows, PowerShell (`pwsh` tool). Working dir: F:\Code\Trials_Frontier_Offiline_Hack
+OS: Windows, PowerShell (`pwsh` tool). Working dir: <repo>
 
 ## Network reality (verified 2026-10)
 - The built-in `web_search` tool FAILS (DeepSeek HTTP 402 Insufficient Balance).

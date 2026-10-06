@@ -73,4 +73,7 @@ server/data/ghosts/store/
 server/data/ghosts/index.json
 server/data/ghosts/replays.json
 server/data/ghosts/inbox/
-
+# 线上运行参数：tf_config.json 是手调过的线上值，永不上传；
+# wts_rewards.json 是游戏奖励表（WebUI 要读），单独放行、必须入库。
+server/data/*.json
+!server/data/wts_rewards.json
