@@ -193,6 +193,39 @@ const SCREENS = [
              .find(b => b.innerText.includes('摩托蓝图')).click()`,
     mustAfter5: ['需要 20 片', 'Berserker Blueprint Piece', '已拥有', '只能金币买'],
   },
+  {
+    // 午夜杯运营屏：六张卡（现状 / 时间 / 挑战规则 / 赛道与对手 / 奖励 / 模板）。
+    // ★ 这一屏的按钮会**真写线上 tf_config.json**，所以这里只碰草稿（切周、改输入框），
+    //   一个保存按钮都不点 —— 冒烟测试不该改生产参数。
+    hash: '#/weekly', title: '午夜杯',
+    must: ['现状', '本周赛道', '本届窗口', '周号', '时间', '窗口长度（天）',
+           '上一周', '本周', '下一周', '立刻结束本届', '保存改动',
+           '挑战规则', '赛道与对手', '榜单 id',
+           '奖励', '每档奖励个数', '白金', '未指定 → 走内置规则', '退出午夜杯再进',
+           '模板', '当前生效值', '存为模板'],
+    // 切片：点「下一周」只改草稿里的 week_offset，窗口预览立刻跟着挪。
+    act: `[...document.querySelectorAll('#pane .seg button')]
+            .find(b => b.innerText.trim() === '下一周').click()`,
+    mustAfter: ['这一届的窗口：'],
+    // 把窗口长度改成 10 天：界面上要立刻挂出「实验性」徽章（只有 7 天在真机验过）。
+    act2: `(() => {
+            const row = [...document.querySelectorAll('#pane .frow')]
+              .find(r => r.innerText.includes('窗口长度（天）'));
+            const inp = row.querySelector('input[type=number]');
+            inp.value = '10';
+            inp.dispatchEvent(new Event('input'));
+          })()`,
+    mustAfter2: ['实验性'],
+    // 奖励卡：点第 3 号池子方块，木档的「未指定」文案要跟着消失（它那档已有选中）。
+    act3: `(() => {
+            const row = [...document.querySelectorAll('#pane .tierrow')]
+              .find(r => r.innerText.includes('木'));
+            row.querySelectorAll('.chip')[2].click();
+          })()`,
+    mustAfter3: ['奖励'],
+    // 截图文件名后缀：共享 steps 里的后缀是给「下发物品」屏写的，这一屏要自己的。
+    suffixes: ['-翻周', '-窗口', '-奖励'],
+  },
 ];
 
 await send('Page.navigate', { url: BASE + '/__admin' });
@@ -237,7 +270,8 @@ for (const s of SCREENS) {
     for (const m of st.must || []) {
       if (!after.includes(m)) die(`${s.title}屏第 ${i + 1} 步之后缺少「${m}」：\n` + after.slice(0, 900));
     }
-    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + st.suffix);
+    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') +
+                ((s.suffixes && s.suffixes[i]) || st.suffix));
   }
   ok(`${s.title}屏：${cards} 张卡 / ${rows} 行表格数据`);
 }

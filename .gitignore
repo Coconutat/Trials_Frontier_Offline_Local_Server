@@ -54,6 +54,10 @@ server/data/leaderboards.json
 server/data/admin.json
 # 筹码余额与局内票（运行期状态，重启要留住但绝不入库）
 server/data/pvp_state.json
+# 运营参数审计日志（WebUI 每改一个键追加一条，保留最近 300 条）与参数模板
+# （整页参数快照，可存可复用）—— 都是运行期数据，不入库
+server/data/config_audit.jsonl
+server/data/templates.json
 # 玩家等级（客户端在 targeting 上报里自己报的 xp；只用来填「云端进度摘要」
 # 的 player_level。不落盘的话服务器一重启，云端摘要就显示等级 1）
 server/data/player_levels.json

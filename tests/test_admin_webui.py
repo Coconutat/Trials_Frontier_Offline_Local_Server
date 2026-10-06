@@ -244,6 +244,9 @@ class AdminGate(Base):
              ("POST", "/__api/admin/revert"), ("GET", "/__api/admin/pvp"),
              ("GET", "/__api/admin/info"),
              ("POST", "/__api/admin/pvp"),
+             ("GET", "/__api/admin/weekly"), ("POST", "/__api/admin/weekly"),
+             ("POST", "/__api/admin/undo"),
+             ("GET", "/__api/admin/templates"), ("POST", "/__api/admin/templates"),
              ("POST", "/__api/admin/sessions/clear"),
              ("POST", "/__api/admin/password")]
     PUBLIC = [("GET", "/__ping"), ("GET", "/__ui"), ("GET", "/__register"),
@@ -788,6 +791,7 @@ class Endpoints(Base):
         for ep in ("/__api/admin/login", "/__api/admin/grant", "/__api/admin/pvp",
                    "/__api/admin/rollback", "/__api/admin/info",
                    "/__api/admin/revert", "/__api/admin/password",
+                   "/__api/admin/weekly", "/__api/admin/undo", "/__api/admin/templates",
                    "/__api/admin/sessions/clear"):
             self.assertIn(ep, blob, "%s 没登记进 /__help" % ep)
         self.assertIn("[public]", blob)     # 门禁边界要能自解释
@@ -1152,6 +1156,253 @@ class Blueprints(Base):
         self.assertIn(404, allowed, "Berserker 碎片（只在 giftbox 的紧凑形式里出现）漏了")
 
 
+# ---------------------------------------------------------------- 运营参数
+class WeeklyOps(Base):
+    """`/__api/admin/weekly` · `/__api/admin/undo` · `/__api/admin/templates`。
+
+    ★ 这三个端点**真的会改 tf_config.json / templates.json / config_audit.jsonl**。
+      所以每个用例都把这三条路径指到临时目录 —— 顺带证明它们是可注入的，
+      谁也不许把线上一份参数改了。
+    """
+
+    def setUp(self):
+        super().setUp()
+        d = Path(self.tmp.name)
+        for name, rel in (("CONFIG_PATH", "tf_config.json"),
+                          ("AUDIT_PATH", "config_audit.jsonl"),
+                          ("TEMPLATES_PATH", "templates.json")):
+            p = patch.object(srv, name, str(d / rel))
+            p.start()
+            self.addCleanup(p.stop)
+        srv._CONFIG_CACHE["mtime"] = None
+        srv._CONFIG_CACHE["data"] = None
+        srv._TRACK_CACHE["mtime"] = None
+        srv._TRACK_CACHE["rows"] = []
+        self.token = self.login()
+
+    # ---------------------------------------------------------------- 工具
+    def get(self, path="/__api/admin/weekly", query=""):
+        handled, r = request(path, token=self.token, query=query)
+        self.assertTrue(handled, path)
+        self.assertEqual(r.status, 200, r.text)
+        return r.json()
+
+    def post(self, path, body):
+        handled, r = request(path, token=self.token, method="POST", body=body)
+        self.assertTrue(handled, path)
+        return r
+
+    def set_fields(self, fields, expect=200):
+        r = self.post("/__api/admin/weekly", {"fields": fields})
+        self.assertEqual(r.status, expect, r.text)
+        return r
+
+    def config_file(self):
+        """磁盘上的 tf_config.json 原文 —— 端点必须真写盘，不是只改内存。"""
+        try:
+            with open(srv.CONFIG_PATH, "r", encoding="utf-8") as fp:
+                return json.load(fp)
+        except OSError:
+            return {}
+
+    def write_config(self, node):
+        """摆一份"线上已有的配置"，用来测正常路径（键本来就在文件里）。"""
+        with open(srv.CONFIG_PATH, "w", encoding="utf-8") as fp:
+            json.dump(node, fp)
+        srv._CONFIG_CACHE["mtime"] = None
+        srv._CONFIG_CACHE["data"] = None
+        return node
+
+    # ---------------------------------------------------------------- 读
+    def test_get_hands_out_everything_the_screen_needs(self):
+        j = self.get()
+        for key in ("config", "status", "tracks", "templates", "audit"):
+            self.assertIn(key, j)
+        self.assertEqual(j["config"]["window_days"], 7)
+        self.assertEqual(j["config"]["left_retry_times"], 3)
+        self.assertEqual(j["config"]["reward_ids"], {})
+        self.assertFalse(j["status"]["experimental"], "默认 7 天不该标实验性")
+        self.assertEqual(j["status"]["week_end"] - j["status"]["week_start"], 7 * 86400)
+        self.assertEqual(j["status"]["retry_limit"], 3)
+
+    def test_status_alone_writes_nothing(self):
+        """现状卡只是看一眼，不该在配置或审计里留下东西。"""
+        self.get()
+        self.assertEqual(self.config_file(), {})
+        self.assertEqual(srv.audit_log(20), [])
+
+    # ---------------------------------------------------------------- 写
+    def test_post_one_key_writes_file_and_records_audit(self):
+        self.write_config({"weekly": {"left_retry_times": 3}})
+        j = self.set_fields({"left_retry_times": 5}).json()
+        first = j["applied"][0]
+        self.assertEqual(first["key"], "left_retry_times")
+        self.assertEqual((first["before"], first["after"]), (3, 5))
+        self.assertTrue(first["audit"], "没给「撤销」留审计编号")
+        self.assertEqual(j["config"]["left_retry_times"], 5)
+        self.assertEqual(self.config_file()["weekly"]["left_retry_times"], 5)
+        rec = j["audit"][0]
+        self.assertEqual((rec["kind"], rec["path"], rec["before"], rec["after"]),
+                         ("weekly", ["weekly", "left_retry_times"], 3, 5))
+
+    def test_audit_says_when_the_key_was_not_in_the_file(self):
+        """文件里本来没这个键 ⇒ 记录要如实说"新增"，撤销就是删掉它（回代码默认值）。"""
+        self.set_fields({"left_retry_times": 5})
+        rec = self.get()["audit"][0]
+        self.assertFalse(rec["existed"])
+        self.assertIsNone(rec["before"])
+
+    def test_post_is_all_or_nothing(self):
+        """一半字段合法、一半非法 ⇒ 一个都不改（改一半最难解释）。"""
+        r = self.set_fields({"left_retry_times": 7, "track_id": 99999999}, expect=400)
+        self.assertEqual(r.json()["error"], "range:track_id:1-1000000")
+        self.assertEqual(self.config_file(), {}, "非法请求居然写盘了")
+        self.assertEqual(srv.weekly_values()["left_retry_times"], 3)
+
+    def test_post_rejects_junk_and_translates_the_message(self):
+        cases = [({"nope": 1}, "unknown-key:nope"),
+                 ({"track_id": "abc"}, "bad-value:track_id"),
+                 ({"reward_slots": 9}, "range:reward_slots:1-8"),
+                 ({"window_days": 0}, "range:window_days:1-30"),
+                 ({"reward_ids": {"iron": [1]}}, "bad-tier:iron"),
+                 ({"reward_ids": {"gold": [99]}}, "bad-pool:gold")]
+        for fields, code in cases:
+            r = self.set_fields(fields, expect=400)
+            self.assertEqual(r.json()["error"], code, fields)
+            msg = r.json()["message"]
+            self.assertTrue(msg, "错误没翻成中文：" + code)
+            self.assertNotIn(":", msg, "界面不该看到错误码：" + msg)
+        self.assertEqual(self.config_file(), {})
+
+    def test_null_removes_the_key_and_the_default_comes_back(self):
+        self.set_fields({"window_days": 14})
+        self.assertEqual(self.get()["status"]["window_days"], 14)
+        self.assertTrue(self.get()["status"]["experimental"], "非 7 天要标实验性")
+        self.set_fields({"window_days": None})
+        self.assertNotIn("window_days", self.config_file().get("weekly", {}))
+        self.assertEqual(self.get()["config"]["window_days"], 7)
+        self.assertFalse(self.get()["status"]["experimental"])
+
+    def test_reward_pools_keep_only_named_tiers(self):
+        r = self.set_fields({"reward_ids": {"platinum": [3, 8], "wood": []}})
+        self.assertEqual(r.json()["config"]["reward_ids"], {"platinum": [3, 8]})
+        # 空列表 = 这一档没指定 ⇒ 走内置规则，配置里不该留一个空数组
+        self.assertNotIn("wood", self.config_file()["weekly"]["reward_ids"])
+
+    # ---------------------------------------------------------------- 撤销
+    def test_undo_restores_the_previous_value(self):
+        self.set_fields({"cooldown_seconds": 60})          # 先让它变成"已存在的键"
+        aid = self.set_fields({"cooldown_seconds": 120}).json()["applied"][0]["audit"]
+        r = self.post("/__api/admin/undo", {"id": aid})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(r.json()["restored"], 60)
+        self.assertEqual(srv.weekly_values()["cooldown_seconds"], 60)
+        # 对**同一条**记录再撤一次是幂等的（撤的是同一个 before）
+        self.post("/__api/admin/undo", {"id": aid})
+        self.assertEqual(srv.weekly_values()["cooldown_seconds"], 60)
+
+    def test_undo_of_a_new_key_deletes_it(self):
+        """记录里说"这个键本来是新增的" ⇒ 撤销要删掉它，让代码默认值重新生效。"""
+        aid = self.set_fields({"fake_field": 30}).json()["applied"][0]["audit"]
+        r = self.post("/__api/admin/undo", {"id": aid})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertIsNone(r.json()["restored"])
+        self.assertNotIn("fake_field", self.config_file().get("weekly", {}))
+        self.assertEqual(srv.weekly_values()["fake_field"], 0)
+
+    def test_undo_rejects_bad_ids(self):
+        r = self.post("/__api/admin/undo", {"id": "0-nope"})
+        self.assertEqual(r.status, 400)
+        self.assertEqual(r.json()["error"], "not-found")
+        r = self.post("/__api/admin/undo", {})
+        self.assertEqual(r.status, 400)
+        self.assertEqual(r.json()["error"], "bad-id")
+
+    # ---------------------------------------------------------------- 模板
+    def test_templates_round_trip(self):
+        self.set_fields({"left_retry_times": 5, "reward_ids": {"gold": [7]}})
+        r = self.post("/__api/admin/templates",
+                      {"page": "weekly", "action": "save", "name": "高难周"})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(r.json()["templates"][0]["name"], "高难周")
+        self.assertNotIn("values", r.json()["templates"][0], "列表不该带整份快照")
+
+        # 复制：界面拿不到源模板的 values，所以只能由服务端读源份来存
+        r = self.post("/__api/admin/templates",
+                      {"page": "weekly", "action": "copy", "name": "高难周",
+                       "new_name": "高难周 副本"})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(r.json()["values"]["left_retry_times"], 5)
+        listed = self.get("/__api/admin/templates", "page=weekly")
+        self.assertEqual(set(t["name"] for t in listed["templates"]["weekly"]),
+                         {"高难周", "高难周 副本"})
+        self.assertEqual(listed["current"]["weekly"]["left_retry_times"], 5)
+
+        # 改回默认再整页套用 ⇒ 快照把两个键都写回来，并且每个键都能单独撤销
+        self.set_fields({"left_retry_times": 3, "reward_ids": None})
+        r = self.post("/__api/admin/templates",
+                      {"page": "weekly", "action": "apply", "name": "高难周", "parts": "all"})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(srv.weekly_values()["left_retry_times"], 5)
+        self.assertEqual(srv.weekly_values()["reward_ids"], {"gold": [7]})
+        self.assertEqual({rec["kind"] for rec in self.get()["audit"]}, {"weekly"},
+                         "套用必须走同一条审计路径")
+
+        # 只套奖励：参数键稳住不动
+        self.set_fields({"left_retry_times": 4})
+        self.post("/__api/admin/templates",
+                  {"page": "weekly", "action": "apply", "name": "高难周", "parts": "rewards"})
+        vals = srv.weekly_values()
+        self.assertEqual(vals["left_retry_times"], 4)
+        self.assertEqual(vals["reward_ids"], {"gold": [7]})
+
+    def test_template_rename_and_delete(self):
+        self.post("/__api/admin/templates", {"page": "weekly", "action": "save", "name": "a"})
+        r = self.post("/__api/admin/templates",
+                      {"page": "weekly", "action": "rename", "name": "a", "new_name": "b"})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual([t["name"] for t in r.json()["templates"]], ["b"])
+        r = self.post("/__api/admin/templates",
+                      {"page": "weekly", "action": "delete", "name": "b"})
+        self.assertEqual(r.status, 200, r.text)
+        self.assertEqual(r.json()["templates"], [])
+
+    def test_template_errors(self):
+        cases = [({"page": "nope", "action": "save", "name": "x"}, "bad-page"),
+                 ({"page": "weekly", "action": "nope", "name": "x"}, "bad-action"),
+                 ({"page": "weekly", "action": "save", "name": "  "}, "bad-name"),
+                 ({"page": "weekly", "action": "apply", "name": "missing"}, "not-found"),
+                 ({"page": "weekly", "action": "copy", "name": "missing",
+                   "new_name": "y"}, "not-found")]
+        for body, code in cases:
+            r = self.post("/__api/admin/templates", body)
+            self.assertEqual(r.status, 400, body)
+            self.assertEqual(r.json()["error"], code, body)
+            self.assertTrue(r.json()["message"], code)
+        # 存两次同名是覆盖；复制到已存在的名字才算冲突
+        self.post("/__api/admin/templates", {"page": "weekly", "action": "save", "name": "dup"})
+        r = self.post("/__api/admin/templates",
+                      {"page": "weekly", "action": "copy", "name": "dup", "new_name": "dup"})
+        self.assertEqual(r.json()["error"], "exists")
+
+    # ---------------------------------------------------------------- 赛道目录
+    def test_track_catalog_reads_the_levels_section(self):
+        """赛道下拉：有 levels 段就给名字；没有就空表（界面退化成手填，绝不猜名字）。"""
+        self.assertEqual(srv.track_catalog(), [])
+        p = patch.object(srv, "_TRACK_CATALOG_PATH", str(Path(self.tmp.name) / "items.json"))
+        p.start()
+        self.addCleanup(p.stop)
+        with open(srv._TRACK_CATALOG_PATH, "w", encoding="utf-8") as fp:
+            json.dump({"levels": {"1042": {"en": "Docks", "cn": "码头"},
+                                  "1041": {"cn": "训练场"}}}, fp)
+        srv._TRACK_CACHE["mtime"] = None
+        srv._TRACK_CACHE["rows"] = []
+        self.assertEqual(srv.track_catalog(),
+                         [{"id": 1041, "name": "训练场", "name_cn": "训练场"},
+                          {"id": 1042, "name": "Docks", "name_cn": "码头"}])
+        self.assertEqual(self.get()["tracks"], srv.track_catalog())
+
+
 # ---------------------------------------------------------------- 文案
 class I18n(Base):
     @classmethod
@@ -1198,7 +1449,14 @@ class I18n(Base):
         for k in ("grant.pvpGolden", "grant.pvpChips",
                   "grant.list.search", "grant.list.selected", "grant.list.unlock",
                   "grant.list.unverified", "grant.list.empty", "grant.modeHint",
-                  "saves.coins", "saves.gems"):
+                  "saves.coins", "saves.gems",
+                  # 午夜杯运营屏：表单标签 / 档位名 / 冷却预设都放在表里、t() 收变量
+                  "weekly.f.track", "weekly.f.board", "weekly.f.fake", "weekly.f.base",
+                  "weekly.f.fast", "weekly.f.slow", "weekly.f.retry", "weekly.f.cool",
+                  "weekly.f.offset", "weekly.f.slots", "weekly.f.days", "weekly.f.rewardIds",
+                  "weekly.tier.platinum", "weekly.tier.gold", "weekly.tier.silver",
+                  "weekly.tier.bronze", "weekly.tier.wood",
+                  "weekly.rules.p1", "weekly.rules.p10", "weekly.rules.p1h", "weekly.rules.p6h"):
             self.assertIn(k, self.blob["cn"], k)
             self.assertIn(k, self.blob["en"], k)
 

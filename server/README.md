@@ -403,6 +403,17 @@ python -m unittest discover -s tests -v
   另外 7 辆（Armadillo / Jackal / Mantis / Marauder / Riptide / Phantom / Moonrover）在任何
   配置里都没有编号、只能金币买，界面会说明、不造条目。374/379/439 的官方名被 RedLynx 写成了
   Tango 的 Redlynx 涂装名，目录里换成规范名并把旧名留在 `alias`（仍然可按旧名搜到）。
+* **午夜杯运营屏**（侧栏独立入口「午夜杯」）：把 `weekly.*` 的键分成 6 张卡（现状 / 时间 /
+  挑战规则 / 赛道与对手 / 奖励 / 模板），每张卡一个「保存改动」，**只发改过的键**。
+  两个新东西：①`weekly.window_days`（1..30，默认 7）—— `_week_span()` 用它替换了所有
+  `_WEEK_SECONDS` 算术（周号反推 / `weeK_end` / `midnight_circuit_end_time` / `week_end`），
+  不等于 7 天时管理端点回 `experimental: true`、界面标「实验性」；②参数**模板** = 整页快照
+  （存 `data/templates.json`，支持「套用整页 / 只套用奖励方案 / 重命名 / 复制 / 删除」）。
+  每次参数改动记一条审计（`data/config_audit.jsonl`，保留 300 条），界面上逐条能**一键撤销**
+  （`cfg_unset()` 负责把键删回代码默认值，`cfg_set()` 记 `existed`/`before`）。
+  ★ 奖励卡**只暴露池子编号 1..15**：每池装什么在客户端的 `/conf/wts_rewards.txt` 里
+  （`getRewardItemForSlot`），所以界面不预览内容；客户端**只在进入午夜杯时读一次**奖励配置，
+  卡片上写明「改完让玩家退出午夜杯再进」（不用重启游戏）。
 
 ### 7.2 端点
 
@@ -421,6 +432,9 @@ python -m unittest discover -s tests -v
 | `POST /__api/admin/grant` | 存档下发（可下发项 = `admin/items.json` 的 478 条，服装按套勾，蓝图按车勾、可填片数；`paints` 字段 = 涂装 id 数组，写 `items2[664+BikeID]` 的位掩码；每次先埋快照） |
 | `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
 | `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
+| `GET\|POST /__api/admin/weekly` | 午夜杯运营参数（GET = 配置 + 现状 + 赛道目录 + 模板 + 最近改动；POST `{fields:{…}}` **逐键校验、全部合法才落盘**，每个键回 `{key,before,after,audit}`） |
+| `POST /__api/admin/undo` | 撤销一条参数改动（`{id}` 来自 weekly 的 `audit`；按记录里的 `existed` 决定写回还是删键） |
+| `GET\|POST /__api/admin/templates` | 参数模板（GET `?page=weekly`；POST `{page,action:save\|apply\|copy\|rename\|delete,name,new_name,parts}`，`parts` 可 `all` / `rewards`） |
 
 ### 7.3 下发的两条通道（别搞混）
 
