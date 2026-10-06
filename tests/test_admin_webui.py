@@ -854,7 +854,7 @@ class ItemCatalog(Base):
 
     def test_shape_and_count_agree(self):
         c = self.cat
-        self.assertEqual(sorted(c), ["categories", "items", "levels", "outfits", "paints",
+        self.assertEqual(sorted(c), ["bikes", "categories", "items", "levels", "outfits", "paints",
                                      "rewards", "source"])
         self.assertEqual(c["source"]["items"], len(c["items"]),
                          "source.items 与实际条数不一致（重新跑 tools/build_item_catalog.py）")
@@ -864,6 +864,8 @@ class ItemCatalog(Base):
                          "source.paints 与实际款数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertEqual(c["source"]["levels"], len(c["levels"]),
                          "source.levels 与实际赛道数不一致（重新跑 tools/build_item_catalog.py）")
+        self.assertEqual(c["source"]["bikes"], len(c["bikes"]),
+                         "source.bikes 与实际车数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertEqual(c["source"]["rewards"], len(c["rewards"]),
                          "source.rewards 与实际奖励 ID 数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertTrue(c["source"]["en"] and c["source"]["cn"], "没记本地化表来源")
@@ -1183,6 +1185,8 @@ class _ParamOps(Base):
         srv._CONFIG_CACHE["data"] = None
         srv._TRACK_CACHE["mtime"] = None
         srv._TRACK_CACHE["rows"] = []
+        srv._BIKE_CACHE["mtime"] = None
+        srv._BIKE_CACHE["rows"] = {}
         self.token = self.login()
 
     # ---------------------------------------------------------------- 工具
@@ -1240,7 +1244,14 @@ class WeeklyOps(_ParamOps):
         此时服务端只能给出 `replay_id=0`，客户端反复去要 `ghost/0/payload`（404），界面看起来
         就是转圈/回到加入屏。现状卡必须先把「这条赛道几个幽灵 / 榜上几行真数据」摆出来，并在
         为 0 时明确警告，而不是让人自己猜。
+
+        ★ 幽灵库和榜单都指到空的再断言：真机上玩家随时可能上传幽灵（2026-10-06 18:08
+          就有一次真实上传），拿线上数据当「一定没有」的用例会随玩家行为翻车。
         """
+        for name, val in (("_opponent_entries", lambda: ({}, {})), ("_load_leaderboards", dict)):
+            p = patch.object(srv, name, val)
+            p.start()
+            self.addCleanup(p.stop)
         self.write_config({"weekly": {"track_id": 1258}})
         s = self.get()["status"]
         self.assertEqual(s["track_id"], 1258)
@@ -1411,6 +1422,58 @@ class WeeklyOps(_ParamOps):
                       {"page": "weekly", "action": "copy", "name": "dup", "new_name": "dup"})
         self.assertEqual(r.json()["error"], "exists")
 
+    # ---------------------------------------------------------------- 发车
+    def test_week_bike_and_loan_upgrade_are_readable(self):
+        """午夜杯：本届的车 + 租借升级，以及界面画下拉要的车表。"""
+        j = self.get()
+        self.assertEqual(j["config"]["bike_id"], 0, "默认 = 自动按赛道级别随机")
+        self.assertEqual(j["config"]["loan_upgrade"], 5)
+        s = j["status"]
+        self.assertTrue(s["bikes"], "车表要下发给界面（本届车下拉用）")
+        self.assertTrue(all({"id", "name"} <= set(b) for b in s["bikes"]))
+        self.assertIn(s["effective_bike"], {b["id"] for b in s["bikes"]})
+        self.assertIn("track_bike", s)
+
+    def test_effective_bike_can_run_the_track(self):
+        """★ 原版规则：车级别跟图级别挂钩（用户 m07949）。自动挑的车必须合法。
+
+        `LevelManager::isCorrectBikeTier @0x47c170`：车 Tier == 图的 `B`，或车 Tier 是 255。
+        """
+        self.write_config({"weekly": {"track_id": 1041}})       # 管道营：B = 0
+        s = self.get()["status"]
+        self.assertEqual(s["track_bike"], 0)
+        self.assertEqual(srv.bike_catalog()[s["effective_bike"]]["tier"], 0)
+        # 一届之内不许变车（同一周号两次读到的必须是同一台）
+        self.assertEqual(self.get()["status"]["effective_bike"], s["effective_bike"])
+
+    def test_configured_week_bike_is_used_as_is(self):
+        self.write_config({"weekly": {"bike_id": 7, "loan_upgrade": 3}})
+        s = self.get()["status"]
+        self.assertEqual(s["effective_bike"], 7)
+        self.assertEqual(self.get()["config"]["loan_upgrade"], 3)
+
+    def test_unknown_bike_id_is_rejected(self):
+        """★ 车号必须真存在：填 40 号客户端 `getBike(40)` 拿到空车 → 加载关卡时崩。"""
+        r = self.set_fields({"bike_id": 40}, expect=400)
+        self.assertEqual(r.json()["error"], "bad-bike:40")
+        self.assertIn("车号", r.json()["message"])
+        self.assertEqual(self.config_file(), {}, "非法车号居然写盘了")
+
+    def test_bike_id_zero_is_accepted(self):
+        j = self.set_fields({"bike_id": 0}).json()
+        self.assertEqual(j["applied"][0]["after"], 0)
+        self.assertEqual(j["config"]["bike_id"], 0)
+
+    def test_loan_upgrade_fills_all_four_parts(self):
+        """租借车 = 四个部件同一个等级、`force_upgrade = 0`（保底：玩家更高就用玩家的）。"""
+        real = srv.cfg
+        p = patch.object(srv, "cfg", lambda *a, **k: 5 if a[:2] == ("weekly", "loan_upgrade")
+                         else real(*a, **k))
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertEqual(srv._weekly_loan_upgrade(),
+                         {"handle": 5, "engine": 5, "wheel": 5, "frame": 5})
+
     # ---------------------------------------------------------------- 赛道目录
     def test_track_catalog_reads_the_levels_section(self):
         """赛道下拉：有 levels 段就给名字；没有就空表（界面退化成手填，绝不猜名字）。"""
@@ -1428,14 +1491,80 @@ class WeeklyOps(_ParamOps):
             return srv.track_catalog()
 
         self.assertEqual(catalog_with({"items": {}}), [])
-        self.assertEqual(catalog_with({"levels": {"1042": {"en": "Docks", "cn": "码头"},
+        # 每张图还要带上它要求的车辆级别（`levels[].bike` = 原表的 `B`）：界面用它解释发车。
+        self.assertEqual(catalog_with({"levels": {"1042": {"en": "Docks", "cn": "码头", "bike": 1},
                                                  "1041": {"cn": "训练场"}}}),
-                         [{"id": 1041, "name": "训练场", "name_cn": "训练场"},
-                          {"id": 1042, "name": "Docks", "name_cn": "码头"}])
+                         [{"id": 1041, "name": "训练场", "name_cn": "训练场", "bike": None},
+                          {"id": 1042, "name": "Docks", "name_cn": "码头", "bike": 1}])
         self.assertEqual(self.get()["tracks"], srv.track_catalog())
 
 
 # ---------------------------------------------------------------- 文案
+# ---------------------------------------------------------------- 按图级别发车
+class BikeAssignment(_ParamOps):
+    """碉堡按赛道级别随机发车（纯函数，不走网络）。
+
+    规则（用户 m07949 / m08106）：池子只放剧情默认车 1..9；**每条赛道按自己的级别各发一台**；
+    玩家在这个级别一台车都没有就换图；实在挑不出来才退回固定 `matchmaking.bike_id`
+    —— **绝不发 0**（真机 `getBike(0)` 是空指针，加载关卡会崩）。
+    """
+
+    def test_pool_follows_the_tier_rule(self):
+        self.assertEqual(srv._pvp_bike_pool(0), [1, 2, 3])
+        self.assertEqual(srv._pvp_bike_pool(1), [4, 5, 6])
+        self.assertEqual(srv._pvp_bike_pool(2), [7, 8, 9])
+        self.assertEqual(srv._pvp_bike_pool(255), [1, 2, 3, 4, 5, 6, 7, 8, 9], "255 = 不限")
+        self.assertEqual(srv._pvp_bike_pool(None), srv._pvp_bike_pool(255))
+
+    def test_story_only_and_owned_filter(self):
+        self.assertNotIn(13, srv._pvp_bike_pool(0), "非剧情车默认不进池子")
+        self.assertIn(13, srv._pvp_bike_pool(0, None, story_only=False))
+        self.assertEqual(srv._pvp_bike_pool(0, {1, 13}), [1])
+        self.assertEqual(srv._pvp_bike_pool(1, {1, 13}), [], "没有 1 级车就得换图")
+
+    def test_owned_bitmap_maps_bit_i_to_bike_i_plus_one(self):
+        """`pvp_init` 的位图语义：bit i = 车号 i+1（`getBikeIDbyIndex @0x62c4d8` = index+1）。"""
+        state = {"bikes": 1 | (1 << 3)}
+        p = patch.object(srv, "_pvp_chips_state", lambda pid="": state)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertEqual(srv._pvp_owned_bikes("x"), {1, 4})
+        state.clear()                      # 没上报过（老存档）⇒ 不知道，就不筛车
+        self.assertIsNone(srv._pvp_owned_bikes("x"))
+
+    def test_pick_is_stable_within_a_match_and_legal_per_track(self):
+        tracks = [1041, 1051, 1258]
+        got = srv._pvp_pick_bikes(tracks, None, seed="m1|p1")
+        self.assertEqual(got, srv._pvp_pick_bikes(tracks, None, seed="m1|p1"),
+                         "同一局重复算（每次轮询都会重算）必须同车")
+        self.assertEqual(sorted(got), tracks)
+        for tid, bike in got.items():
+            self.assertIn(bike, srv._pvp_bike_pool(srv._track_bike_tier(tid)), tid)
+
+    def test_no_pick_when_random_is_off(self):
+        real = srv.cfg
+        p = patch.object(srv, "cfg",
+                         lambda *a, **k: False if a[:2] == ("matchmaking", "bike_random")
+                         else real(*a, **k))
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertFalse(srv._pvp_bike_random())
+        self.assertEqual(srv._pvp_pick_bikes([1041], None, seed="s"), {},
+                         "关掉随机发车 ⇒ 全部走固定 bike_id")
+
+    def test_tracks_the_player_cannot_field_are_swapped_out(self):
+        cand = srv.cfg("matchmaking", "candidate_tracks", default=None)
+        if not isinstance(cand, list) or len(cand) < 6:
+            self.skipTest("候选池不可用")
+        blocked = [t for t in cand if not srv._pvp_bike_pool(srv._track_bike_tier(t), {1})]
+        self.assertTrue(blocked, "候选池里应该有只拥有 1 号车就跑不了的赛道（B=1 那几条）")
+        picked = srv._pvp_tracks({1})
+        self.assertTrue(picked)
+        for t in picked:
+            self.assertNotIn(t, blocked)
+            self.assertTrue(srv._pvp_bike_pool(srv._track_bike_tier(t), {1}))
+
+
 # ---------------------------------------------------------------- 碉堡（PVP 运营）
 class Bunker(_ParamOps):
     """`/__api/admin/bunker`，以及它复用的 `/__api/admin/undo` · `/__api/admin/templates`。
@@ -1522,6 +1651,28 @@ class Bunker(_ParamOps):
         for rid in (205, 257, 258, 259, 221):
             self.assertIn(rid, {r["id"] for r in cat})
             self.assertNotIn(rid, srv._PVP_SPECIAL_IDS)
+
+    def test_bike_fields_are_exposed_and_tier_is_reported(self):
+        """发车三件套：随机开关 / 只发剧情车 / 固定车辆；车表带级别（界面解释「为什么发这台」）。"""
+        keys = {f["key"] for f in self.bget()["fields"]}
+        self.assertIn("matchmaking.bike_random", keys)
+        self.assertIn("matchmaking.bike_story_only", keys)
+        self.assertIn("matchmaking.bike_id", keys)
+        bikes = self.bget()["bikes"]
+        self.assertEqual(len(bikes), 19, "车表 = /conf/bikes.txt 的 19 台")
+        self.assertTrue(all({"id", "name", "tier"} <= set(b) for b in bikes))
+        self.assertEqual([b["id"] for b in bikes if b["story"]], list(range(1, 10)),
+                         "剧情默认车 = 1..9")
+
+    def test_refuses_a_bike_id_the_client_does_not_know(self):
+        """★ 车号要真存在：填 40 号客户端 `getBike(40)` 拿到空车 → 加载关卡时崩。"""
+        r = self.bset({"matchmaking.bike_id": 40}, expect=400)
+        self.assertEqual(r.json()["error"], "bad-bike:40")
+        self.assertIn("车号", r.json()["message"])
+        self.assertEqual(self.config_file(), {}, "非法车号居然写盘了")
+        # 真车号照常放行（7 = 激流）
+        j = self.bset({"matchmaking.bike_id": 7}).json()
+        self.assertEqual(j["values"]["matchmaking.bike_id"], 7)
 
     def test_status_players_are_read_only(self):
         """现状卡里的玩家档案只是看一眼：不许写配置，也不许在审计里留东西。"""
@@ -1784,6 +1935,7 @@ class I18n(Base):
                   "weekly.f.track", "weekly.f.board", "weekly.f.fake", "weekly.f.base",
                   "weekly.f.fast", "weekly.f.slow", "weekly.f.retry", "weekly.f.cool",
                   "weekly.f.offset", "weekly.f.slots", "weekly.f.days", "weekly.f.rewardIds",
+                  "weekly.f.bike", "weekly.f.loan",
                   "weekly.tier.platinum", "weekly.tier.gold", "weekly.tier.silver",
                   "weekly.tier.bronze", "weekly.tier.wood",
                   "weekly.rules.p1", "weekly.rules.p10", "weekly.rules.p1h", "weekly.rules.p6h"):

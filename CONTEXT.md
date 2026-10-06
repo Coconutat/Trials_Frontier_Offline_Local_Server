@@ -149,6 +149,32 @@
   碉堡的一局长度（`matchmaking.match_duration_seconds`，同时当 `total_time` 与 `ranked_match_duration` 用）。
   只影响**新开的局**；与「单条赛道时限」不是一回事（后者在客户端原表）。
 
+- **车辆级别（tier）与图的车辆级别（`B`）**
+  每辆车在原表 `/conf/bikes.txt` 里有 `Tier`（0 / 1 / 2，**255 = 不限**）；每张图在
+  `/conf/levels.txt` 里有 `B` = 这张图要求的车辆级别（**255 = 不限**）。
+  客户端 `LevelManager::isCorrectBikeTier @0x47c170` 要求两者**相等**（图为 255 或车为 255 时放行）——
+  所以「1 级车跑一级图」。车的级别是**原表**，服务端只能读、不能改。
+
+- **剧情车（story bike）**
+  车号 1..9 那批（`Armadillo`…`Phantom`），也就是玩家沿剧情解锁的三档各三辆。
+  10/11/12/19（`Stallion`/`BMW`/`Moonrover`/`Donkey`）是 `Tier = 255` 的特殊车：
+  它们能跑任何图，但**随机发车时默认不出场**。
+
+- **发车方式（bike assignment）**
+  服务端决定一局里每条赛道发哪辆车，三档开关：
+  **按赛道级别随机**（`matchmaking.bike_random`，默认开，池子 = 玩家**已拥有**且级别匹配的车）、
+  **只放剧情车**（`matchmaking.bike_story_only`，默认开）、
+  **全场固定一辆**（关掉随机后所有赛道都发 `matchmaking.bike_id` —— ★ 这台车必须能跑每张候选图）。
+  「已拥有」来自客户端上报的车库位图（bit i = 车号 i+1），不是服务端猜的。
+  抽签结果在对局记录里固化（换局才重抽），所以同一局不会换车。
+
+- **租借升级（loan upgrade）与保底车**
+  午夜杯只有**一辆**本周车：玩家没有这辆车、或者自己的升级**不如**本周的车，就开那辆带固定升级的
+  **租借车**（不进玩家真实车库）；自己车更强的玩家照常用自己的升级。
+  客户端 `WeeklyChallengeManager::setBikeUpgradeLevel @0x636710` 在 `force_upgrade == 0` 时
+  对四个部件取 `max(玩家自己的升级, 配置值)` —— 服务端发 5/5/5/5 + `force_upgrade = 0` 即为此语义，
+  **不需要**单独的「租赁」标志位。`weekly.bike_id = 0` = 按本周赛道级别自动随机（整周同一辆）。
+
 - **礼包 / 商城商品（`season.product_list`）**
   赛季相关的一次性商品（`{product_id, amount}`）。`product_id` 是**商城商品 id**（如
   `chip_shop.goldentickets` = 金票），不是物品 id；原表里没有的 id 客户端**静默忽略**。

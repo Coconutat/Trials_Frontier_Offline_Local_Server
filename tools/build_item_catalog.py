@@ -199,6 +199,12 @@ def load_levels(packout, en, cn):
     后台的赛道下拉靠它：午夜杯的 `weekly.track_id`、碉堡的 `candidate_tracks`/
     `track_ids` 都是这张表的 **Level ID**（1041 这类）。名字走 LOCF（`N` 就是键），
     注意 382 条里有几条没有本地化文本，前端要能退化成显示编号。
+
+    ★ `bike` = 表里的 `B` 字段 = **这张图要求的车级别**（0/1/2，255 = 不限）。
+      客户端 `LevelManager::isCorrectBikeTier @0x47c170` 就是拿它（`level+0x286`）
+      跟车的 `Tier`（`bike+0x3b`，来自 bikes.txt）比：相等、或车的 Tier 是 255、
+      或图的 `B` 是 255 才放行。碉堡随机发车、午夜杯租借车都靠这个字段配车。
+      分布：B=0 有 135 张、1 有 142 张、2 有 101 张、255 有 4 张（1211/1212/1233/1258）。
     """
     path = _find_by_keys(packout, (b'"Levels"', b'"Villages"'))
     if not path:
@@ -211,9 +217,11 @@ def load_levels(packout, en, cn):
         except (TypeError, ValueError):
             continue
         key = (node.get("N") or "").strip()
+        tier = node.get("B")
         out[str(lid)] = {"key": key,
                          "en": en.get(gh(key), "") if key else "",
-                         "cn": cn.get(gh(key), "") if key else ""}
+                         "cn": cn.get(gh(key), "") if key else "",
+                         "bike": tier if isinstance(tier, int) else None}
     return out
 
 
@@ -368,6 +376,47 @@ def bike_names(packout):
     doc = load_json_tolerant(open(path, "rb").read()) if path else None
     return {int(k): ((v or {}).get("Comment") or "").strip()
             for k, v in ((doc or {}).get("BikeData") or {}).items() if str(k).isdigit()}
+
+
+# 车名在 LOCF 里没有（见 bike_names 的注释），中文名只能人工给：19 台车的常用叫法。
+BIKE_CN = {1: "犰狳", 2: "探戈", 3: "野马", 4: "胡狼", 5: "螳螂", 6: "掠夺者",
+           7: "激流", 8: "狂战士", 9: "幽灵", 10: "骏马", 11: "BMW", 12: "月球车",
+           13: "KTM 500 EXC", 14: "KTM 450 RALLY", 15: "土匪", 16: "BMW F800 GS",
+           17: "HD", 18: "HD EV", 19: "毛驴"}
+# 剧情默认车：1..9（Armadillo…Phantom，Tier 0/1/2 各 3 台）。10/11/12/19 是 T255 的
+# 特殊车、13/14/15/16/17/18 是商店/活动车 —— 碉堡的随机发车只用剧情车（用户 m08106：
+# 「随机最好只有游戏默认的可以在剧情里获得的车…这是一个兜底的安全范围」）。
+STORY_BIKES = tuple(range(1, 10))
+
+
+def load_bikes(packout):
+    """bikes.txt 的 `BikeData` → {str(车号): {id,en,cn,tier,type,garage,story}}。
+
+    `tier` = `BikeData.Tier`（0/1/2；**255 = 特殊车**，客户端
+    `LevelManager::isCorrectBikeTier @0x47c170` 里「车的 Tier 是 255 就能跑任何图」
+    就是它）；`type` = `BikeType`（0/1/2/3 = 车厂风格）；`garage` = `GarageOrder`
+    （车库里排第几）。配车就靠这里的 tier 跟 `levels[].bike`（图的 `B`）对。
+    """
+    path = find_bikes(packout)
+    if not path:
+        return {}
+    doc = load_json_tolerant(open(path, "rb").read()) or {}
+    out = {}
+    for k, v in (doc.get("BikeData") or {}).items():
+        if not str(k).isdigit():
+            continue
+        bid, v = int(k), (v or {})
+        en = (v.get("Comment") or "").strip()
+        out[str(bid)] = {
+            "id": bid,
+            "en": en or ("Bike %d" % bid),
+            "cn": BIKE_CN.get(bid) or en or ("车 %d" % bid),
+            "tier": v.get("Tier") if isinstance(v.get("Tier"), int) else None,
+            "type": v.get("BikeType") if isinstance(v.get("BikeType"), int) else None,
+            "garage": v.get("GarageOrder") if isinstance(v.get("GarageOrder"), int) else None,
+            "story": bid in STORY_BIKES,
+        }
+    return out
 
 
 def blueprint_needs(packout):
@@ -590,6 +639,7 @@ def main():
     # 都不进 items 键空间，另开顶层段（`items` 的数量断言不受影响）。
     levels = load_levels(args.packout, en, cn)
     rewards = load_rewards(args.packout, en, cn, items)
+    bikes = load_bikes(args.packout)
 
     # 赛道碎片 id 与「赛道」同族，合到一张卡里给运维看，别单开一类天天被点错。
     out = {
@@ -597,7 +647,7 @@ def main():
                    "en": "1516", "cn": "1523",
                    "items": len(items), "outfits": len(outfits), "paints": len(paints),
                    "blueprints": len(blueprints), "levels": len(levels),
-                   "rewards": len(rewards),
+                   "rewards": len(rewards), "bikes": len(bikes),
                    "blueprint_bikes": bp_have, "no_blueprint_bikes": bp_miss,
                    "overlap_ids": overlap, "skipped_files": bad},
         "categories": [
@@ -612,6 +662,7 @@ def main():
         "paints": paints,
         "levels": levels,
         "rewards": rewards,
+        "bikes": bikes,
         "items": items,
     }
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -633,6 +684,10 @@ def main():
           % (len(levels), sum(1 for v in levels.values() if v["en"]),
              len(rewards), dict(collections.Counter(
                  v["cat"] for v in rewards.values()))))
+    print("车辆表 %d 台（剧情默认 %d 台）：%s"
+          % (len(bikes), sum(1 for b in bikes.values() if b["story"]),
+             "、".join("%s(T%s)" % (b["cn"], b["tier"]) for b in
+                       sorted(bikes.values(), key=lambda b: b["id"]))))
     print("分类 %s；%d 个配置解析失败；%d 个 id 与赛道解锁撞车（已按服装归类）"
           % (dict(cats), len(bad), len(overlap)))
     for b in bad[:5]:
