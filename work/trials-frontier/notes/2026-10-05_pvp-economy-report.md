@@ -4,7 +4,7 @@
 
 ## 范围与证据
 
-沿用 [授权范围](<../scope.md>)：granted / lab_only。本轮只读本地 APK 派生产物、修改项目代码并跑临时回环 HTTP，不访问官方服务、不操作手机、不修改真实玩家存档。主路线 R1 APK，lead + cre/cae/doc。技能包实际位于 `F:\Code\reverse-skill`；工具索引未生成，按 PATH 实测，不运行需单独批准的包脚本、不安装依赖。报告类型为普通逆向（flavor=null）。
+沿用 [授权范围](<../scope.md>)：granted / lab_only。本轮只读本地 APK 派生产物、修改项目代码并跑临时回环 HTTP，不访问官方服务、不操作手机、不修改真实玩家存档。主路线 R1 APK，lead + cre/cae/doc。技能包实际位于 `<reverse-skill 目录>`；工具索引未生成，按 PATH 实测，不运行需单独批准的包脚本、不安装依赖。报告类型为普通逆向（flavor=null）。
 
 | Evidence | source_ref / repro_command | content_hash |
 |---|---|---|
