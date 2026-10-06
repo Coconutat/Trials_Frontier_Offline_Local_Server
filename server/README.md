@@ -393,6 +393,7 @@ python -m unittest discover -s tests -v
 | `/__config` | 当前生效的运行时配置 |
 | `/__help` | 端点清单（**新增端点要同步登记**，这是自发现的唯一入口） |
 | `POST /__api/admin/login` `logout` `me` | 管理员登录 / 登出 / 当前身份（`me` 未登录也 200） |
+| `GET /__api/admin/info` | 后台要展示的两条外发地址：玩家注册 `/__ui`、手机上的后台 `/__admin`（基址走 `_public_host()`，**绝不回环**） |
 | `POST /__api/admin/password` | 改口令（<8 位拒；改完**重签 Cookie**，否则把自己踢掉） |
 | `POST /__api/admin/grant` | 存档物品下发（白名单只有金币 1 / 钻石 2） |
 | `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |

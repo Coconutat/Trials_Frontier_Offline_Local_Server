@@ -145,6 +145,19 @@ function idCell(id) {
   });
 }
 
+function urlCell(url) {
+  // 一条要发给别人的地址（玩家注册入口 / 手机上的后台）。
+  return el('span', { style: 'display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap' },
+    el('span', { class: 'mono', text: url, style: 'user-select:all' }),
+    el('button', {
+      class: 'btn tiny', text: t('app.copy'),
+      onclick: async () => {
+        const ok = await copyText(url);
+        toast(ok ? t('app.copied') : url, { kind: ok ? 'good' : null, timeout: 1800 });
+      },
+    }));
+}
+
 function table(cols, rows) {
   const thead = el('thead', null, el('tr', null,
     cols.map(c => el('th', { class: c.cls || null, text: c.label }))));
@@ -375,8 +388,8 @@ function richCell(n) {
 }
 
 async function screenAccounts() {
-  const [accs, devs, ses] = await Promise.all([
-    api('/__accounts'), api('/__devices'), api('/__sessions')]);
+  const [accs, devs, ses, info] = await Promise.all([
+    api('/__accounts'), api('/__devices'), api('/__sessions'), api('/__api/admin/info')]);
   const perUser = {};
   for (const s of Object.values(ses.sessions || {})) {
     const u = s && s.user;
@@ -456,6 +469,16 @@ async function screenAccounts() {
       el('p', { class: 'lead', text: t('accounts.devices.lead') })),
     table(devCols, devs.devices || []));
 
+  // 玩家注册入口 —— 以前后台完全看不到它，要发给别人时只能自己拼地址。
+  const regRow = (label, url) => el('div',
+    { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:6px 0' },
+    el('span', { class: 'muted', text: label, style: 'min-width:8em' }), urlCell(url));
+  const regCard = el('section', { class: 'card pad' },
+    el('h2', { text: t('accounts.register.title') }),
+    el('p', { class: 'lead', text: t('accounts.register.lead') }),
+    regRow(t('accounts.register.player'), info.register_url),
+    regRow(t('accounts.register.admin'), info.admin_url));
+
   const pwInput = el('input', { type: 'password', autocomplete: 'new-password',
                                 placeholder: t('accounts.admin.placeholder'),
                                 style: 'max-width:260px' });
@@ -476,7 +499,7 @@ async function screenAccounts() {
     el('p', { class: 'lead', text: t('accounts.admin.lead') }),
     el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, pwInput, pwBtn));
 
-  return [sessCard, accCard, devCard, pwCard];
+  return [regCard, sessCard, accCard, devCard, pwCard];
 }
 
 // ─────────────────────────────────────────────── 屏 · 存档

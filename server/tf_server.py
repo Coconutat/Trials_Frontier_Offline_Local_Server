@@ -572,11 +572,19 @@ def _req_host(headers):
 
     ⚠ 不能用写死的 127.0.0.1：PC 局域网部署时客户端连的是 192.168.x.x，
     banner_url 里若是 127.0.0.1 就会去连手机自己。
+    ⚠ 真机上（`http.server`）headers 是 `email.message.Message`，**不是 dict** ——
+    只认 dict 的话这里永远取不到 Host，于是 `_public_host` 每次都退回默认端口。
+    真机实测：服务器跑在 8123，发出去的地址却是 `http://192.168.x.x:8000/…`。
     """
     if isinstance(headers, dict):
         for k, v in headers.items():
             if k.lower() == "host" and v:
                 return v
+    else:
+        get = getattr(headers, "get", None)
+        v = get("Host") if get else None       # Message.get 大小写不敏感
+        if v:
+            return v
     return "127.0.0.1:8000"
 
 
@@ -591,7 +599,7 @@ def _lan_ip():
             continue
         if ip and not ip.startswith("127."):
             return ip
-    return ""
+    return "127.0.0.1"          # 探测不出来就给个能看的，别让 URL 变成 "http://:8123"
 
 
 def _public_host(headers):
@@ -5143,6 +5151,16 @@ class Handler(BaseHTTPRequestHandler):
             return js({"ok": True, "username": who, "message": "账号已删除（存档目录保留）"})
 
         # ---------------------------------------------- 后台运维动作（要管理员）
+        if path == "/__api/admin/info":
+            # 后台要显示的「玩家注册入口 / 手机上的后台入口」——这两条地址是要发给
+            # 别人的，所以基址复用 _public_host()：它**绝不回环**（在 PC 上用
+            # 127.0.0.1 打开后台，这里也会换成局域网地址，正好是能发给玩家那种），
+            # 并尊重 appcfg.public_host 覆盖。
+            base = _public_host(self.headers)
+            return js({"ok": True,
+                       "username": (acct.admin_by_token(self._admin_token()) or {}).get("username"),
+                       "register_url": "http://%s/__ui" % base,
+                       "admin_url": "http://%s/__admin" % base})
         if path == "/__api/admin/grant":
             form = _json_body(body) or {}
             res, err = acct.grant_items(form.get("profile"), form.get("items") or [])
@@ -5322,6 +5340,7 @@ class Handler(BaseHTTPRequestHandler):
                     "[public] POST /__api/register {username,password,nameOnPlatform}",
                     "POST /__api/admin/login {username,password} -> Set-Cookie",
                     "POST /__api/admin/logout", "GET /__api/admin/me",
+                    "GET /__api/admin/info -> {register_url,admin_url}（发给玩家的地址）",
                     "POST /__api/admin/password {password}",
                     "POST /__api/admin/grant {profile,items:[{item_id,amount,mode}]}（存档物品，要玩家选「用云端」）",
                     "GET|POST /__api/admin/pvp {profile,fields:{golden_ticket,chips},mode}（竞技场余额，即时生效）",
@@ -5382,22 +5401,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self._handle("OPTIONS")
-
-
-def _lan_ip():
-    """猜本机在局域网里的地址（只在内存里选路由，不发任何包）。
-
-    给手机看用：把手机浏览器指到这个 IP 才能打开后台。
-    """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-        finally:
-            s.close()
-    except OSError:
-        return "127.0.0.1"
 
 
 def main():
