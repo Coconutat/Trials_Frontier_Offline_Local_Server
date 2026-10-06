@@ -325,7 +325,7 @@ function confirmDialog(o) {
 // ─────────────────────────────────────────────── 状态 / 路由
 
 const state = { screen: 'accounts', saves: [], detail: null, grantProfile: '',
-                grantAmounts: {}, grantMode: 'add',
+                itemSel: {}, itemOpen: {}, grantMode: 'add',
                 pvpAmounts: {}, pvpMode: 'add' };
 
 const SCREENS = {
@@ -556,9 +556,9 @@ function snapshotList(profileId, curRich, hist) {
 function saveDetailCard(d) {
   const m = items2Map(d.doc && d.doc.content);
   const kv = el('div', { class: 'kv' },
-    el('div', null, el('div', { class: 'k', text: t('grant.item1') }),
+    el('div', null, el('div', { class: 'k', text: t('saves.coins') }),
         el('div', { class: 'v', text: fmtNum(m[1]) })),
-    el('div', null, el('div', { class: 'k', text: t('grant.item2') }),
+    el('div', null, el('div', { class: 'k', text: t('saves.gems') }),
         el('div', { class: 'v', text: fmtNum(m[2]) })),
     el('div', null, el('div', { class: 'k', text: t('saves.item135') }),
         el('div', { class: 'v', text: m[135] == null ? '—' : fmtNum(m[135]) })),
@@ -621,10 +621,6 @@ async function screenSaves() {
 
 // ─────────────────────────────────────────────── 屏 · 下发物品
 
-// 存档里能安全写下去的：items2 里只有这两个是「一个 id 对一个计数器」。
-// ⚠ 金票**不在这里** —— 玩家在竞技场看到的那几张是服务端 pvp_state.json 里的
-//   计数器，跟 items2 的 id 135 是两码事（真机实测，m00702）。
-const GRANT_ITEMS = [1, 2];
 // 竞技场余额：改服务端 pvp_state.json，客户端下次读 PVP 响应就看到，无需玩家操作。
 const PVP_ITEMS = ['golden_ticket', 'chips'];
 
@@ -636,6 +632,119 @@ function modeSeg(cur, onpick) {
     'aria-pressed': String(cur === mo),
     onclick: () => onpick(mo),
   })));
+}
+
+// 官方物品目录：server/admin/items.json，由 tools/build_item_catalog.py 从游戏自带的
+// 物品表里抽出来，中文名直接取自游戏自己的本地化表（LOCF 1523），不是我们翻的。
+let CATALOG = null;
+
+async function catalog() {
+  if (!CATALOG) CATALOG = await api('/__admin/items.json');
+  return CATALOG;
+}
+
+function itemName(it) { return (LANG === 'cn' ? it.cn : it.en) || it.en || ('#' + it.id); }
+function catLabel(c) { return (LANG === 'cn' ? c.cn : c.en) || c.key; }
+
+// 真机存档里这两类是 0/1 标志（225=1、414=0），不是计数器 ⇒ 只能「解锁」，不给数量。
+const FLAG_CATS = { outfit: 1, blueprint: 1 };
+
+// 折叠清单：分类 → 打勾 → 填数量。勾选/展开/搜索只改 DOM，不重渲染 —— 四百条物品
+// 重渲染一次既会闪，也会把正在输入的数量框焦点弄丢。
+function itemPicker(cat, cur) {
+  const groups = cat.categories
+    .map(c => ({ meta: c, items: Object.keys(cat.items).map(k => cat.items[k])
+                 .filter(it => it.cat === c.key).sort((a, b) => a.id - b.id) }))
+    .filter(g => g.items.length);
+
+  const root = el('div', { class: 'acclist' });
+  const total = el('span', { class: 'hint', text: t('grant.list.selected', { n: 0 }) });
+  const empty = el('p', { class: 'hint', hidden: true, text: t('grant.list.empty') });
+  const accs = {};
+
+  const selectedIn = key => Object.keys(state.itemSel).filter(id =>
+    cat.items[id] && cat.items[id].cat === key).length;
+  const refresh = () => {
+    for (const k in accs) {
+      const n = selectedIn(k);
+      accs[k].badge.textContent = String(n);
+      accs[k].badge.hidden = !n;
+    }
+    total.textContent = t('grant.list.selected', { n: Object.keys(state.itemSel).length });
+  };
+
+  for (const g of groups) {
+    const flag = !!FLAG_CATS[g.meta.key];
+    // 「未验证」是按物品带的（存档里真的没确认过怎么写），不是按分类配的：
+    // 一个类里只要有一条没验证过就提醒，别拿 meta.verified 判断（categories 里没这个字段，
+    // 用它会变成「每个类都挂警告」）。
+    const unverified = g.items.some(it => !it.verified);
+    const badge = el('span', { class: 'badge sel', hidden: true });
+    const body = el('div', { class: 'accbody' });
+    if (unverified) body.append(el('p', { class: 'hint p-warn', text: t('grant.list.unverified') }));
+    for (const it of g.items) {
+      const box = el('input', { type: 'checkbox', class: 'tick' });
+      const qty = el('input', { type: 'number', min: '0', step: '1', class: 'qty',
+                                placeholder: '1', disabled: true, 'aria-label': t('grant.amount') });
+      box.checked = it.id in state.itemSel;
+      if (box.checked) { qty.value = String(state.itemSel[it.id]); qty.disabled = false; }
+      box.onchange = () => {
+        qty.disabled = !box.checked;
+        if (box.checked) {
+          if (!qty.value) qty.value = '1';
+          state.itemSel[it.id] = Number(qty.value) || 0;
+        } else delete state.itemSel[it.id];
+        refresh();
+      };
+      qty.oninput = () => { if (box.checked) state.itemSel[it.id] = Number(qty.value) || 0; };
+      body.append(el('div', { class: 'irow', dataset: { q: (itemName(it) + ' ' + it.id).toLowerCase() } },
+        el('label', { class: 'ibox' }, box),
+        el('span', { class: 'iname', text: itemName(it) }),
+        el('span', { class: 'hint mono', text: '#' + it.id }),
+        el('span', { class: 'ibal', text: cur[it.id] == null ? '—' : fmtNum(cur[it.id]) }),
+        flag ? el('span', { class: 'hint', text: t('grant.list.unlock') }) : qty));
+    }
+    const open = !!state.itemOpen[g.meta.key];
+    const head = el('button', { type: 'button', class: 'acchead', 'aria-expanded': String(open) },
+      el('span', { class: 'chev' }),
+      el('span', { class: 'grow', text: catLabel(g.meta) }),
+      el('span', { class: 'hint mono', text: String(g.items.length) }),
+      badge);
+    const acc = el('div', { class: 'acc' + (open ? ' open' : '') }, head, body);
+    head.addEventListener('click', () => {
+      const on = acc.classList.toggle('open');
+      state.itemOpen[g.meta.key] = on;
+      head.setAttribute('aria-expanded', String(on));
+    });
+    accs[g.meta.key] = { acc, badge, body };
+    root.append(acc);
+  }
+
+  const filter = el('input', { type: 'search', class: 'filter', placeholder: t('grant.list.search') });
+  filter.addEventListener('input', () => {
+    const qq = filter.value.trim().toLowerCase();
+    let shown = 0;
+    for (const g of groups) {
+      let vis = 0;
+      for (const row of accs[g.meta.key].body.querySelectorAll('.irow')) {
+        const hit = !qq || row.dataset.q.indexOf(qq) >= 0;
+        row.hidden = !hit;
+        if (hit) vis++;
+      }
+      accs[g.meta.key].acc.hidden = !vis;
+      if (qq && vis) accs[g.meta.key].acc.classList.add('open');
+      shown += vis;
+    }
+    empty.hidden = shown > 0;
+  });
+  refresh();
+  return { root, filter, total, empty,
+    picks: () => Object.keys(state.itemSel).map(id => ({
+      item_id: Number(id), amount: Number(state.itemSel[id]) || 0,
+      mode: FLAG_CATS[(cat.items[id] || {}).cat] ? 'set' : state.grantMode,
+    })).filter(x => x.amount !== 0 && cat.items[x.item_id]),
+    name: id => (cat.items[id] && itemName(cat.items[id])) || ('#' + id),
+    clear: () => { state.itemSel = {}; } };
 }
 
 async function screenGrant() {
@@ -741,29 +850,24 @@ async function screenGrant() {
       ].join('　') : t('grant.pvpNever') })),
     el('div', { class: 'card-head' }, el('span', { class: 'grow' }), pvpSubmit));
 
-  // ── 存档物品：要玩家在游戏里选「用云端」────────────────────────────────────
-  const saveRows = GRANT_ITEMS.map(id => el('div', { class: 'itemrow' },
-    el('div', { class: 'nm' },
-      el('b', { text: t('grant.item' + id) }),
-      el('span', { class: 'hint mono', text: 'items2 id ' + id })),
-    el('div', { class: 'bal', text: t('grant.balance') + ' ' + (m[id] == null ? '—' : fmtNum(m[id])) }),
-    el('input', {
-      type: 'number', min: '0', step: '1', value: state.grantAmounts[id] || '',
-      placeholder: '0', oninput: e => { state.grantAmounts[id] = e.target.value; },
-    })));
+  // ── 存档物品：官方目录清单，按类折叠 ───────────────────────────────────────
+  let cat = null;
+  try {
+    cat = await catalog();
+  } catch (e) { if (e.auth || e.net) throw e; }
+  const list = cat ? itemPicker(cat, m) : null;
 
   const submit = el('button', {
     class: 'btn primary', text: t('grant.submit'),
     onclick: () => guarded(async () => {
-      const items = GRANT_ITEMS.map(id => ({
-        item_id: id, amount: Number(state.grantAmounts[id] || 0), mode: state.grantMode,
-      })).filter(x => x.amount !== 0);
+      const items = list ? list.picks() : [];
       if (!items.length) { toast(t('grant.zero'), { kind: 'bad' }); return; }
       submit.disabled = true;
       try {
         const r = await post('/__api/admin/grant', { profile: state.grantProfile, items });
         const summary = r.applied.map(a =>
-          t('grant.item' + a.item_id) + ' ' + fmtNum(a.before) + ' → ' + fmtNum(a.after)).join('　');
+          (list ? list.name(a.item_id) : '#' + a.item_id) + ' ' +
+          fmtNum(a.before) + ' → ' + fmtNum(a.after)).join('　');
         toast(t('grant.doneBody', {
           profile: state.grantProfile.slice(0, 8),
           summary: summary,
@@ -777,7 +881,7 @@ async function screenGrant() {
             show('grant');
           }) },
         });
-        state.grantAmounts = {};
+        if (list) list.clear();
         show('grant');
       } finally { submit.disabled = false; }
     }),
@@ -788,12 +892,19 @@ async function screenGrant() {
     el('p', { class: 'lead', text: t('grant.warnBody') }),
     el('p', { class: 'lead p-warn', text: t('grant.warnBody2') }));
 
-  nodes.push(pick, pvpCard, warn, el('section', { class: 'card' },
+  const listCard = el('section', { class: 'card' },
     el('div', { class: 'card-head' },
       el('h2', { class: 'grow', text: t('grant.saveTitle') }),
+      el('span', { class: 'hint', text: t('grant.modeHint') }),
       modeSeg(state.grantMode, mo => { state.grantMode = mo; show('grant'); })),
-    el('div', { class: 'card-body' }, saveRows, el('p', { class: 'hint', text: t('grant.whitelist') })),
-    el('div', { class: 'card-head' }, el('span', { class: 'grow' }), submit)));
+    el('div', { class: 'card-body' },
+      list ? el('div', { class: 'listbar' }, list.filter, list.total) : null,
+      list ? list.root : el('div', { class: 'empty', text: t('grant.noSave') }),
+      list ? list.empty : null,
+      el('p', { class: 'hint', text: t('grant.whitelist') })),
+    el('div', { class: 'card-head' }, el('span', { class: 'grow' }), submit));
+
+  nodes.push(pick, pvpCard, warn, listCard);
   return nodes;
 }
 

@@ -4935,6 +4935,9 @@ _ADMIN_FILES = {
     "/__admin/app.js": ("app.js", "application/javascript; charset=utf-8"),
     # 文案单独放 JSON：Python 侧的离线自检能直接 load 它并核对中英键是否一一对应。
     "/__admin/i18n.json": ("i18n.json", "application/json; charset=utf-8"),
+    # 官方物品目录（401 条，含中英名与分类），由 tools/build_item_catalog.py 生成。
+    # 它只是游戏自带表的导出，没有玩家数据，所以跟静态资源一起裸给。
+    "/__admin/items.json": ("items.json", "application/json; charset=utf-8"),
 }
 
 

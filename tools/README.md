@@ -352,13 +352,41 @@ python tools/re/locdump.py key M_RACE_GHOST # english 'Race Ghost'
 
 然后所有 `tools/re/` 工具的第一个参数都传这个 `.so` 路径。
 
+### 5.1 `build_item_catalog.py` —— 官方物品目录（后台「下发物品」用）
+
+```bash
+python tools/build_item_catalog.py                       # 默认读 tmp/packout/all，写 server/admin/items.json
+python tools/build_item_catalog.py --packout <dir> --out <file>
+```
+
+数据全部来自游戏自己的文件，没有任何猜测：
+
+* **物品 id ← 奖励/商店表**：扫解包目录里所有含 `"ItemId"` 的 JSON，那个 `ItemId` 就是存档
+  `items2` 的键（`id = Type*5 + Tier` 那套公式也吻合）。
+* **物品名 ← LOCF 本地化表**：`1516` = en、`1523` = zh-CN（繁体 1525，另有 pt/fr/de/it/ja/ko/ru/es）。
+  格式 = `LOCF` + u8 版本 + u32 条数，随后 `[u32 hash][u16 len][len 字节含结尾 NUL]`；
+  记录用**名字键**索引，键的哈希与 `content.dat` 条目名同一个函数（`mt::String::getHashCode`，
+  脚本里的 `gh()`）。表里只有 `ITEM_<type>_<tier>`、`OUTFIT_%02d_NAME`、`LVL_<NAME>`
+  这些键，所以名字必须靠 `NameId` 反查，不能直接匹配英文原文。
+* **分类 + `verified`**：分类是按 `Type` 与贴图路径推的；`verified` 表示「这个类的存档写法
+  **在真机上确认过**」——只有涂装（Type 2）与赛道（Type 1/3）是 `false`，后台会给它们挂
+  「未验证」警告。改判定就改脚本里的 `category()`。
+* `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
+  所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试。
+  `0010_1854657d.bin` 目前仍解析不了（少 7 条 RIDER 记录），会记进 `source.skipped_files`。
+
+**金票（135）被显式跳过**：它不在存档 `items2` 里，走 `server/data/pvp_state.json`。
+
+生成的 `server/admin/items.json` 同时被三处消费：后台的折叠清单、`tflocal_accounts.grantable_items()`
+（可下发集合）、`tests/test_admin_webui.py::ItemCatalog`（形状自检）。**改了物品表就重跑它。**
+
 ---
 
 ## 6. 依赖
 
 | 依赖 | 谁需要 | 说明 |
 |---|---|---|
-| Python 3.8+ | 全部 | 只用标准库的：`patch_native.py`、`patch_dex.py`、`patch_dynaddr.py`、`patch_manifest.py`、`build_apk.py`、`ghost_index.py`、`gref_global.py` 以及 `tools/re/` 里除下表外的脚本 |
+| Python 3.8+ | 全部 | 只用标准库的：`patch_native.py`、`patch_dex.py`、`patch_dynaddr.py`、`patch_manifest.py`、`build_apk.py`、`ghost_index.py`、`build_item_catalog.py`、`gref_global.py` 以及 `tools/re/` 里除下表外的脚本 |
 | `pyelftools` | `patch_urls.py`、`tools/re/syms.py` | `pip install pyelftools` |
 | `capstone` | `tools/re/disasm.py`、`tools/re/xref_adrp.py` | `pip install capstone` |
 | Android SDK build-tools | `tfpatcher.py` 最后一步 | zipalign + apksigner；没有就用 `--no-sign` |
