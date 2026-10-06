@@ -645,6 +645,9 @@ Check: `369+5*9=414` Stallion, `369+5*10=419` Agent, `369+5*18=459` Donkey — m
 The atlas index runs one ahead of the `upgrades.txt` bike ID (`BLUEPRINT_9` → `Upgrades[10] STALLION`).
 Blueprint slots for nn 3–8 and 11 (`384 389 394 399 404 409 424`) are **not referenced by any reward
 catalog in this build**, so those IDs are inferred from the formula only and are marked as such.
+> ⚠ **这句有错，已在 §5c 修正**：`404`（Berserker）其实真实存在（`giftbox.txt` 里以紧凑形式
+> `{"IID":80,"IL":4,"IC":1}` 给出；真机存档里 ccb 有 3 片），而 `384/389/394/399/409/424` 这 6 个编号
+> **根本不存在** —— 它们对应的车没有蓝图，只有 12 辆车有碎片编号。
 
 ### 5b. Bike catalogue (BikeData keys — these are *bike* indexes, not item IDs)
 
@@ -700,6 +703,69 @@ Blueprint counts per bike come from `content.dat entry #45 (/conf/upgrades.txt) 
 > Berserker IID 80, Agent IID 83, Donkey IID 91. In `wts_rewards.txt`/`wheelspecials.txt` the same
 > blueprints appear directly as ItemIds 419 (Agent), 434 (KTM 450), 444 (BMW F800 GS),
 > 449 (HD XG750R), 454 (HD Electric), 459 (Donkey), each with `ItemAmount: 2` (“x2”).
+
+### 5c. ★ 修正（2026-10-06，用户 m03499 反馈「蓝图是碎片，每辆车要求数量不一样，车数量对不上」）
+
+**蓝图是碎片计数器，不是 0/1 标志。** 真机存档实测（`server/data/save/*/latest.json` 的 `content.items2`）：
+
+| 存档 | 374 | 379 | 404 | 414 | 419 | 429 | 434 | 439 | 444 | 449 | 454 | 459 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `53ebbd18`（ccb） | 1000 | 7 | 3 | 0 | 1004 | 1000 | 1004 | 1004 | 1004 | 1004 | 1004 | 1000 |
+| `82712000`（huawei） | 1004 | 0 | 0 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| `11111111` | 1000 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1000 |
+
+（`1000`/`1004` 的含义仍未定论，疑似「已完成/已解锁」哨兵或历史作弊残留 —— **不能当布尔用**，
+后台照原值显示「已拥有 n/N」。）
+
+**编号与需求量**：
+
+- 编号 `id = (车号 + 72) * 5 + 4`（车号 = `BikeData` key；等价于旧记法 `369 + 5 * nn`，`nn = 车号 − 1`）。
+- 需求量 = `/conf/upgrades.txt` 的 `BP`（上表），与 LOCF 里 7 处 "Collect N to build" 文案逐条吻合：
+  Bandito 20 / KTM 500-EXC 20 / KTM 450 RALLY 30 / Stallion 50 / BMW F 800 GS 50 / HD XG750R 50 / HD EV 50。
+- **只有 12 辆车有碎片编号**：Tango(2)=374、Bronco(3)=379、Berserker(8)=404、Stallion(10)=414、
+  Agent/BMW(11)=419、KTM 500-EXC(13)=429、KTM 450 RALLY(14)=434、Bandito(15)=439、BMW F 800 GS(16)=444、
+  HD XG750R(17)=449、HD EV(18)=454、Donkey(19)=459。
+- 另外 7 辆（Armadillo 1 / Jackal 4 / Mantis 5 / Marauder 6 / Riptide 7 / Phantom 9 / Moonrover 12）的
+  编号 369/384/389/394/399/409/424 **在任何配置与真机存档里都不存在**（它们的 `BP` 是 4/10/20/20/10/20/20，
+  但没有碎片物品）—— **只能金币买，不是漏挖**。
+
+**反汇编印证**（`tmp\extract\libTrialsGo.so`，arm64）：
+
+| 地址 | 符号 | 关键指令 |
+|---|---|---|
+| `0x00663110` | `tr::MenuzComponentGarageBike::hadleBlueprintPurchase()` | `bikeID + 0x48` → `and/add` 得 `×5` → `+4` → `PlayerItems::add(w1, …, 1, -1, 0x3e7, 0)`；后半 `getItemCount(0,2)`（宝石）→ `setItemCount(0,2, gems − w20)` + `gemsUsed(w20)` ⇒ 花宝石买 1 片，`w20` = 车记录 `[+0xf0]` 的宝石单价 |
+| `0x00662fdc` | `tr::MenuzComponentGarageBike::purchaseBlueprint()` | `price = [bike+0xf0]`；低于 `GlobalSettings::getSetting(gh("Gems_Purchase_Confirmation_limit"), 0x14)` 直接买，否则弹确认框 |
+| `0x007c3060` | `tr::MenuzBlueprintRenderer::init(int bikeID,int owned)` | `[0x5e4] = BikeUpgrade::getUpgradeID(bikeID, 4)`（已拥有片数）；`[0x5e8] = 车记录 [+0x58] − 1`（需求量−1） |
+| `0x007c4e5c` | `tr::MenuzBlueprintRenderer::blueprintComplete()` | `[0x5e4] == [0x5e8]` ⇒ 集齐判据 `owned >= need` |
+| `0x00747ab0` | `tr::MenuzStateGarage::setupAvailableBikes` | `init(bikeID, 0)` |
+| `0x007dc684` | `tr::PopupStateBlueprint::pushPopup(int,int,int)` | 弹窗（`w1,w2` 存进 `[0x238]/[0x23c]`） |
+
+复现：`python tools\re\symaddr.py tmp\extract\libTrialsGo.so Blueprint --sub`、`python tools\re\disasm.py tmp\extract\libTrialsGo.so 0x00663110 120`。
+
+**★ 紧凑形式 `{IID,IL,IC}` 不能一律套 `IID*5+IL`** —— `IC` 的含义按物品族不同：
+
+| `IID` | 族 | `IC` 装的是 | 例 |
+|---|---|---|---|
+| 0 / 1 / 2 | 金币 / 零件 / 宝石 | **数量** | `IID 0 IL 1 IC 5000` = "Daily 5000 Coins"；`IID 1 IL 3 IC 1` = "Tier IV Chain" |
+| 70 | 零件礼包 | **零件编号** | `IID 70 IL 0 IC 13` = 零件 13 |
+| 80 / 83 / 85 / 91 … | 蓝图 | **数量（片数）** | `{"IID":85,"IL":4,"IC":20}` = KTM500 20 片（0042）、`IC:50` = Donkey 50 片（0042）、`IC:19` = 19 片（0021） |
+| 133 / 134 / 136 | 涂装 | **该车的涂装序号（SkinIndex）** | 同一键 668/669 上出不同 `IC` ⇒ "Mr. Bones Jackal" / "Fanny Pack Mantis" |
+| 170 | 赛道 | **赛道 id** | `compensation Track: Open Jaw Bog` 的 `IC` = 1164 = `levels.txt` 里的 Open Jaw Bog |
+
+所以 `tools/build_item_catalog.py` 的 `walk_itemids()` 只对**蓝图那一族**（`blueprint_bike(IID*5+IL)` 为真）
+套平面公式；放宽成「所有 `{IID,IL}` 都收」会让目录立刻多出 25 条垃圾（503 条物品、20 → 46 个撞车编号）。
+
+**名字**：374/379/439 的官方 `NameId` 被 RedLynx 复制粘贴成了 **`WSB_TANGO_REDLYNX_TITLE`**
+（"Redlynx Paint Job for Tango / Tango的Redlynx涂装"），后台换成规范名并把旧名留 `alias`。
+`WSI_BANDITO_BLUEPRINT_TITLE` / `WSI_AGENT_…` / `WSI_KTM500_…` / `WSI_KTM450_…` / `WSI_BMWF800GS_…` /
+`WSI_HD_…` / `WSI_HD_EV_…` 都在 LOCF 里有真名；`PVPS_STALLION_TITLE`="The Stallion Blueprint / Stallion图纸"、
+`PVPS_DONKEY_TITLE`="The Donkey Blueprint / Donkey图纸"；
+`WSI_TANGO_…`/`WSI_BRONCO_…`/`WSI_BERSERKER_…`/`WSI_DONKEY_…` **不存在**（Tango/Bronco/Berserker 没有官方文案，
+后台按车名兜底拼 "Berserker Blueprint Piece" 并挂「无官方名」）。
+
+**后台下发**：编号进普通 `items` 通道（`mode` 可 `add`/`set`，是计数器），行上显示「需要 N 片 / 已拥有 n/N」，
+勾选时数量框默认填 `max(need − owned, 1)`。真机 HTTP 验证：给测试档发 404 `add 3` →
+`{"before":0,"after":3}`、`server_version` 1→2、revert 后版本回 1 且 404 消失。
 
 ---
 

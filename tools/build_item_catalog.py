@@ -25,7 +25,8 @@ r"""把游戏自带的物品目录抽成后台能用的清单：server/admin/ite
 
 分类的「verified」是**真机证据强度**，不是猜的：
   * 计数类（货币/零件/消耗品）：真机存档里就是 5=1、6=8、150=109 这样的计数。
-  * 0/1 类（服装部件/蓝图）：真机存档里 205=0、225=1、414=0，客户端自己「获得物品」也写 +id=1。
+  * 0/1 类（服装部件）：真机存档里 205=0、225=1，客户端自己「获得物品」也写 +id=1。
+  * ★ 蓝图也是**计数器**（碎片），见下面 ★ 蓝图 —— 真机存档里 379=7、404=3、419=1004。
   * 涂装(type 2) **不是** items2 的键，见下面 ★ 涂装；赛道(type 1) / 赛道碎片(type 3)：
     id 与别的名字空间挤在一起，存档里也没找到可信的写法 ⇒ 标 verified=false，界面上如实说明。
 
@@ -62,6 +63,33 @@ r"""把游戏自带的物品目录抽成后台能用的清单：server/admin/ite
     混淆（`m_items[i] = 0x0AB1D4F5 ^ rol(M, 7)` 之类，0x0AB1D4F5 是全库通用的常量）。
     ⇒ 涂装**只能按「车」下发**（置一位），不能按 id 写 `items2[id]`；id 3–107 里有一半还同时是
     零件 id（5–54）⇒ 按 id 下发不但无效，还会写到别人的计数上。
+
+★ 蓝图（`blueprint`）是**碎片计数器**，而且只有 12 辆车有：
+
+  * ★★ 编号 = `(车号 + 72) * 5 + 4`（tier 4 = 碎片）。反汇编里就是这么算的：
+    `MenuzComponentGarageBike::hadleBlueprintPurchase()` @0x00663110 拿
+    `w1 = ((bikeID + 0x48) * 5) + 4` 去 `PlayerItems::add()`；0x48 = 72。
+    12 条实测编号全对：Tango(2)=374、Bronco(3)=379、Berserker(8)=404、Stallion(10)=414、
+    Agent/BMW(11)=419、KTM 500-EXC(13)=429、KTM 450 RALLY(14)=434、BANDITO(15)=439、
+    BMW F 800 GS(16)=444、HD XG750R(17)=449、HD EV(18)=454、Donkey(19)=459。
+    车号就是 bikes.txt 的 `BikeData` ID。剩下 7 辆（Armadillo/Jackal/Mantis/Marauder/
+    Riptide/Phantom/Moonrover）**任何配置里都没有**它们的碎片编号（369/384/389/394/399/
+    409/424）⇒ 只能金币购买，不是漏挖。
+  * ★ 每辆车要几片写在 `/conf/upgrades.txt`（`0045_*`）的 `BP` 字段里（`{"ID":3,"N":"BRONCO",
+    "BP":20,…}`，ID 与 BikeData 同序）。7 处官方文案「Collect N to build」与 BP 全部吻合
+    （Bandito 20 / KTM 500-EXC 20 / KTM 450 RALLY 30 / Stallion 50 / BMW F 800 GS 50 /
+    HD XG750R 50 / HD EV 50）；Berserker 20、Donkey 50、Tango 4、Bronco 20、Agent 50。
+    客户端 `MenuzBlueprintRenderer::init()` 读的正是车记录的 `[+0x58]`（= 需求量）跟
+    `BikeUpgrade::getUpgradeID(bikeID, 4)`（= 已拥有片数）比大小。
+  * 名字：配置里 374/379 的 `NameId` 是 RedLynx 复制粘贴写错的（`WSB_TANGO_REDLYNX_TITLE`
+    = "Redlynx Paint Job for Tango"），439 也被这条压过 ⇒ 优先挑「文案里含 Blueprint」的记录，
+    挑不到就用配置自己的 `Comment`（"Tango Blueprint Piece"），再挑不到才按车名拼
+    （"Berserker Blueprint Piece"）。这样中英名不会出现「涂装」字样，官方译文缺失的标
+    verified=false，界面上如实说明。
+  * 碎片条目有两种写法：老表用散字段 `{"Type":74,"ItemId":374,…}`，`/conf/giftbox.txt`、
+    PH 商店那两张表只用紧凑形式 `{"IID":80,"IL":4,"IC":1}` ⇒ **平面编号 = `IID * 5 + IL`**
+    （与 `ITEM_<type>_<tier>` 同一个公式；`IID 0 IL 1` = 1 金币、`0 IL 2` = 2 宝石可交叉验证）。
+    以前只解析前一种，所以 Berserker(404) 一直缺。
 """
 import argparse
 import collections
@@ -74,6 +102,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+# 蓝图碎片：物品 type = 车号 + 72，tier 4 是碎片 ⇒ id = (车号 + 72) * 5 + 4（见模块开头 ★ 蓝图）。
+BLUEPRINT_TYPE_BASE = 72
 
 
 def gh(s):
@@ -251,11 +282,84 @@ def _better_record(new, old):
     return bool(new.get("NameId")) and not old.get("NameId")
 
 
+def find_upgrades(packout):
+    """按内容找 /conf/upgrades.txt（一辆车一条，`BP` = 蓝图碎片需求量）。"""
+    for p in sorted(glob.glob(os.path.join(packout, "*.bin"))):
+        head = open(p, "rb").read(4096)
+        if b'"Upgrades"' in head and b'"BP"' in head:
+            return p
+    return None
+
+
+def bike_names(packout):
+    """bikes.txt 的 `BikeData` → {车号: 英文车名}（车名只在 `Comment` 里，LOCF 里没有）。"""
+    path = find_bikes(packout)
+    doc = load_json_tolerant(open(path, "rb").read()) if path else None
+    return {int(k): ((v or {}).get("Comment") or "").strip()
+            for k, v in ((doc or {}).get("BikeData") or {}).items() if str(k).isdigit()}
+
+
+def blueprint_needs(packout):
+    """`/conf/upgrades.txt` 的 `BP` → {车号: 需要几片}（车号与 BikeData 同序）。"""
+    path = find_upgrades(packout)
+    doc = load_json_tolerant(open(path, "rb").read()) if path else None
+    return {u["ID"]: u["BP"] for u in ((doc or {}).get("Upgrades") or [])
+            if isinstance(u.get("ID"), int) and isinstance(u.get("BP"), int)}
+
+
+def load_blueprints(allnodes, bikes, needs, en, cn):
+    """→ ({str(id): 记录}, 有碎片的车名, 没碎片的车名)。
+
+    ★ 只收**任何配置里真的出现过**的碎片编号（19 辆车里 12 辆有）；其余 7 辆（Armadillo /
+    Jackal / Mantis / Marauder / Riptide / Phantom / Moonrover）的碎片编号 369/384/389/
+    394/399/409/424 在配置与真机存档里都不存在 —— 它们只能金币买，不是漏挖，不能凭空造。
+    名字优先挑「文案里含 Blueprint」的记录：374/379 的 `NameId` 被 RedLynx 写成了 Tango 的
+    Redlynx 涂装名，439 也被那条压过（见模块开头 ★ 蓝图）。
+    """
+    out, have, miss = {}, [], []
+    for b in sorted(bikes):
+        iid = (b + BLUEPRINT_TYPE_BASE) * 5 + 4
+        if iid not in allnodes:
+            miss.append(bikes[b])
+            continue
+        have.append(bikes[b])
+        name_en = name_cn = key = ""
+        for nd in allnodes[iid]:
+            k = nd.get("NameId") or ""
+            e = en.get(gh(k), "") if k else ""
+            if "lueprint" in e:
+                name_en, name_cn, key = e, cn.get(gh(k), ""), k
+                break
+        if not name_en:                              # 配置里没给正式文案 → 用配置自己的 Comment
+            for nd in allnodes[iid]:
+                cm = (nd.get("Comment") or "").strip()
+                if "lueprint" in cm:
+                    name_en = cm
+                    break
+        if not name_en:                              # 连 Comment 都没有 → 按车名拼（Berserker）
+            name_en = "%s Blueprint Piece" % bikes[b]
+        rec = {"id": iid, "cat": "blueprint", "t": b + BLUEPRINT_TYPE_BASE,
+               "en": name_en, "cn": name_cn, "key": key, "verified": bool(name_cn),
+               "bike": b, "bike_en": bikes[b]}
+        if needs.get(b):
+            rec["need"] = needs[b]
+        out[str(iid)] = rec
+    return out, have, miss
+
+
 def walk_itemids(node, out):
     if isinstance(node, dict):
 
         if isinstance(node.get("ItemId"), int):
             out.append(node)
+        elif isinstance(node.get("IID"), int) and isinstance(node.get("IL"), int):
+            # 紧凑形式 {"IID":…,"IL":…,"IC":…}：**只有蓝图碎片家族**验证过
+            # 「平面编号 = IID*5 + IL」（`IID 80 IL 4` = 404 Berserker）。别的表同名不同义：
+            # 赛道（`IID 170`）用 IC 装赛道 id（1103–1317）、涂装（`IID 133/134/136`）用 IC 装
+            # 该车的涂装序号、零件礼包（`IID 70`）用 IC 装零件编号 —— 照公式算会造出 851、350
+            # 这种根本不存在的编号并污染目录，所以这里只放蓝图那一族进来。
+            if blueprint_bike(node["IID"] * 5 + node["IL"]):
+                out.append(node)
         for v in node.values():
             walk_itemids(v, out)
     elif isinstance(node, list):
@@ -263,10 +367,27 @@ def walk_itemids(node, out):
             walk_itemids(v, out)
 
 
+def item_id_of(node):
+    """散字段 `ItemId` 或紧凑 `IID`/`IL` → 平面编号（`IID * 5 + IL`，与 ITEM_<type>_<tier> 同式）。"""
+    iid = node.get("ItemId")
+    if isinstance(iid, int):
+        return iid
+    return node["IID"] * 5 + node["IL"]
+
+
+def blueprint_bike(iid):
+    """蓝图碎片编号 → 车号（BikeData ID）；不是碎片返回 0。"""
+    if iid % 5 == 4 and BLUEPRINT_TYPE_BASE < iid // 5 <= BLUEPRINT_TYPE_BASE + 21:
+        return iid // 5 - BLUEPRINT_TYPE_BASE
+    return 0
+
+
 def category(iid, node):
     """①排序即优先级。返回 (cat_key, verified)。"""
     if iid in (1, 2):
         return "currency", True
+    if blueprint_bike(iid):                      # 碎片是计数器，按编号就能认，别靠贴图名
+        return "blueprint", True
     tex = (node.get("TextureName") or "").upper()
     typ = node.get("Type")
     if typ in (1, 3):                            # 赛道与其碎片合成一张卡（都是未验证）
@@ -292,9 +413,11 @@ def main():
         sys.exit("本地化表解析失败（en=%d cn=%d 条）" % (len(en), len(cn)))
 
     entries, files, bad, shop = {}, collections.Counter(), [], {}
+    allnodes = {}                                    # 编号 → 所有出现过的记录（蓝图按编号认）
     for p in sorted(glob.glob(os.path.join(args.packout, "*.bin"))):
         raw = open(p, "rb").read()
-        if raw[:4] == b"LOCF" or b'"ItemId"' not in raw:
+        # 有些表（giftbox / 带 Price 的商店）只用紧凑的 {"IID":…,"IL":…,"IC":…}
+        if raw[:4] == b"LOCF" or (b'"ItemId"' not in raw and b'"IID"' not in raw):
             continue
         doc = load_json_tolerant(raw)
         if doc is None:
@@ -303,7 +426,8 @@ def main():
         found = []
         walk_itemids(doc, found)
         for node in found:
-            iid = node["ItemId"]
+            iid = item_id_of(node)
+            allnodes.setdefault(iid, []).append(node)
             if node.get("Type") == 2:                # 涂装：另走 SkinData 那张表（load_paints）
                 prev = shop.get(iid)
                 if prev is None or (not prev.get("NameId") and node.get("NameId")):
@@ -331,6 +455,28 @@ def main():
             "cn": c or e or (node.get("Comment") or "").strip(),
             "key": key, "verified": verified,
         }
+
+    # 蓝图：只有 12 辆车有碎片编号（`(车号+72)*5+4`），`need` = upgrades.txt 的 `BP`。
+    # 374/379/439 的 NameId 被 RedLynx 复制粘贴写成了 Tango 的 Redlynx 涂装名 ⇒ 名字另挑。
+    blueprints, bp_have, bp_miss = load_blueprints(
+        allnodes, bike_names(args.packout), blueprint_needs(args.packout), en, cn)
+    for iid, bp in sorted(blueprints.items(), key=lambda kv: kv[1]["id"]):
+        it = items.get(iid)
+        if it is None:
+            items[iid] = bp
+            cats["blueprint"] += 1
+            continue
+        if it["cat"] != "blueprint":
+            cats[it["cat"]] -= 1
+            cats["blueprint"] += 1
+        if bp["en"] != it["en"]:                     # 旧名（Redlynx 涂装）留证并改用规范名
+            it["alias"] = it["en"] or it["cn"]
+            it["en"], it["cn"], it["key"] = bp["en"], bp["cn"] or bp["en"], bp["key"]
+            it["verified"] = bp["verified"]
+        it["cat"] = "blueprint"
+        it["bike"], it["bike_en"] = bp["bike"], bp["bike_en"]
+        if bp.get("need"):
+            it["need"] = bp["need"]
 
     # 服装：80 套 × 3 件。部件 id 有整整一半从没在任何配置里出现过（隐藏套装），
     # 只能按 customization.txt 的公式补出来；id 与别的名字空间撞车时（19 个 id 同时是
@@ -374,6 +520,8 @@ def main():
         "source": {"packout": os.path.basename(args.packout),
                    "en": "1516", "cn": "1523",
                    "items": len(items), "outfits": len(outfits), "paints": len(paints),
+                   "blueprints": len(blueprints),
+                   "blueprint_bikes": bp_have, "no_blueprint_bikes": bp_miss,
                    "overlap_ids": overlap, "skipped_files": bad},
         "categories": [
             {"key": "currency", "en": "Currency", "cn": "货币"},
@@ -396,10 +544,12 @@ def main():
     bonus = sum(1 for o in outfits.values() if o["bonus"])
     print("写入 %s：%d 条物品（有英文名 %d）+ %d 套服装（%d 套有套装效果，隐藏 %d）"
           "+ %d 款涂装（%d 款有官方中文名，%d 辆车）"
+          "+ %d 个蓝图（%d 辆车有碎片编号，另外 %d 辆车只能金币买）"
           % (args.out, len(items), named, len(outfits), bonus,
              sum(1 for o in outfits.values() if o["hidden"]),
              len(paints), sum(1 for p in paints.values() if p["verified"]),
-             len({p["bike"] for p in paints.values()})))
+             len({p["bike"] for p in paints.values()}),
+             len(blueprints), len(bp_have), len(bp_miss)))
     print("分类 %s；%d 个配置解析失败；%d 个 id 与赛道解锁撞车（已按服装归类）"
           % (dict(cats), len(bad), len(overlap)))
     for b in bad[:5]:

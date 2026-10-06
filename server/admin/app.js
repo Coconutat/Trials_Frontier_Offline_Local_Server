@@ -646,8 +646,9 @@ async function catalog() {
 function itemName(it) { return (LANG === 'cn' ? it.cn : it.en) || it.en || ('#' + it.id); }
 function catLabel(c) { return (LANG === 'cn' ? c.cn : c.en) || c.key; }
 
-// 真机存档里这两类是 0/1 标志（225=1、414=0），不是计数器 ⇒ 只能「解锁」，不给数量。
-const FLAG_CATS = { outfit: 1, blueprint: 1 };
+// 真机存档里服装部件是 0/1 标志（225=1），不是计数器 ⇒ 只能「解锁」，不给数量。
+// ★ 蓝图**不是**标志：真机档里 379=7 片、404=3 片、429=1004，是碎片计数器 ⇒ 必须有数量框。
+const FLAG_CATS = { outfit: 1 };
 
 // 折叠清单：分类 → 打勾 → 填数量。勾选/展开/搜索只改 DOM，不重渲染 —— 四百条物品
 // 重渲染一次既会闪，也会把正在输入的数量框焦点弄丢。
@@ -774,6 +775,46 @@ function itemPicker(cat, cur) {
             : el('span', { class: 'hint', text: t('grant.list.unlock') }));
   };
 
+  // 蓝图是**碎片计数器**：一辆车一个编号（`(车号+72)*5+4`），每辆车要的片数不同
+  // （upgrades.txt 的 `BP`：Tango 4、Bronco 20、KTM 450 RALLY 30、Stallion 50…），
+  // 所以按车列一行、带数量框。19 辆车里只有 12 辆有碎片编号，其余 7 辆只能金币买。
+  const bpItems = Object.keys(cat.items).map(k => cat.items[k])
+    .filter(it => it.cat === 'blueprint').sort((a, b) => a.bike - b.bike);
+
+  const bpRow = it => {
+    const name = itemName(it);
+    const own = Number(cur[it.id]) || 0;
+    const need = Number(it.need) || 0;
+    const box = el('input', { type: 'checkbox', class: 'tick' });
+    const qty = el('input', { type: 'number', min: '0', step: '1', class: 'qty',
+                              placeholder: '1', disabled: true, 'aria-label': t('grant.amount') });
+    box.checked = it.id in state.itemSel;
+    if (box.checked) { qty.value = String(state.itemSel[it.id]); qty.disabled = false; }
+    box.onchange = () => {
+      qty.disabled = !box.checked;
+      if (box.checked) {
+        // 默认填「还差几片」——勾一下就能凑齐，不用自己算。
+        if (!qty.value) qty.value = String(Math.max(need - own, 1));
+        state.itemSel[it.id] = Number(qty.value) || 0;
+      } else delete state.itemSel[it.id];
+      refresh();
+    };
+    qty.oninput = () => { if (box.checked) state.itemSel[it.id] = Number(qty.value) || 0; };
+    const note = el('span', { class: 'setnote' });
+    if (it.bike_en) note.append(el('span', { class: 'hint', text: it.bike_en }));
+    if (need) note.append(el('span', { class: 'hint', text: t('grant.list.bpNeed', { n: need }) }));
+    // 374/379/439 的官方名被 RedLynx 复制粘贴成了 Tango 的 Redlynx 涂装名，旧名留在这里。
+    if (it.alias) note.append(el('span', { class: 'hint', text: it.alias }));
+    if (!it.verified) note.append(el('span', { class: 'hint', text: t('grant.list.noloc') }));
+    note.append(el('span', { class: 'hint', text: t('grant.list.bpOwned', { n: own, m: need }) }));
+    const q = [name, it.id, it.bike_en, it.need, it.alias].join(' ').toLowerCase();
+    return el('div', { class: 'irow setrow', dataset: { q } },
+      el('label', { class: 'ibox' }, box),
+      el('span', { class: 'iname' }, el('span', { class: 'setname', text: name }), note),
+      el('span', { class: 'hint mono', text: '#' + it.id }),
+      qty);
+  };
+
   // 一辆车一组（嵌套折叠）：108 款摊平了没法看，而位掩码本来就是按车分的。
   const bikeGroup = (g, i) => {
     const own = g.rows.filter(isOwned).length;
@@ -819,6 +860,21 @@ function itemPicker(cat, cur) {
       bikeGroups.forEach((bg, i) => body.append(bikeGroup(bg, i)));
       const h = head(g.meta.key, t('grant.list.paintCard'), paints.length,
                      !!state.itemOpen[g.meta.key]);
+      const acc = el('div', { class: 'acc' + (state.itemOpen[g.meta.key] ? ' open' : '') }, h.btn, body);
+      h.btn.addEventListener('click', () => {
+        const on = acc.classList.toggle('open');
+        state.itemOpen[g.meta.key] = on;
+        h.btn.setAttribute('aria-expanded', String(on));
+      });
+      accs[g.meta.key] = { acc, badge: h.badge, body };
+      root.append(acc);
+      continue;
+    }
+    if (g.meta.key === 'blueprint' && bpItems.length) {
+      body.append(el('p', { class: 'hint', text: t('grant.list.bpHint',
+        { names: ((cat.source || {}).no_blueprint_bikes || []).join(' / ') }) }));
+      for (const it of bpItems) body.append(bpRow(it));
+      const h = head(g.meta.key, catLabel(g.meta), bpItems.length, !!state.itemOpen[g.meta.key]);
       const acc = el('div', { class: 'acc' + (state.itemOpen[g.meta.key] ? ' open' : '') }, h.btn, body);
       h.btn.addEventListener('click', () => {
         const on = acc.classList.toggle('open');

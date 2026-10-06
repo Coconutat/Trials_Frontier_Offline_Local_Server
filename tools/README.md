@@ -372,6 +372,8 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
   **在真机上确认过**」——只剩赛道（Type 1/3）是 `false`，后台会给它挂「未验证」警告。
   改判定就改脚本里的 `category()`。★ 涂装（Type 2）**不再是条目**：它不走 `items2` 的键
   （见下），混在物品里发下去会写到零件计数上，所以 `category()` 里那条分支已删。
+  蓝图是个例外：它的存档写法同样是确认过的，但 `verified` 取的是「**有没有官方文案**」
+  （Tango / Bronco / Berserker 三辆没有，界面显示「无官方名」）。
 * **服装 ← `/conf/customization.txt`**（`0007_*.bin`，脚本按内容找、不认文件名哈希）：`Rider` 数组
   80 条，每条 `NameStringId = OUTFIT_%02d_NAME`、`BonusPowerDescriptionStringId = OUTFIT_%02d_POWER`。
   **套装部件 id = `ItemType * 5 + tier`**（tier 0/1/2 = 头盔 / 上衣 / 裤装）；
@@ -396,15 +398,37 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
   所以 `paints` 段的字段是 `{id,bike,bike_en,slot,key,bit,name,nameid,en,cn,verified,comment,
   [diamond],[mission_unlock]}`，`key = 664 + bike`、`bit = 1 << slot`；后台按「车」分组列，
   勾一款 = 给那一位置 1（`tflocal_accounts._paint_value()`）。
+* **蓝图 ← `/conf/upgrades.txt`**（脚本按内容找 `"Upgrades"` + `"BP"`）：`Upgrades` 每条
+  `{ID, N, F, S, BP, …}`，**`BP` = 这辆车的蓝图碎片需求量**（Tango 4、Bronco 20、KTM 450 RALLY 30、
+  Stallion 50…），与官方文案里 7 处 "Collect N to build" 逐条吻合。
+  ★★ 蓝图是**碎片计数器**（真机档里 379 = 7 片、404 = 3 片、429 = 1004 片），编号
+  `id = (车号 + 72) * 5 + 4`；反汇编印证：`MenuzComponentGarageBike::hadleBlueprintPurchase()`
+  @`0x00663110` 里 `bikeID + 0x48` → `×5` → `+4` 后调 `PlayerItems::add(..., 1, ...)`，
+  `MenuzBlueprintRenderer::init()` @`0x007c3060` 用 `BikeUpgrade::getUpgradeID(bikeID, 4)` 读已拥有、
+  车记录 `[+0x58]` 读需求量，`blueprintComplete()` @`0x007c4e5c` 比两者是否相等。
+  19 辆车里只有 12 辆有碎片编号，另外 7 辆（Armadillo / Jackal / Mantis / Marauder / Riptide /
+  Phantom / Moonrover）在任何配置里都不出现（只能金币买，编号 369/384/389/394/399/409/424），
+  `source.no_blueprint_bikes` 记着它们。
+  `blueprints` 段字段 `{id,cat,t,en,cn,key,verified,bike,bike_en,[need],[alias]}`；
+  374/379/439 的官方名被 RedLynx 写成了 Tango 的 Redlynx 涂装名，脚本换成规范名、旧名留在 `alias`。
+  ★ 紧凑形式 `{IID,IL,IC}` 只有**蓝图这一族**验证过 `平面编号 = IID * 5 + IL`：赛道（`IID 170`）
+  用 `IC` 装赛道 id、涂装（`IID 133/134/136`）用 `IC` 装涂装序号、零件礼包（`IID 70`）用 `IC`
+  装零件号 —— 一律按公式硬算会造出 851、350 这类**不存在**的编号（试过，目录立刻多出 25 条垃圾），
+  所以 `walk_itemids()` 的紧凑分支只收 `blueprint_bike(IID * 5 + IL)` 为真的节点。
 * `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
   所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试（最多 16 次，
-  `0010_1854657d.bin` 需要 12 次）。**现在 0 个文件解析失败**，`source.skipped_files` 是空表。
+  `0010_1854657d.bin` 需要 12 次）。**还有 3 个文件解析不了**，如实记进 `source.skipped_files`：
+  `0005_c40462b7.bin` 是 `"I": 01`（前导零的非法数字，插逗号救不了，Crafting 表）、
+  `0040_2ad9129d.bin`（`StoreCategories`，带 `Price:[{PH,PS}]`）与 `0050_fae155bb.bin`（`XpConf`）
+  都在**补了尾逗号之后**又报 `Expecting ',' delimiter`（重试守卫只认这一种报错）。这 3 个文件在
+  本轮之前从来没被读过，所以不算回归；要修就修加载器，与目录本身无关。
 
 **金票（135）被显式跳过**：它不在存档 `items2` 里，走 `server/data/pvp_state.json`。
 
-生成的 `server/admin/items.json`（477 条物品 + 80 套服装 + 108 款涂装）同时被四处消费：后台的
-折叠清单、`tflocal_accounts.grantable_items()`、`tflocal_accounts.grantable_paints()`（可下发集合）、
-`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints`（形状与公式自检）。
+生成的 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图）同时被五处消费：
+后台的折叠清单、`tflocal_accounts.grantable_items()`、`tflocal_accounts.grantable_paints()`
+（可下发集合）、`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints` / `::Blueprints`
+（形状与公式自检）。
 **改了物品表 / 套装表 / 车表就重跑它。**
 
 ---
