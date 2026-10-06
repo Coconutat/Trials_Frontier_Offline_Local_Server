@@ -146,8 +146,17 @@
   所以换赛道前先看这两个数，或者先让玩家在这条赛道上跑一圈。
 
 - **对局时长（match duration）**
-  碉堡的一局长度（`matchmaking.match_duration_seconds`，同时当 `total_time` 与 `ranked_match_duration` 用）。
-  只影响**新开的局**；与「单条赛道时限」不是一回事（后者在客户端原表）。
+  碉堡的一局长度（`matchmaking.match_duration_seconds`，同时当 `total_time` 与 `ranked_match_duration` 用；
+  好友局另有 `matchmaking.friendly_match_duration`）。只影响**新开的局**；与「单条赛道时限」不是一回事
+  （后者在客户端原表）。到点后客户端的下一次 `/start_race` 会吃 409 `match-ended`，它据此收局 ——
+  ★ 所以**时长就是「突然结束」的第一嫌疑**：碉堡屏给这个字段配了四个预设（5 分钟 / 30 分钟 / 1 小时 /
+  还原 6 小时）+ 数字框随便填，现状卡还有一条「300 秒 = 测试值」的红字警告。
+
+- **对局胜负（占得多就赢）**
+  `_pvp_match_won`：**占住的赛道比对手多**就算赢，`1:0` 与 `2:1` 都算，`0:0`（谁都没跑出成绩）是平局
+  ⇒ 不写 `last_match_winner`、段位与连胜不动。判定口径与客户端屏幕完全同一套：逐赛道比 score
+  （`_pvp_owner_of` ↔ `parseMatch` 0x4fe0dc）。2026-10-06 之前是「3 条里占住 ≥2 条」，在「到点被
+  截断、只跑完 1 条」的真机局里会算出平局而与屏幕（判胜利）打架 —— 见 `[pvp] close …` 那行日志。
 
 - **车辆级别（tier）与图的车辆级别（`B`）**
   每辆车在原表 `/conf/bikes.txt` 里有 `Tier`（0 / 1 / 2，**255 = 不限**）；每张图在
