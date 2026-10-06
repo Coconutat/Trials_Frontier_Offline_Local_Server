@@ -589,6 +589,9 @@ table.list.compact td { padding: 7px 14px; }
 .rwnum { width: 100%; text-align: right; font-variant-numeric: tabular-nums; }
 .rwspwrap { display: flex; align-items: center; gap: 8px; }
 .rwsp { flex: 1 1 auto; min-width: 88px; }
+/* 客户端不认识的 RewardID：服务端会拒绝保存，这里先当场标红（它会发成毛驴轮胎）。 */
+.rwsp.bad { border-color: color-mix(in srgb, var(--danger) 60%, transparent); }
+.hint.bad { color: color-mix(in srgb, var(--danger) 82%, var(--text)); }
 @media (max-width: 700px) {
   .rwrow { grid-template-columns: 72px 1fr 1fr; }
   .rwspwrap { grid-column: 1 / -1; }

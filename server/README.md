@@ -389,7 +389,8 @@ python -m unittest discover -s tests -v
   **蓝图和其余类一样是计数器**（这一条最初写错了，见下面那条）。
   另外两段不参与下发、只喂下拉：`levels`（382 条赛道 → `track_catalog()`，午夜杯的
   `weekly.track_id` 与碉堡的候选/固定赛道都用它）、`rewards`（`/conf/pvp_match_rewards.txt`
-  的 RewardID → 名字 → ItemId，碉堡「赛季奖励」的特殊奖励下拉用它）。
+  的 RewardID → 名字 → ItemId；碉堡「赛季奖励」的下拉**只取其中 `PVPMatchSpecialRewards`
+  那 43 个编号**，见 §7.1 那条）。
 * **服装按「套」列**（`outfits` 段，来自 `/conf/customization.txt`）：勾一套 = 头盔 / 上衣 /
   裤装三件一起解锁（`id = ItemType * 5 + tier`），行上带官方名 + 内部代号 +
   「已拥有 n/3」+ **套装效果文案**（`BonusPower`，集齐即账号级生效，例如 The High Roller
@@ -432,7 +433,12 @@ python -m unittest discover -s tests -v
     `PopupStatePVPXGames::getPVPSeasonName` 只取第一个 `|` 之后的部分 ⇒ 含 `|` 直接 `bad-pipe`。
     **换横幅图必须换 URL**（客户端拿 URL hash 跟 `season_banner%d.bnr` 里的 4 字节比，不符才重下）。
   - **特殊奖励是 RewardID 不是 ItemId**：`item_id 145` 的 `amount` 由客户端的
-    `/conf/pvp_match_rewards.txt` 解释，界面给 304 个候选的下拉 + 允许手填编号。
+    `/conf/pvp_match_rewards.txt` 解释。★★ **只有原表 `PVPMatchSpecialRewards` 里的 43 个编号
+    能用**（`_PVP_SPECIAL_GROUPS` / `_PVP_SPECIAL_IDS`：零件 4 档 + 202 Soylent 涂装 +
+    203 Luchador 涂装 + 220 毛驴图纸），别的编号服务端判 `bad-special:<id>`，界面当场标红。
+    原因：`PVPManager::getSpecialRewardById` 是 **get-or-create**，未知编号会就地插一个空的
+    `WheelReward` ⇒ 玩家看到的是同一个占位物（毛驴轮胎）。喷漆 / 衣服 / 赛道只存在于另一张
+    309 条的轮盘表，**当不了赛季奖励**，要发请走「下发物品」页。
   - **段位名不存在**（客户端 `MenuzComponentPVPRank` 里零次本地化调用、LOCF 里也没有
     `RANK_%d` 键）⇒ 只提供星章表与起始段位，卡里只读说明。
   - **绝不直接编辑 `data/pvp_state.json`**：金票 / 筹码 / 段位 / 星 / 连胜只走 `/__api/admin/*`

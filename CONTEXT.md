@@ -124,6 +124,13 @@
   ⚠ `item_id 145` 的 `amount` 是 `RewardID`（不是库存物品 id、不是数量）；金币/钻石才是真 `item_id`。
   **每局**的金币/钻石/特殊奖励不在服务端，由客户端本地发放。
 
+- **特殊奖励白名单（special reward whitelist）与占位物（placeholder item）**
+  赛季奖励里 `item_id 145` 能填的 `RewardID` **只有 43 个**（原表 `/conf/pvp_match_rewards.txt`
+  的 `PVPMatchSpecialRewards` 7 组：零件 4 档 + `202` Soylent 涂装 + `203` Luchador 涂装 +
+  `220` 毛驴图纸）。客户端查不到别的编号时不会报错，而是**就地插一个空奖励**，
+  玩家看到的永远是同一个**占位物**（实测「毛驴轮胎」）⇒ 服务端直接拒绝白名单外的编号。
+  ★ 喷漆 / 衣服 / 赛道**只能**在「下发物品」页发，它们当不了赛季奖励。
+
 - **对局时长（match duration）**
   碉堡的一局长度（`matchmaking.match_duration_seconds`，同时当 `total_time` 与 `ranked_match_duration` 用）。
   只影响**新开的局**；与「单条赛道时限」不是一回事（后者在客户端原表）。

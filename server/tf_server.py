@@ -2708,6 +2708,10 @@ def _param_message(err):
                 "收到的是 %s" % err.split(":", 1)[1])
     if err.startswith("dup-special:"):
         return "第 %s 名的特殊奖励写了两遍（客户端会发两次，请删掉一条）" % err.split(":", 1)[1]
+    if err.startswith("bad-special:"):
+        return ("特殊奖励编号 %s 客户端不认识，会发成一个占位物（毛驴轮胎）。"
+                "赛季特殊奖励只能填 %d 个编号：零件 4 档、两款涂装（202 Soylent / 203 Luchador）、"
+                "毛驴图纸（220）" % (err.split(":", 1)[1], len(_PVP_SPECIAL_IDS)))
     return {"bad-request": "请求不合法",
             "bad-page": "没有这一页",
             "bad-name": "模板名不能为空或带换行，最长 %d 个字" % _TEMPLATE_NAME_MAX,
@@ -3020,6 +3024,10 @@ def _bunker_rewards_check(raw):
             raise _BadParam("range:season.rewards(名次):0-25")
         if item not in (1, 2, 145):
             raise _BadParam("bad-reward-item:%d" % item)
+        if item == 145 and amt not in _PVP_SPECIAL_IDS:
+            # 见 _PVP_SPECIAL_GROUPS：客户端的赛季特殊奖励只认这 43 个编号，
+            # 别的编号会塌成一个占位物（实测「毛驴轮胎」）。
+            raise _BadParam("bad-special:%d" % amt)
         if not 0 <= amt <= 1000000000:
             raise _BadParam("range:season.rewards(数量):0-1000000000")
         if (rank, item) in acc:
@@ -3101,46 +3109,69 @@ def admin_bunker_apply(fields):
     return {"applied": applied, "values": bunker_values()}, None
 
 
-_BUNKER_CATALOG = {"mtime": None, "rewards": [], "bikes": []}
+_BUNKER_CATALOG = {"mtime": None, "specials": [], "bikes": []}
+
+# 客户端的赛季特殊奖励表：原表 `/conf/pvp_match_rewards.txt` 的 PVPMatchSpecialRewards，
+# 7 组共 43 个编号（名字是组里那个 Comment）。
+# ★ 赛季奖励的 `item_id: 145` **只能填这里面的编号**：
+#   `PVPManager::getSpecialRewardById @0x5e231c` 对未知编号会**就地插一个空的 WheelReward**
+#   （get-or-create，永不返回 null），而唯一往这张表里塞真数据的是
+#   `PVPDataParser::parseMatchSpecialRewards @0x5db0b4`（只读 PVPMatchSpecialRewards）；
+#   于是列表里所有不认识的编号塌成同一行占位物（实测「毛驴轮胎」）。
+#   喷漆/衣服/赛道**不在**这张表里，赛季奖励发不了它们——要发请用「下发物品」页。
+_PVP_SPECIAL_GROUPS = (
+    ("Crafting Item Tier 2", "零件 · 档位 2",
+     (20003, 20008, 20013, 20018, 20023, 20028, 20033, 20038, 20043, 20048)),
+    ("Crafting Item Tier 3", "零件 · 档位 3",
+     (20002, 20007, 20012, 20017, 20022, 20027, 20032, 20037, 20042, 20047)),
+    ("Soylent Bike Skin", "涂装 · Soylent（Tango*）", (202,)),
+    ("Luchador Bikeskin", "涂装 · Luchador（Bronco）", (203,)),
+    ("Donkey Blueprint", "蓝图 · 毛驴图纸", (220,)),
+    ("Crafting Item Tier 4", "零件 · 档位 4",
+     (20001, 20006, 20011, 20016, 20021, 20026, 20031, 20036, 20041, 20046)),
+    ("Crafting Item lvl 5", "零件 · 档位 5",
+     (20000, 20005, 20010, 20015, 20020, 20025, 20030, 20035, 20040, 20045)),
+)
+_PVP_SPECIAL_IDS = frozenset(i for _, _, ids in _PVP_SPECIAL_GROUPS for i in ids)
 
 
 def _bunker_catalogs():
-    """`items.json` 派生的两个下拉：特殊奖励（原表 RewardID）与车辆（`paints[].bike`）。"""
+    """`items.json` 派生的两个下拉：赛季特殊奖励（客户端认的 43 个）与车辆（`paints[].bike`）。"""
     try:
         stamp = os.path.getmtime(_TRACK_CATALOG_PATH)
     except OSError:
         return [], []
     if _BUNKER_CATALOG["mtime"] == stamp:
-        return _BUNKER_CATALOG["rewards"], _BUNKER_CATALOG["bikes"]
-    rewards, bikes = [], {}
+        return _BUNKER_CATALOG["specials"], _BUNKER_CATALOG["bikes"]
+    specials, bikes = [], {}
     try:
         with open(_TRACK_CATALOG_PATH, "r", encoding="utf-8") as fp:
             data = json.load(fp)
+        named = {}
         for raw_id, node in (data.get("rewards") or {}).items():
-            if not isinstance(node, dict):
-                continue
             try:
-                rid = int(raw_id)
+                named[int(raw_id)] = node if isinstance(node, dict) else {}
             except (TypeError, ValueError):
                 continue
-            if node.get("item_id") in (1, 2):
-                continue                    # 金币/钻石条目走「金币」「钻石」两行
-            rewards.append({"id": rid, "name": node.get("name") or "",
-                            "name_cn": node.get("cn") or node.get("name") or "",
-                            "item_id": node.get("item_id"), "cat": node.get("cat") or ""})
+        for group_en, group_cn, ids in _PVP_SPECIAL_GROUPS:
+            for rid in ids:
+                node = named.get(rid) or {}
+                specials.append({"id": rid, "group_en": group_en, "group_cn": group_cn,
+                                 "name": node.get("name") or "",
+                                 "name_cn": node.get("cn") or node.get("name") or "",
+                                 "item_id": node.get("item_id")})
         for node in (data.get("paints") or {}).values():
             if not isinstance(node, dict):
                 continue
             bid, name = node.get("bike"), node.get("bike_en")
             if isinstance(bid, int) and bid > 0 and name and bid not in bikes:
                 bikes[bid] = name
-        rewards.sort(key=lambda r: r["id"])
     except (OSError, ValueError, AttributeError):
         return [], []
     rows = [{"id": bid, "name": bikes[bid]} for bid in sorted(bikes)]
-    if rewards or rows:
-        _BUNKER_CATALOG.update(mtime=stamp, rewards=rewards, bikes=rows)
-    return rewards, rows
+    if specials or rows:
+        _BUNKER_CATALOG.update(mtime=stamp, specials=specials, bikes=rows)
+    return specials, rows
 
 
 def bunker_audit(limit=30):
@@ -3199,14 +3230,14 @@ def admin_bunker_status():
 
 def bunker_payload():
     """碉堡页要的全部只读数据：界面照着它画，不用自己拼默认值。"""
-    rewards, bikes = _bunker_catalogs()
+    specials, bikes = _bunker_catalogs()
     return {"cards": [{"id": c, "cn": cn, "en": en} for c, cn, en in _BUNKER_CARDS],
             "fields": [dict(f, default=_bunker_default(f["key"]), now=_bunker_get(f["key"]))
                        for f in _BUNKER_FIELDS],
             "values": bunker_values(),
             "status": admin_bunker_status(),
             "tracks": track_catalog(),
-            "rewards": rewards,
+            "specials": specials,
             "bikes": bikes,
             "templates": templates_for("bunker").get("bunker", []),
             "audit": bunker_audit(30)}

@@ -1442,7 +1442,7 @@ class Bunker(_ParamOps):
     def test_get_hands_out_every_card_and_field(self):
         """界面要的东西一次给全：8 张卡 + 服务端字段表 + 现状 + 三个目录 + 模板 + 审计。"""
         j = self.bget()
-        for key in ("cards", "fields", "values", "status", "tracks", "rewards", "bikes",
+        for key in ("cards", "fields", "values", "status", "tracks", "specials", "bikes",
                     "templates", "audit"):
             self.assertIn(key, j)
         self.assertEqual([c["id"] for c in j["cards"]], self.CARDS)
@@ -1479,16 +1479,30 @@ class Bunker(_ParamOps):
             self.assertIsInstance(p["this_season"], bool)
 
     def test_catalogs_come_from_the_item_catalog(self):
-        """奖励下拉 = 客户端原表的 RewardID→名字（去掉金币/钻石，它们有专门的框）。"""
+        """特殊奖励下拉 = 客户端原表 `PVPMatchSpecialRewards` 里客户端真认的 43 个编号。
+
+        客户端对未知编号会**就地插一个空 WheelReward**（`PVPManager::getSpecialRewardById
+        @0x5e231c` 是 get-or-create），列表里于是塌成同一个占位物（毛驴轮胎）⇒ 下拉只给
+        原表里这 43 个，别的一律拒绝。
+        """
         j = self.bget()
         self.assertEqual(len(j["tracks"]), len(srv.track_catalog()))
         self.assertTrue(all({"id", "name"} <= set(b) for b in j["bikes"]))
-        cat = [r for r in j["rewards"]]
-        self.assertTrue(len(cat) > 200, "奖励下拉只剩 %d 条" % len(cat))
-        self.assertEqual([r["id"] for r in cat], sorted(r["id"] for r in cat))
-        self.assertNotIn(1, [r["item_id"] for r in cat], "金币不该出现在特殊奖励下拉里")
-        self.assertNotIn(2, [r["item_id"] for r in cat], "钻石不该出现在特殊奖励下拉里")
-        self.assertTrue(all(r["name"] for r in cat))
+        cat = j["specials"]
+        self.assertEqual(len(cat), 43)
+        self.assertEqual(len(srv._PVP_SPECIAL_IDS), 43)
+        # 顺序照原表：按组连续（下拉用 <optgroup> 分组，所以必须是组内连续的）
+        order = [i for _, _, ids in srv._PVP_SPECIAL_GROUPS for i in ids]
+        self.assertEqual([r["id"] for r in cat], order)
+        groups = []
+        for r in cat:
+            if not groups or groups[-1] != (r["group_en"], r["group_cn"]):
+                groups.append((r["group_en"], r["group_cn"]))
+            self.assertTrue(r["name"], "%d 没有名字" % r["id"])
+        self.assertEqual(len(groups), 7, "7 组特殊奖励：零件 4 档 + 两款涂装 + 毛驴图纸")
+        self.assertEqual(len({r["id"] for r in cat}), 43)
+        # 用户报的「加了喷漆结果是毛驴轮胎」：205 这类涂装编号不在原表里
+        self.assertNotIn(205, srv._PVP_SPECIAL_IDS)
 
     def test_status_players_are_read_only(self):
         """现状卡里的玩家档案只是看一眼：不许写配置，也不许在审计里留东西。"""
@@ -1539,6 +1553,13 @@ class Bunker(_ParamOps):
                   "range:season.rewards(名次):0-25"),
                  ({"season.rewards": [{"rank": 1, "item_id": 7, "amount": 1}]},
                   "bad-reward-item:7"),
+                 # 用户报的 bug：喷漆/衣服编号不是赛季特殊奖励，客户端会发成毛驴轮胎
+                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 205}]},
+                  "bad-special:205"),
+                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 257}]},
+                  "bad-special:257"),
+                 ({"season.rewards": [{"rank": 1, "item_id": 145, "amount": 20049}]},
+                  "bad-special:20049"),
                  ({"season.product_list": "nope"}, "bad-products"),
                  ({"matchmaking.enabled": "maybe"}, "bad-value:matchmaking.enabled")]
         for fields, code in cases:
@@ -1577,7 +1598,25 @@ class Bunker(_ParamOps):
         j = self.bset({"season.star_array": [3] * 25 + [9]}).json()
         self.assertEqual(j["values"]["season.star_array"], [3] * 25)
 
+    def test_only_the_specials_the_client_knows_are_accepted(self):
+        """白名单：原表 `PVPMatchSpecialRewards` 那 43 个编号能存，别的必须 400。
+
+        用户实测：填了喷漆/衣服编号（205/257/258/259）后真机上整条奖励轨道都变成毛驴轮胎 ——
+        客户端 `PVPManager::getSpecialRewardById @0x5e231c` 是 get-or-create，未知编号会就地
+        插一个空 WheelReward，所有不认识的编号塌成同一个占位物。
+        """
+        for good in (202, 203, 220, 20000, 20040, 20048):
+            j = self.bset({"season.rewards": [{"rank": 1, "item_id": 145, "amount": good}]}).json()
+            self.assertEqual(j["values"]["season.rewards"],
+                             [{"rank": 1, "item_id": 145, "amount": good}])
+        for bad in (205, 257, 258, 259, 221, 20004, 20049):
+            r = self.bset({"season.rewards": [{"rank": 1, "item_id": 145, "amount": bad}]},
+                          expect=400)
+            self.assertEqual(r.json()["error"], "bad-special:%d" % bad)
+            self.assertIn("毛驴轮胎", r.json()["message"])
+
     def test_track_ids_keep_three_and_dedupe(self):
+
         j = self.bset({"matchmaking.track_ids": [1041, 1041, 1001, 1002, 1003]}).json()
         self.assertEqual(j["values"]["matchmaking.track_ids"], [1041, 1001, 1002])
         self.assertEqual(self.config_file()["matchmaking"]["track_ids"], [1041, 1001, 1002])
