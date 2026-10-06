@@ -657,13 +657,23 @@ function itemPicker(cat, cur) {
                  .filter(it => it.cat === c.key).sort((a, b) => a.id - b.id) }))
     .filter(g => g.items.length);
 
+  // 服装按「套」列，不按件：240 件里 99 件任何配置里都没有（隐藏套装），而且一件件点
+  // 没有意义 —— 套装效果是集齐才生效的。套装表来自 customization.txt（见 build_item_catalog.py）。
+  const sets = Object.keys(cat.outfits || {}).map(k => cat.outfits[k])
+    .sort((a, b) => a.id - b.id);
+  const setOf = id => (cat.items[id] || {}).set;
+
   const root = el('div', { class: 'acclist' });
   const total = el('span', { class: 'hint', text: t('grant.list.selected', { n: 0 }) });
   const empty = el('p', { class: 'hint', hidden: true, text: t('grant.list.empty') });
   const accs = {};
 
-  const selectedIn = key => Object.keys(state.itemSel).filter(id =>
-    cat.items[id] && cat.items[id].cat === key).length;
+  // 勾一件服装 = 勾这一套的三件（头盔/上衣/裤装），所以徽标按「套」数，不按件数。
+  const selectedIn = key => {
+    const ids = Object.keys(state.itemSel).map(Number);
+    if (key === 'outfit') return new Set(ids.map(setOf).filter(Boolean)).size;
+    return ids.filter(id => (cat.items[id] || {}).cat === key).length;
+  };
   const refresh = () => {
     for (const k in accs) {
       const n = selectedIn(k);
@@ -673,14 +683,64 @@ function itemPicker(cat, cur) {
     total.textContent = t('grant.list.selected', { n: Object.keys(state.itemSel).length });
   };
 
+  const head = (key, label, count, open) => {
+    const b = el('span', { class: 'badge sel', hidden: true });
+    const btn = el('button', { type: 'button', class: 'acchead', 'aria-expanded': String(open) },
+      el('span', { class: 'chev' }),
+      el('span', { class: 'grow', text: label }),
+      el('span', { class: 'hint mono', text: String(count) }),
+      b);
+    return { btn, badge: b };
+  };
+
+  // 一套服装一行：勾上就把三件一起写成 1（存档里这三件是 0/1 标志，不能给数量）。
+  const setRow = o => {
+    const name = (LANG === 'cn' ? o.cn : o.en) || o.en || o.key;
+    const own = o.parts.filter(p => Number(cur[p]) > 0).length;
+    const box = el('input', { type: 'checkbox', class: 'tick' });
+    box.checked = o.parts.every(p => p in state.itemSel);
+    box.onchange = () => {
+      for (const p of o.parts) {
+        if (box.checked) state.itemSel[p] = 1; else delete state.itemSel[p];
+      }
+      refresh();
+    };
+    const note = el('span', { class: 'setnote' });
+    if (o.hidden) note.append(el('span', { class: 'pill', text: t('grant.list.hidden') }));
+    // 官方中文名有时跟内部代号差很多（The High Roller 官方中文叫「摩天轮」），两个都给。
+    if (o.comment && o.comment !== name) note.append(el('span', { class: 'hint', text: o.comment }));
+    if (o.bonus) note.append(el('span', { class: 'bonust',
+      text: (LANG === 'cn' ? o.bonus_cn : o.bonus_en) || o.bonus }));
+    note.append(el('span', { class: 'hint', text: t('grant.list.setOwned', { n: own }) }));
+    const q = [name, o.parts.join(' '), o.comment, o.bonus_en, o.bonus_cn].join(' ').toLowerCase();
+    return el('div', { class: 'irow setrow', dataset: { q } },
+      el('label', { class: 'ibox' }, box),
+      el('span', { class: 'iname' }, el('span', { class: 'setname', text: name }), note),
+      el('span', { class: 'hint mono', text: '#' + o.parts.join(' ') }),
+      el('span', { class: 'hint', text: t('grant.list.unlock') }));
+  };
+
   for (const g of groups) {
     const flag = !!FLAG_CATS[g.meta.key];
     // 「未验证」是按物品带的（存档里真的没确认过怎么写），不是按分类配的：
     // 一个类里只要有一条没验证过就提醒，别拿 meta.verified 判断（categories 里没这个字段，
     // 用它会变成「每个类都挂警告」）。
     const unverified = g.items.some(it => !it.verified);
-    const badge = el('span', { class: 'badge sel', hidden: true });
     const body = el('div', { class: 'accbody' });
+    if (g.meta.key === 'outfit' && sets.length) {
+      body.append(el('p', { class: 'hint p-warn', text: t('grant.list.derived') }));
+      for (const o of sets) body.append(setRow(o));
+      const h = head(g.meta.key, catLabel(g.meta), sets.length, !!state.itemOpen[g.meta.key]);
+      const acc = el('div', { class: 'acc' + (state.itemOpen[g.meta.key] ? ' open' : '') }, h.btn, body);
+      h.btn.addEventListener('click', () => {
+        const on = acc.classList.toggle('open');
+        state.itemOpen[g.meta.key] = on;
+        h.btn.setAttribute('aria-expanded', String(on));
+      });
+      accs[g.meta.key] = { acc, badge: h.badge, body };
+      root.append(acc);
+      continue;
+    }
     if (unverified) body.append(el('p', { class: 'hint p-warn', text: t('grant.list.unverified') }));
     for (const it of g.items) {
       const box = el('input', { type: 'checkbox', class: 'tick' });
@@ -704,19 +764,14 @@ function itemPicker(cat, cur) {
         el('span', { class: 'ibal', text: cur[it.id] == null ? '—' : fmtNum(cur[it.id]) }),
         flag ? el('span', { class: 'hint', text: t('grant.list.unlock') }) : qty));
     }
-    const open = !!state.itemOpen[g.meta.key];
-    const head = el('button', { type: 'button', class: 'acchead', 'aria-expanded': String(open) },
-      el('span', { class: 'chev' }),
-      el('span', { class: 'grow', text: catLabel(g.meta) }),
-      el('span', { class: 'hint mono', text: String(g.items.length) }),
-      badge);
-    const acc = el('div', { class: 'acc' + (open ? ' open' : '') }, head, body);
-    head.addEventListener('click', () => {
+    const h = head(g.meta.key, catLabel(g.meta), g.items.length, !!state.itemOpen[g.meta.key]);
+    const acc = el('div', { class: 'acc' + (state.itemOpen[g.meta.key] ? ' open' : '') }, h.btn, body);
+    h.btn.addEventListener('click', () => {
       const on = acc.classList.toggle('open');
       state.itemOpen[g.meta.key] = on;
-      head.setAttribute('aria-expanded', String(on));
+      h.btn.setAttribute('aria-expanded', String(on));
     });
-    accs[g.meta.key] = { acc, badge, body };
+    accs[g.meta.key] = { acc, badge: h.badge, body };
     root.append(acc);
   }
 

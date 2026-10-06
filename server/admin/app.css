@@ -393,6 +393,18 @@ table.list.compact td { padding: 7px 14px; }
 .irow .ibal { text-align: right; color: var(--text-2); font-variant-numeric: tabular-nums; font-size: 12.5px; }
 .irow .qty { width: 88px; padding: 5px 8px; text-align: right; }
 .irow .qty:disabled { opacity: .4; }
+/* 服装：一套一行 —— 名称下面挂一行小字（隐藏标记 / 套装效果 / 已拥有 n/3），
+   右边是「解锁」而不是数量框（存档里三件都是 0/1 标志）。 */
+.irow.setrow { grid-template-columns: 26px 1fr auto auto; align-items: start; padding: 9px 0; }
+.irow.setrow .ibox { padding-top: 2px; }
+.irow.setrow .iname { white-space: normal; overflow: visible; }
+.irow .setname { display: block; }
+.irow .setnote { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 3px; }
+.irow .setnote .bonust { flex: 1 1 100%; color: var(--text-2); font-size: 12px; }
+.irow .pill {
+  padding: 1px 7px; border-radius: 999px; font-size: 11px; line-height: 1.6;
+  background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text);
+}
 @media (max-width: 760px) {
   .irow { grid-template-columns: 26px 1fr 88px; }
   .irow .ibal, .irow .mono { display: none; }

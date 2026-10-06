@@ -850,9 +850,11 @@ class ItemCatalog(Base):
 
     def test_shape_and_count_agree(self):
         c = self.cat
-        self.assertEqual(sorted(c), ["categories", "items", "source"])
+        self.assertEqual(sorted(c), ["categories", "items", "outfits", "source"])
         self.assertEqual(c["source"]["items"], len(c["items"]),
                          "source.items 与实际条数不一致（重新跑 tools/build_item_catalog.py）")
+        self.assertEqual(c["source"]["outfits"], len(c["outfits"]),
+                         "source.outfits 与实际套数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertTrue(c["source"]["en"] and c["source"]["cn"], "没记本地化表来源")
         self.assertGreater(len(c["items"]), 300)
 
@@ -896,6 +898,86 @@ class ItemCatalog(Base):
         # 金票(135)走 pvp_state.json，不进存档 items2 —— 出现在这里会被误当成存档物品下发。
         self.assertNotIn(135, (int(k) for k in self.cat["items"]),
                          "金票不该出现在存档物品目录里")
+
+
+class OutfitSets(Base):
+    """服装按「套」下发：勾一套 = 头盔/上衣/裤装三件（`id = ItemType*5 + tier`）。
+
+    240 件里多数在任何配置里都不出现（隐藏/未上架），只能从游戏自带的套装表推出来，
+    所以这里钉的是「推导规则本身」——规则错了，写进存档的就是一堆别的物品的编号。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cat = json.loads((ADMIN_DIR / "items.json").read_text(encoding="utf-8"))
+        cls.sets = cls.cat["outfits"]
+        cls.items = cls.cat["items"]
+
+    def test_parts_follow_the_formula(self):
+        self.assertEqual(len(self.sets), 80, "套装表条数变了（customization.txt 里是 80 套）")
+        seen = set()
+        for k, o in self.sets.items():
+            self.assertEqual(o["parts"], [o["type"] * 5, o["type"] * 5 + 1, o["type"] * 5 + 2], k)
+            self.assertIn(o["type_src"], ("ItemType", "40+ID"), k)
+            for tier, pid in enumerate(o["parts"]):
+                self.assertNotIn(pid, seen, "同一个编号被两套用了：%d" % pid)
+                seen.add(pid)
+                it = self.items[str(pid)]
+                self.assertEqual(it["cat"], "outfit", str(pid))
+                self.assertEqual(it["set"], k, str(pid))
+                self.assertEqual(it["part"], tier, str(pid))
+        self.assertEqual(len(seen), 240, "80 套 × 3 件应该是 240 个编号")
+
+    def test_high_roller_is_the_unlimited_fuel_set(self):
+        """用户点名的那套：集齐 = 无限汽油（服务端只负责把这 3 件写进存档）。"""
+        hr = [o for o in self.sets.values() if "High Roller" in (o["en"] or "")]
+        self.assertEqual(len(hr), 1, "找不到 The High Roller")
+        o = hr[0]
+        self.assertEqual(o["parts"], [740, 741, 742])
+        self.assertTrue(o["hidden"], "High Roller 没上架过，应该是隐藏套装")
+        self.assertIn("MULTIPLY_FUEL_REFILL_TIME", o["bonus"])
+        self.assertIn("无限汽油", o["bonus_cn"])
+        self.assertIn("Unlimited fuel", o["bonus_en"])
+
+    def test_old_sets_without_itemtype_use_40_plus_id(self):
+        """ID 0–19 那批记录里没有 ItemType 字段，type = 40 + Rider ID（部件名反查验证过）。"""
+        eg = [o for o in self.sets.values() if "Eggman" in (o["en"] or "")]
+        self.assertEqual(len(eg), 1)
+        o = eg[0]
+        self.assertEqual((o["type"], o["type_src"], o["parts"]), (57, "40+ID", [285, 286, 287]))
+        self.assertEqual(o["part_names"]["285"],
+                         ["The Eggman Helmet Piece", "艾格曼头盔"], "官方部件名没读上")
+
+    def test_hidden_sets_and_bonus_coverage(self):
+        hidden = [o for o in self.sets.values() if o["hidden"]]
+        bonus = [o for o in self.sets.values() if o["bonus"]]
+        self.assertEqual(len(hidden), 46, "UnlockType 全是 4 的套数变了")
+        self.assertGreaterEqual(len(bonus), 20, "有套装效果的套数掉了")
+        for o in bonus:
+            self.assertTrue(o["bonus_en"] and o["bonus_cn"], "套装效果没有中英文案：" + o["key"])
+        for o in hidden:
+            self.assertEqual(o["unlock"], [4, 4, 4], "隐藏套装的 UnlockType 变了：" + o["key"])
+
+    def test_namespace_collisions_are_recorded_and_given_to_outfits(self):
+        """19 个编号同时是某个「赛道解锁」条目 —— 以服装为准，旧名字留在 source 里。"""
+        bad = self.cat["source"]["overlap_ids"]
+        self.assertEqual(len(bad), 19)
+        for r in bad:
+            self.assertEqual(r["was"], "track")
+            self.assertTrue(r["alias"], "撞车的旧名字没留证")
+            self.assertEqual(self.items[str(r["id"])]["cat"], "outfit")
+            self.assertEqual(self.items[str(r["id"])]["alias"], r["alias"])
+        by_cat = {}
+        for it in self.items.values():
+            by_cat[it["cat"]] = by_cat.get(it["cat"], 0) + 1
+        self.assertEqual(by_cat["outfit"], 240, "服装类应该正好等于全部部件")
+        self.assertEqual(by_cat["track"], 152, "赛道解锁条目里有 19 个判给服装了")
+
+    def test_every_part_is_grantable(self):
+        ids = {int(k) for k in self.items}
+        for o in self.sets.values():
+            for pid in o["parts"]:
+                self.assertIn(pid, ids, "部件不在目录里，下发给它会 not-grantable")
 
 
 # ---------------------------------------------------------------- 文案

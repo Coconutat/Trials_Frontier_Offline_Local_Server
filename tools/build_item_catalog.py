@@ -29,6 +29,22 @@ r"""把游戏自带的物品目录抽成后台能用的清单：server/admin/ite
   * 涂装(type 2) / 赛道(type 1) / 赛道碎片(type 3)：**存档里没找到可信的写法**，
     而且涂装的 id（3–107）与零件 id（5–54）挤在同一个 items2 键空间里，
     按 id 下发给谁看都分不清 ⇒ 标 verified=false，界面上如实说「不保证生效」。
+
+★ 服装（`outfits`）另有一条来源，因为**整整一半的套装部件从来没在任何配置里出现过**
+（隐藏/未上架的套装：High Roller、Henchman Black、Polar Vortex …），奖励表里挖不到：
+
+  * `/conf/customization.txt`（`0007_*`）一条 Rider = 一整套，字段里有官方名
+    (`NameStringId` = `OUTFIT_%02d_NAME`)、描述、**套装效果** `BonusPower` +
+    `BonusPowerDescriptionStringId` = `OUTFIT_%02d_POWER`、`UnlockType`、`ItemType`。
+  * **部件 id = `ItemType * 5 + tier`，tier 0/1/2 = 头盔 / 上衣 / 裤装**。部件名的 LOCF 键就是
+    `ITEM_<ItemType>_<tier>`（`ITEM_111_0` = "Arctic Explorer Helmet Piece"/北极探险家头盔），
+    但只有极少数套装给部件单独起过名，其余部件显示的就是套装名。
+  * 最早那批套装（Rider ID 0–19：Survivor / Stuntman / Samsarian / Rebel / Priest …）的记录里
+    **没有 `ItemType` 字段**，它们的 type = `40 + Rider ID`（DOGFIGHTER ID 1 → 41 → 205/206/207、
+    Eggman ID 17 → 57 → 285/286/287，而 `ITEM_57_*` 的官方部件名正是 "The Eggman … Piece"；
+    真机存档里 200-202 / 215-217 / 250-252 … 这些块也都确实存在）⇒ 80 套全部能定位。
+  * 名称空间有重叠（`ItemId` 只在同一个 Type 内唯一：635 = 消耗品 "Super Magnet"，
+    同时又是 type 127 的 tier 0），所以**只能按「套」下发**，不能靠 id 区间猜类别。
 """
 import argparse
 import collections
@@ -106,6 +122,60 @@ def load_json_tolerant(raw):
 
 # 货币的名字：官方商店条目里给的是「大型金币包」这种礼包名，这里用最直白的叫法。
 NAME_OVERRIDE = {1: ("Coins", "金币"), 2: ("Gems", "钻石")}
+
+# 最早那批套装（Rider ID 0–19）的记录里没有 ItemType 字段，type 恰好是 40 + Rider ID。
+OLD_OUTFIT_TYPE_BASE = 40
+
+
+def find_customization(packout):
+    """按内容找 /conf/customization.txt（不认文件名哈希，那是构建期随机串）。"""
+    for p in sorted(glob.glob(os.path.join(packout, "*.bin"))):
+        raw = open(p, "rb").read()
+        if b'"NameStringId"' in raw and b'"Rider"' in raw:
+            return p
+    return None
+
+
+def load_outfits(packout, en, cn):
+    """→ {setKey: {...}}；setKey = "OUTFIT_34#116"（黑/橙两套共用同一个 OUTFIT 名）。"""
+    path = find_customization(packout)
+    if not path:
+        return {}
+    doc = load_json_tolerant(open(path, "rb").read()) or {}
+    loc = lambda key: (en.get(gh(key), ""), cn.get(gh(key), ""))
+    out = {}
+    for r in doc.get("Rider") or []:
+        oid = r.get("NameStringId") or ""
+        m = re.fullmatch(r"OUTFIT_(\d+)_NAME", oid)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        typ, src = r.get("ItemType"), "ItemType"
+        if not isinstance(typ, int):
+            typ, src = OLD_OUTFIT_TYPE_BASE + int(r.get("ID") or 0), "40+ID"
+        e, c = loc(oid)
+        de, dc = loc("OUTFIT_%02d_DESCRIPTION" % idx)
+        pe, pc = loc("OUTFIT_%02d_POWER" % idx)
+        parts = [typ * 5 + k for k in range(3)]
+        pnames = {str(parts[k]): loc("ITEM_%d_%d" % (typ, k)) for k in range(3)}
+        ut = r.get("UnlockType")
+        out["%s#%d" % (oid, typ)] = {
+            "key": oid, "id": int(r.get("ID") or 0), "idx": idx,
+            "en": e, "cn": c, "comment": (r.get("Comment") or "").strip(),
+            "desc_en": de, "desc_cn": dc,
+            "bonus": (r.get("BonusPower") or "").strip(),
+            "bonus_en": pe, "bonus_cn": pc,
+            "type": typ, "type_src": src, "parts": parts, "part_names": pnames,
+            "unlock": ut, "hidden": bool(ut) and all(x == 4 for x in ut),
+        }
+    # 同一个官方名对应两套（Henchman Uniform 黑/橙）时，用 Comment 的尾巴区分开。
+    dup = collections.Counter(o["en"] for o in out.values() if o["en"])
+    for o in out.values():
+        if o["en"] and dup[o["en"]] > 1 and o["comment"].lower().startswith(o["en"].lower()):
+            tail = o["comment"][len(o["en"]):].strip()
+            if tail:
+                o["en"], o["cn"] = "%s (%s)" % (o["en"], tail), "%s（%s）" % (o["cn"], tail)
+    return out
 
 
 def walk_itemids(node, out):
@@ -185,11 +255,46 @@ def main():
             "key": key, "verified": verified,
         }
 
+    # 服装：80 套 × 3 件。部件 id 有整整一半从没在任何配置里出现过（隐藏套装），
+    # 只能按 customization.txt 的公式补出来；id 与别的名字空间撞车时（19 个 id 同时是
+    # 某个「赛道解锁」条目）以服装为准，旧名字收进 alias 留证。
+    outfits = load_outfits(args.packout, en, cn)
+    overlap = []
+    for sk, o in sorted(outfits.items(), key=lambda kv: kv[1]["id"]):
+        o["set"] = sk
+        for k, pid in enumerate(o["parts"]):
+            ne, nc = o["part_names"].get(str(pid), ("", ""))
+            it = items.get(str(pid))
+            if it is None:
+                items[str(pid)] = {
+                    "id": pid, "cat": "outfit", "t": 0, "set": sk, "part": k,
+                    "en": ne or o["en"], "cn": nc or o["cn"] or o["en"],
+                    "key": ("ITEM_%d_%d" % (o["type"], k)) if (ne or nc) else o["key"],
+                    "verified": False, "derived": True,
+                }
+                cats["outfit"] += 1
+                continue
+            if it["cat"] != "outfit":
+                old = it["en"] or it["cn"]
+                overlap.append({"id": pid, "was": it["cat"], "alias": old})
+                it["alias"] = old
+                cats[it["cat"]] -= 1
+                cats["outfit"] += 1
+            it["cat"], it["set"], it["part"] = "outfit", sk, k
+            if ne:
+                it["en"], it["cn"], it["key"] = ne, nc or ne, "ITEM_%d_%d" % (o["type"], k)
+            elif "alias" in it:
+                # 撞车改名后没有官方部件名 ⇒ 显示套装名，旧名字留在 alias 里。
+                it["en"], it["cn"] = o["en"], o["cn"] or o["en"]
+        # 这一套里有几件是从套装表推导出来的（隐藏套装在任何配置里都没有这些 id）。
+        o["derived"] = sum(1 for p in o["parts"] if items[str(p)].get("derived"))
+
     # 赛道碎片 id 与「赛道」同族，合到一张卡里给运维看，别单开一类天天被点错。
     out = {
         "source": {"packout": os.path.basename(args.packout),
                    "en": "1516", "cn": "1523",
-                   "items": len(items), "skipped_files": bad},
+                   "items": len(items), "outfits": len(outfits),
+                   "overlap_ids": overlap, "skipped_files": bad},
         "categories": [
             {"key": "currency", "en": "Currency", "cn": "货币"},
             {"key": "consumable", "en": "Consumables & boosts", "cn": "消耗品 / 加速"},
@@ -199,6 +304,7 @@ def main():
             {"key": "paint", "en": "Bike paints (unverified)", "cn": "车漆涂装（未验证）"},
             {"key": "track", "en": "Tracks & pieces (unverified)", "cn": "赛道与碎片（未验证）"},
         ],
+        "outfits": outfits,
         "items": items,
     }
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -207,8 +313,12 @@ def main():
         f.write("\n")
 
     named = sum(1 for v in items.values() if v["en"])
-    print("写入 %s：%d 条物品（有英文名 %d），分类 %s，%d 个配置解析失败"
-          % (args.out, len(items), named, dict(cats), len(bad)))
+    bonus = sum(1 for o in outfits.values() if o["bonus"])
+    print("写入 %s：%d 条物品（有英文名 %d）+ %d 套服装（%d 套有套装效果，隐藏 %d）"
+          % (args.out, len(items), named, len(outfits), bonus,
+             sum(1 for o in outfits.values() if o["hidden"])))
+    print("分类 %s；%d 个配置解析失败；%d 个 id 与赛道解锁撞车（已按服装归类）"
+          % (dict(cats), len(bad), len(overlap)))
     for b in bad[:5]:
         print("  失败 %s" % b)
 
