@@ -172,6 +172,10 @@ const SCREENS = [
     // 再点开第一个分类（货币），确认折叠清单真的展开出物品行（未展开时 innerText 里没有这些）。
     act2: `document.querySelector('#pane .acchead').click()`,
     mustAfter2: ['金币', '钻石', '已选 0 项'],
+    // 再点开「骑手服装」：80 套按套列出，High Roller 那套的套装效果文案必须露出来。
+    act3: `[...document.querySelectorAll('#pane .acchead')]
+             .find(b => b.innerText.includes('骑手服装')).click()`,
+    mustAfter3: ['无限汽油', '隐藏', '已拥有', 'The High Roller'],
   },
 ];
 
@@ -217,6 +221,16 @@ for (const s of SCREENS) {
       if (!after2.includes(m)) die(`${s.title}屏第二步之后缺少「${m}」：\n` + after2.slice(0, 900));
     }
     await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + '-清单');
+  }
+  if (s.act3) {
+    const r3 = await evalJs(`(()=>{try{${s.act3};return 'ok'}catch(e){return 'FAIL: '+e}})()`);
+    if (r3 !== 'ok') die(`${s.title}屏的第三步操作没点成：${r3}`);
+    await sleep(900);
+    const after3 = await evalJs(`document.getElementById('pane').innerText`);
+    for (const m of s.mustAfter3 || []) {
+      if (!after3.includes(m)) die(`${s.title}屏第三步之后缺少「${m}」：\n` + after3.slice(0, 900));
+    }
+    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + '-服装');
   }
   ok(`${s.title}屏：${cards} 张卡 / ${rows} 行表格数据`);
 }

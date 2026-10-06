@@ -678,17 +678,17 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
 | 登录 | 管理员口令（首启 12 位随机口令只打到控制台）；`--reset-admin` 兜底 |
 | 账号 | 会话卡（总数 / 一键清空）+ 账号表 9 列（含封禁徽标、可复制的 profileId、记住我用量）+ 设备表 + 改口令 |
 | 存档 | 槽位表（kind 徽标 / 物品数 / 赛道记录 / richness / 写入时间）+ 详情（关键余额 + 历史快照）+ 逐个「回滚到此」 |
-| 下发物品 | 存档槽下拉 + 竞技场卡（金票 / 筹码，服务端即时生效）+ 醒目警示卡（如实写明要玩家在游戏里点「用云端」）+ **按类折叠的官方物品清单**（401 条，勾选 + 填数量 + 搜索；货币 / 消耗品 / 零件 / 服装 / 蓝图 / 涂装 / 赛道与碎片） |
+| 下发物品 | 存档槽下拉 + 竞技场卡（金票 / 筹码，服务端即时生效）+ 醒目警示卡（如实写明要玩家在游戏里点「用云端」）+ **按类折叠的官方物品清单**（500 条，勾选 + 填数量 + 搜索；货币 / 消耗品 / 零件 / 服装 / 蓝图 / 涂装 / 赛道与碎片）。**服装按「套」列**：80 套（含 46 套从未上架的隐藏套装），勾一套 = 头盔 / 上衣 / 裤装一起解锁，行上显示官方名 + 内部代号 + 已拥有 n/3 + 套装效果（The High Roller = 无限汽油） |
 
 - **鉴权**：管理员账号独立于玩家账号，存 `data/admin.json`（`_hash_pw`，不入库）；登录发
   `tf_admin` Cookie（`HttpOnly; SameSite=Strict`，**故意不加 `Secure`** —— 只能走明文 HTTP）。
   门禁用 `startswith("/__") and not in _PUBLIC`，**新增端点默认是关的**。
 - **受控写档**：`grant_items()` 只动 `items2` + `version` + 审计字段，先埋 `pre_grant_` 快照；
-  可下发的物品集合由 `admin/items.json`（401 条官方目录，`tools/build_item_catalog.py` 生成）
-  决定，读不到目录就退回只放金币/钻石 —— 宁可少发也不能因为文件丢了把下发全放开。
+  可下发的物品集合由 `admin/items.json`（500 条物品 + 80 套服装，`tools/build_item_catalog.py`
+  生成）决定，读不到目录就退回只放金币/钻石 —— 宁可少发也不能因为文件丢了把下发全放开。
   `rollback_save()` 埋 `pre_restore_` 快照（回滚本身不可逆）；两者都能一键撤销。
   带前缀的快照名在 `sorted()` 里排在纯数字时间戳之后，所以不会被 `SAVE_HISTORY_MAX` 的裁剪丢掉。
-- **回归**：`tests/test_admin_webui.py`（85 项，全库 153 项）+ `tools/ui_smoke.mjs`（headless Edge + CDP
+- **回归**：`tests/test_admin_webui.py`（91 项，全库 159 项）+ `tools/ui_smoke.mjs`（headless Edge + CDP
   逐屏断言，对 `Runtime.exceptionThrown` / console error 零容忍）。
   ⚠ 教训：只调 `_introspect` 的门禁测试会给**假绿灯** —— `_handle` 里在它之前的内联近路
   就是绕过访问控制的洞（`/__log` 曾经这么裸奔过），所以门禁必须用真路由 `request_handle()` 测。

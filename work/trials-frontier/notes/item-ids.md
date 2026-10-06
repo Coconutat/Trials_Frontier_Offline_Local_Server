@@ -1399,5 +1399,85 @@ Related files not in the table above: `tmp\packout\itemids_report.txt` (full raw
 - **`ItemId 145` “SPECIAL PVP REWARD ITEM”** — the concrete item it resolves to at runtime is unknown.
 - **Outfit part IDs that never appear in a reward catalog** have no entry here; §4a lists every
   outfit-part ID that *is* referenced by a reward table, which is the set a server can safely grant.
+  → **已被 §9 取代**：这类 id 现在可以从 `/conf/customization.txt` 推导（`ItemType*5+tier`），
+  而且其中 165/240 个在真机存档 `items2` 里出现过 —— 「没在任何奖励表里出现」不等于不能下发。
 - **Entry #5 (the Crafting table, 703 B)** has no recovered internal path — its hash matched none of
   the 296 candidate path strings in `libTrialsGo.strings.txt`.
+---
+
+## 9. 服装套装表（`/conf/customization.txt`）与部件 id 公式
+
+解包条目 `0007_27884168.bin`（106148 B）= `/conf/customization.txt`，顶层 `{"Rider": [80 条]}`。
+**脚本按内容嗅探（同时含 `"Rider"` 与 `"NameStringId"`），不认文件名哈希**（`tools/build_item_catalog.py`
+的 `find_customization()`）。
+
+每套的字段（并集）：`ID`、`Comment`、`StringOverride`、`HelmetOnIcon/OffIcon`、`Upper*`、`Lower*`、
+`Menu*Texture/Offset`、`NameStringId`、`DescriptionStringId`、**`BonusPowerDescriptionStringId`**、
+`BonusPower`、`Order`、`R`、`ItemType`、`UnlockType`、`CanBeBought0/1/2`、`MissionUnlock`、
+`UnlockMissionIds`、`LeaderboardHilight`、`SpecialFX`、`TR_SFX_VOICE_*`、`VOPitchMultiplier`。
+
+### 部件 id 公式
+
+```
+部件 id = ItemType * 5 + tier        tier: 0 = 头盔 / 1 = 上衣(Middle) / 2 = 裤装(Bottom)
+LOCF 键 = ITEM_<ItemType>_<tier>     （绝大多数没有文本，显示的是套装名）
+```
+
+* **Rider ID 0–19 那批记录里没有 `ItemType`**，用 `type = 40 + Rider ID`
+  （Dogfighter ID1→41→205/206/207 … Pumpkin King ID19→59→295/296/297）。
+  验证：`ITEM_57_0/1/2` = "The Eggman Helmet/Middle/Bottom Piece" ↔ Eggman ID17→57→285/286/287。
+* **`Rider ID` 与 `OUTFIT_nn` 序号不是一回事**：只能走 `NameStringId` 映射
+  （ID0→OUTFIT_00、ID1→06、ID2→05、ID18→21、ID19→19、ID20→18、ID33/36→OUTFIT_34、ID34/37→OUTFIT_35）。
+* 80 套 × 3 = **240 个 id 互不冲突**；其中 **99 个不在任何奖励/商店配置里**（隐藏与未上架套装），
+  **165/240 在真机存档 `items2` 里出现过**（4 个存档分别是 210 / 3 / 576 / 293 个键）。
+* **与「赛道解锁」条目有 19 个编号撞车**（1130/1135/1146/1187/1191/1192/1195/1196/1197/1201/1202/
+  1207/1210/1215/1216/1222/1231/1287/1296）—— 例如 1130 既是 Wurst Racer 头盔又是 "Garbage Route"。
+  `ItemId` 只在同一个 `Type` 内唯一，而 `items2` 只有 id 一维；赛道实际是靠 `chips.<pid>.tracks`
+  解锁的（不走 items2），所以**按服装归类**，旧名字记进 `alias` / `source.overlap_ids`。
+  同类撞车另一例：id 635 = 消耗品 "Super Magnet"（金币加倍器）= type 127 的 tier 0。
+
+### 套装效果（`BonusPower`，24 套有）
+
+格式 `"<EFFECT> <args>"`，文案在 `BonusPowerDescriptionStringId = OUTFIT_%02d_POWER`，
+所有文案都写 "Outfit does not need to be equipped" ⇒ **集齐即账号级生效，不用穿着**。
+
+| 套装 | 效果 |
+|---|---|
+| ID39 **The High Roller**（隐藏，`MULTIPLY_FUEL_REFILL_TIME 0.006`）| 无限汽油 |
+| ID6 Samsarian | `INCREASE_MISSION_REWARD_XP 1.2` |
+| ID10 Rebel | `INCREASE_LEVEL_REWARD_XP 1.1` |
+| ID11 Priest | `WHEEL_GEM_REWARD_BONUS 1` |
+| ID12 Enforcer | `INCREASE_LOOT_WHEEL_IMPACT 1.15` |
+| ID13 Goon | `CHECKPOINT_COIN_MULTIPLY 1.5` |
+| ID14 Cyberpunk | `MULTIPLY_SLOTMACHINE_COOLDOWN_TIME 0.8` |
+| ID15 Platinum Knight | `MULTIPLY_FUEL_REFILL_TIME 0.666666` |
+| ID16 Cyborg | `MULTIPLY_UPGRADE_WAIT_TIME 0.9` |
+| ID21 Manbird | `CHECKPOINT_COIN_MULTIPLY 2.0` |
+| ID22 Cornelius | `MULTIPLY_PVP_CHIPSTORE_PRICES 0.9` |
+| ID29 Cowgirl | `MULTIPLY_LOOT_WHEEL_REWARD 151 2.0` |
+| ID30 Native Warrior | `PVP_EXTRA_MATCH_SLOT 1` |
+| ID33/36 Henchman | `MULTIPLY_LOOT_WHEEL_CHANCE 419 2.0` |
+| ID34/37 Super Spy | `MULTIPLY_UPGRADE_WAIT_TIME 0.5` |
+| ID43 Christmas Gal | `REDUCE_GIFT_OPENING_PRICE 0.5` |
+| ID44 Sugar Daddy | `UPGRADE_WAIT_TIME_TO 1.0` |
+| ID51 Dealbreaker（内部代号 HALLOWEEN_MAN）| `MULTIPLY_FREE_CHALLENGE_RETRY 2.0` |
+| ID59 Reputed Hunter | `MULTIPLY_STARTING_REPUTATION 1.5` |
+| ID76 Space Suit（内部代号 MOONRIDER）| `SPECIAL_ABILITY_TIME_MULTIPLIER 11 0.5 cooldown` |
+| ID78 Dr. Cuul | `REMOVE_HUNT_DECOY_TRACKS 2` |
+| ID79 Madcap Elf | `MULTIPLY_RALLY_TICKETS 2` |
+
+### 上架状态
+
+`UnlockType` 是 3 元数组：`[4,4,4]` = 不可购买 = **隐藏套装（46 套）**，`[0,0,0]` / `[2,2,2]` /
+`[3,3,3]` = 可买 / 任务解锁（价格看 `CanBeBought0/1/2`，隐藏的为 `None`）；
+`MissionUnlock: 10000` 是「永不」哨兵值。`Comment`（内部代号）与官方名常常不一样：
+ID46 `MUMMY_BOY`→"The Desert King"、ID48 `THE_KING`→"King of the Wastes"、
+ID51 `HALLOWEEN_MAN`→"The Dealbreaker"、ID76 `MOONRIDER`→"Space Suit"、ID78 `Dr Cool`→"Dr. Cuul"。
+**ID33/36 与 ID34/37 各共用一个 `OUTFIT_nn` 名**（Henchman Uniform / Super Spy 的黑白两套），
+所以钥匙必须带 type（`OUTFIT_34_NAME#116`）。
+
+### 复现
+
+```bash
+python tools/build_item_catalog.py            # 产出 server/admin/items.json（500 条物品 + 80 套服装）
+```

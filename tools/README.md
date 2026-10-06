@@ -371,14 +371,27 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 * **分类 + `verified`**：分类是按 `Type` 与贴图路径推的；`verified` 表示「这个类的存档写法
   **在真机上确认过**」——只有涂装（Type 2）与赛道（Type 1/3）是 `false`，后台会给它们挂
   「未验证」警告。改判定就改脚本里的 `category()`。
+* **服装 ← `/conf/customization.txt`**（`0007_*.bin`，脚本按内容找、不认文件名哈希）：`Rider` 数组
+  80 条，每条 `NameStringId = OUTFIT_%02d_NAME`、`BonusPowerDescriptionStringId = OUTFIT_%02d_POWER`。
+  **套装部件 id = `ItemType * 5 + tier`**（tier 0/1/2 = 头盔 / 上衣 / 裤装）；
+  Rider ID 0–19 那批记录里**没有 `ItemType` 字段**，用 `type = 40 + Rider ID`（部件名反查验证过：
+  `ITEM_57_0` = "The Eggman Helmet Piece"）。这套公式必须对：隐藏套装的部件 id
+  **在任何配置里都不出现**（80 套 240 件里 99 件如此），挖不出来只能推。
+* **`outfits` 段**：`{setKey: {key,id,idx,en,cn,comment,desc_*,bonus,bonus_*,type,type_src,parts,
+  part_names,unlock,hidden,derived}}`，`setKey = "OUTFIT_34_NAME#116"`（同名两套用 `Comment`
+  尾巴区分，如 Henchman Uniform 黑/橙）。`hidden` = `UnlockType` 全是 4（没上架过），
+  目前 46 套；`bonus` 是效果原文（`MULTIPLY_FUEL_REFILL_TIME 0.006` = High Roller 的无限汽油），
+  带效果的有 24 套。部件 id 与「赛道解锁」条目**有 19 个编号撞车**（如 1130 既是 Garbage Route
+  又是 Wurst Racer 头盔）：按服装归类，旧名字记进条目的 `alias` 与 `source.overlap_ids`。
 * `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
   所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试。
   `0010_1854657d.bin` 目前仍解析不了（少 7 条 RIDER 记录），会记进 `source.skipped_files`。
 
 **金票（135）被显式跳过**：它不在存档 `items2` 里，走 `server/data/pvp_state.json`。
 
-生成的 `server/admin/items.json` 同时被三处消费：后台的折叠清单、`tflocal_accounts.grantable_items()`
-（可下发集合）、`tests/test_admin_webui.py::ItemCatalog`（形状自检）。**改了物品表就重跑它。**
+生成的 `server/admin/items.json`（500 条物品 + 80 套服装）同时被三处消费：后台的折叠清单、
+`tflocal_accounts.grantable_items()`（可下发集合）、`tests/test_admin_webui.py::ItemCatalog` /
+`::OutfitSets`（形状与公式自检）。**改了物品表或套装表就重跑它。**
 
 ---
 
