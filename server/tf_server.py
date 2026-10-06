@@ -5166,12 +5166,14 @@ class Handler(BaseHTTPRequestHandler):
                        "admin_url": "http://%s/__admin" % base})
         if path == "/__api/admin/grant":
             form = _json_body(body) or {}
-            res, err = acct.grant_items(form.get("profile"), form.get("items") or [])
+            res, err = acct.grant_items(form.get("profile"), form.get("items") or [],
+                                        form.get("paints") or [])
             if res is None:
                 return js({"ok": False, "error": err,
                            "message": {"no-save": "这个存档槽没有 latest.json",
                                        "bad-profile": "没指定存档槽",
                                        "bad-grant": "下发内容不合法",
+                                       "no-items2": "这个存档没有 items2",
                                        }.get(err, "下发失败：" + str(err))}, 400)
             return js({"ok": True, **res})
         if path == "/__api/admin/pvp":

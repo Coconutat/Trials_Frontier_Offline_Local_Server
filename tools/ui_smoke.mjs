@@ -159,7 +159,7 @@ const SCREENS = [
   {
     hash: '#/grant', title: '下发物品',
     must: ['竞技场', '金票', '筹码', '存档物品', '云端',
-           '货币', '消耗品', '摩托车零件', '骑手服装', '摩托蓝图', '已选 0 项'],
+           '货币', '消耗品', '摩托车零件', '骑手服装', '摩托蓝图', '车漆涂装', '已选 0 项'],
     // 默认选中是列表第一个（<anonymous>）。切到 ccb 那个真档上，确认竞技场卡
     // 读到的是服务端 pvp_state.json 里的真值。★ 别写死余额：那是随时可改的线上
     // 数值（改过一次就把断言变成假失败），所以只钉「段位 24」这种结构性的东西。
@@ -176,6 +176,17 @@ const SCREENS = [
     act3: `[...document.querySelectorAll('#pane .acchead')]
              .find(b => b.innerText.includes('骑手服装')).click()`,
     mustAfter3: ['无限汽油', '隐藏', '已拥有', 'The High Roller'],
+    // 再点开「车漆涂装」并展开 Riptide 那一组：108 款按车分组的嵌套折叠，
+    // 涂装行上要能看到「位 0」这种位掩码信息（涂装不按 id 下发）。
+    act4: `(() => {
+            [...document.querySelectorAll('#pane .acchead')]
+              .find(b => b.innerText.includes('车漆涂装')).click();
+            const g = [...document.querySelectorAll('#pane .acc-sub > .acchead')]
+              .find(b => b.innerText.includes('Riptide'));
+            if (!g) throw new Error('没找到 Riptide 那一组涂装');
+            g.click();
+          })()`,
+    mustAfter4: ['车漆涂装', 'Riptide', 'Riptide SnakeBite skin', '位 0'],
   },
 ];
 
@@ -202,35 +213,25 @@ for (const s of SCREENS) {
   for (const m of s.must) {
     if (!text.includes(m)) die(`${s.title}屏缺少「${m}」：\n` + text.slice(0, 600));
   }
-  if (s.act) {
-    const r = await evalJs(`(()=>{try{${s.act};return 'ok'}catch(e){return 'FAIL: '+e}})()`);
-    if (r !== 'ok') die(`${s.title}屏的操作没点成：${r}`);
-    await sleep(1200);
+  // 逐步点开（act → act4）：每步「点一下 → 核对文案 → 截图」。折叠起来的内容不在
+  // innerText 里，所以展开之后才能断言里面的字。
+  const steps = [
+    { act: s.act, must: s.mustAfter, suffix: '-展开', wait: 1200 },
+    { act: s.act2, must: s.mustAfter2, suffix: '-清单', wait: 900 },
+    { act: s.act3, must: s.mustAfter3, suffix: '-服装', wait: 900 },
+    { act: s.act4, must: s.mustAfter4, suffix: '-涂装', wait: 900 },
+  ];
+  for (let i = 0; i < steps.length; i++) {
+    const st = steps[i];
+    if (!st.act) continue;
+    const r = await evalJs(`(()=>{try{${st.act};return 'ok'}catch(e){return 'FAIL: '+e}})()`);
+    if (r !== 'ok') die(`${s.title}屏第 ${i + 1} 步操作没点成：${r}`);
+    await sleep(st.wait);
     const after = await evalJs(`document.getElementById('pane').innerText`);
-    for (const m of s.mustAfter || []) {
-      if (!after.includes(m)) die(`${s.title}屏点开之后缺少「${m}」：\n` + after.slice(0, 800));
+    for (const m of st.must || []) {
+      if (!after.includes(m)) die(`${s.title}屏第 ${i + 1} 步之后缺少「${m}」：\n` + after.slice(0, 900));
     }
-    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + '-展开');
-  }
-  if (s.act2) {
-    const r2 = await evalJs(`(()=>{try{${s.act2};return 'ok'}catch(e){return 'FAIL: '+e}})()`);
-    if (r2 !== 'ok') die(`${s.title}屏的第二步操作没点成：${r2}`);
-    await sleep(900);
-    const after2 = await evalJs(`document.getElementById('pane').innerText`);
-    for (const m of s.mustAfter2 || []) {
-      if (!after2.includes(m)) die(`${s.title}屏第二步之后缺少「${m}」：\n` + after2.slice(0, 900));
-    }
-    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + '-清单');
-  }
-  if (s.act3) {
-    const r3 = await evalJs(`(()=>{try{${s.act3};return 'ok'}catch(e){return 'FAIL: '+e}})()`);
-    if (r3 !== 'ok') die(`${s.title}屏的第三步操作没点成：${r3}`);
-    await sleep(900);
-    const after3 = await evalJs(`document.getElementById('pane').innerText`);
-    for (const m of s.mustAfter3 || []) {
-      if (!after3.includes(m)) die(`${s.title}屏第三步之后缺少「${m}」：\n` + after3.slice(0, 900));
-    }
-    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + '-服装');
+    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + st.suffix);
   }
   ok(`${s.title}屏：${cards} 张卡 / ${rows} 行表格数据`);
 }

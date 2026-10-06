@@ -850,11 +850,13 @@ class ItemCatalog(Base):
 
     def test_shape_and_count_agree(self):
         c = self.cat
-        self.assertEqual(sorted(c), ["categories", "items", "outfits", "source"])
+        self.assertEqual(sorted(c), ["categories", "items", "outfits", "paints", "source"])
         self.assertEqual(c["source"]["items"], len(c["items"]),
                          "source.items 与实际条数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertEqual(c["source"]["outfits"], len(c["outfits"]),
                          "source.outfits 与实际套数不一致（重新跑 tools/build_item_catalog.py）")
+        self.assertEqual(c["source"]["paints"], len(c["paints"]),
+                         "source.paints 与实际款数不一致（重新跑 tools/build_item_catalog.py）")
         self.assertTrue(c["source"]["en"] and c["source"]["cn"], "没记本地化表来源")
         self.assertGreater(len(c["items"]), 300)
 
@@ -959,9 +961,9 @@ class OutfitSets(Base):
             self.assertEqual(o["unlock"], [4, 4, 4], "隐藏套装的 UnlockType 变了：" + o["key"])
 
     def test_namespace_collisions_are_recorded_and_given_to_outfits(self):
-        """19 个编号同时是某个「赛道解锁」条目 —— 以服装为准，旧名字留在 source 里。"""
+        """20 个编号同时是某个「赛道解锁」条目 —— 以服装为准，旧名字留在 source 里。"""
         bad = self.cat["source"]["overlap_ids"]
-        self.assertEqual(len(bad), 19)
+        self.assertEqual(len(bad), 20, "撞车编号数变了（重新跑生成器再看）")
         for r in bad:
             self.assertEqual(r["was"], "track")
             self.assertTrue(r["alias"], "撞车的旧名字没留证")
@@ -971,13 +973,112 @@ class OutfitSets(Base):
         for it in self.items.values():
             by_cat[it["cat"]] = by_cat.get(it["cat"], 0) + 1
         self.assertEqual(by_cat["outfit"], 240, "服装类应该正好等于全部部件")
-        self.assertEqual(by_cat["track"], 152, "赛道解锁条目里有 19 个判给服装了")
+        self.assertEqual(by_cat["track"], 157, "赛道解锁条目里有 20 个判给服装了")
 
     def test_every_part_is_grantable(self):
         ids = {int(k) for k in self.items}
         for o in self.sets.values():
             for pid in o["parts"]:
                 self.assertIn(pid, ids, "部件不在目录里，下发给它会 not-grantable")
+
+
+class Paints(Base):
+    """涂装不是「一个涂装一个键」，而是「每辆车一条位掩码」：
+
+        items2[664 + BikeID] = ((当前装备的 SkinIndex + 1) << 24) | 已拥有位掩码
+
+    位算错不会「没生效」，而是把别的涂装标成已拥有（还可能写到别的车的字上），
+    所以这里把编码本身钉死。真机存档（ccb）里 6 条涂装字都满足这个编码。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cat = json.loads((ADMIN_DIR / "items.json").read_text(encoding="utf-8"))
+        cls.paints = cls.cat["paints"]
+
+    def test_catalog_covers_every_skin_in_the_bike_table(self):
+        self.assertEqual(len(self.paints), 108, "bikes.txt 的 SkinData 是 108 款")
+        self.assertEqual(sorted(int(k) for k in self.paints), list(range(108)))
+        seen = set()
+        for k, p in self.paints.items():
+            self.assertEqual(str(p["id"]), k, "键与 id 不一致：" + k)
+            self.assertEqual(p["key"], 664 + p["bike"], "存档键算错了：" + k)
+            self.assertEqual(p["bit"], 1 << p["slot"], "位算错了：" + k)
+            self.assertLess(p["slot"], 24, "存档里只有 24 位可用：" + k)
+            self.assertNotIn((p["bike"], p["slot"]), seen, "同一辆车的同一款出现两次：" + k)
+            seen.add((p["bike"], p["slot"]))
+            self.assertTrue(p["en"], "涂装没有名字：" + k)
+        self.assertEqual(len({p["bike"] for p in self.paints.values()}), 17,
+                         "有涂装的车数变了（19 辆车，其中 2 辆没上过涂装）")
+        self.assertGreaterEqual(sum(1 for p in self.paints.values() if p["cn"]), 60,
+                               "官方中文名掉了一半以上，本地化表是不是没读上")
+
+    def test_paint_is_not_a_category_any_more(self):
+        """涂装编号不能留在 items 里当存档物品 —— 一半涂装编号同时是零件号。"""
+        keys = [c["key"] for c in self.cat["categories"]]
+        self.assertNotIn("paint", keys, "涂装不该再有分类：它不走 items2 的 id")
+        for it in self.cat["items"].values():
+            self.assertNotEqual(it["cat"], "paint", "还有条目被判成涂装")
+
+    def test_grantable_paints_comes_from_the_catalog(self):
+        allowed = acct.grantable_paints()
+        self.assertEqual(len(allowed), 108, "可下发涂装数量不对，是不是没读到 items.json？")
+        self.assertEqual(allowed[3]["key"], 664 + 7, "Riptide 是 BikeID 7，第 0 款")
+        self.assertEqual(allowed[3]["slot"], 0)
+        self.assertTrue(allowed[3]["name"])
+
+    def test_value_encoding_keeps_the_equipped_paint(self):
+        self.assertEqual(acct._paint_value(0, 0), 0x01000001)
+        self.assertEqual(acct._paint_value(0x02000004, 0), 0x02000005)   # 当前装备不能被顶掉
+        self.assertEqual(acct._paint_value(0x01000001, 0), 0x01000001)   # 重复下发不改值
+        self.assertEqual(acct._paint_value(0x01000001, 3), 0x01000009)
+
+    def test_grant_sets_the_bit_on_the_bike_word(self):
+        self.write_save()                            # 存档里没有 664+ 的键
+        res, err = acct.grant_items(PID, [], [3])    # id 3 = BikeID 7 第 0 款 → 键 671
+        self.assertIsNone(err, "只发涂装被当成 bad-grant 了：%s" % err)
+        self.assertEqual(res["paint_applied"][0]["key"], 671)
+        self.assertEqual(res["paint_applied"][0]["before"], 0)
+        self.assertEqual(res["grants"], 1, "只发涂装也要算一次下发，前端靠它拼提示")
+        it = acct.load_progress_items(PID)
+        self.assertEqual(it[671], 0x01000001)
+        self.assertNotIn(3, it, "涂装自己的编号被当成 items2 的键写下去了")
+
+    def test_grant_keeps_an_equipped_paint(self):
+        self.write_save(items=(0, 457, 671, 0x02000004))   # 已拥有并装备第 2 款
+        self.assertIsNone(acct.grant_items(PID, [], [3])[1])
+        self.assertEqual(acct.load_progress_items(PID)[671], 0x02000005)
+
+    def test_rejects_unknown_paint_without_writing(self):
+        before = self.write_save()
+        res, err = acct.grant_items(PID, [], [9999])
+        self.assertIsNone(res)
+        self.assertEqual(err, "not-grantable-paint:9999")
+        self.assertEqual(acct.load_progress(PID)["content"]["items2"], before["content"]["items2"])
+
+    def test_bad_paint_does_not_leave_the_item_written(self):
+        before = self.write_save()
+        res, err = acct.grant_items(PID, [{"item_id": 1, "amount": 10}], [9999])
+        self.assertIsNone(res)
+        self.assertEqual(acct.load_progress(PID)["content"]["items2"], before["content"]["items2"],
+                         "涂装报错时物品已经写进去了")
+
+    def test_undo_puts_the_paint_back(self):
+        self.write_save()
+        res, err = acct.grant_items(PID, [], [3])
+        self.assertIsNone(err)
+        self.assertIsNone(acct.restore_snapshot(PID, res["snapshot"])[1])
+        self.assertNotIn(671, acct.load_progress_items(PID))
+
+    def test_endpoint_carries_paints(self):
+        token = self.login()
+        self.write_save()
+        handled, r = request("/__api/admin/grant", token=token, method="POST",
+                             body={"profile": PID, "paints": [3]})
+        self.assertTrue(handled)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.json()["paint_applied"][0]["paint_id"], 3)
+        self.assertEqual(acct.load_progress_items(PID)[671], 0x01000001)
 
 
 # ---------------------------------------------------------------- 文案

@@ -663,22 +663,48 @@ function itemPicker(cat, cur) {
     .sort((a, b) => a.id - b.id);
   const setOf = id => (cat.items[id] || {}).set;
 
+  // 涂装：108 款，编号**不是** items2 的键 —— 存档里每辆车一个 24 位拥有位掩码
+  // （键 = 664 + 车号，位 = 该车第几款涂装，见 build_item_catalog.py 开头 ★ 涂装），
+  // 所以按「车」分组列：一辆车一组，勾一款 = 给那一位置 1。
+  const paints = Object.keys(cat.paints || {}).map(k => cat.paints[k]);
+  const bikeGroups = [];
+  for (const p of paints) {
+    let g = bikeGroups.filter(x => x.bike === p.bike)[0];
+    if (!g) bikeGroups.push(g = { bike: p.bike, name: p.bike_en, key: 664 + p.bike, rows: [] });
+    g.rows.push(p);
+  }
+  for (const g of bikeGroups) g.rows.sort((a, b) => a.slot - b.slot);
+  bikeGroups.sort((a, b) => a.bike - b.bike);
+  const paintVal = p => Number(cur[p.key]) || 0;
+  const isOwned = p => (paintVal(p) & p.bit) !== 0;
+  if (paints.length) {
+    groups.push({ meta: { key: 'paint', en: 'Bike paints', cn: '车漆涂装' }, items: paints });
+  }
+
   const root = el('div', { class: 'acclist' });
   const total = el('span', { class: 'hint', text: t('grant.list.selected', { n: 0 }) });
   const empty = el('p', { class: 'hint', hidden: true, text: t('grant.list.empty') });
   const accs = {};
+  const bikeBadges = [];
 
-  // 勾一件服装 = 勾这一套的三件（头盔/上衣/裤装），所以徽标按「套」数，不按件数。
+  // 勾一件服装 = 勾这一套的三件（头盔/上衣/裤装），所以徽标按「套」数，不按件数；
+  // 涂装按「款」数（每款一个键 'p<id>'，跟物品 id 不会撞 —— 存档 id 都是数字）。
+  const selKeys = () => Object.keys(state.itemSel);
   const selectedIn = key => {
-    const ids = Object.keys(state.itemSel).map(Number);
-    if (key === 'outfit') return new Set(ids.map(setOf).filter(Boolean)).size;
-    return ids.filter(id => (cat.items[id] || {}).cat === key).length;
+    if (key === 'outfit') return new Set(selKeys().map(k => setOf(Number(k))).filter(Boolean)).size;
+    if (key === 'paint') return selKeys().filter(k => k.charAt(0) === 'p').length;
+    return selKeys().filter(k => (cat.items[Number(k)] || {}).cat === key).length;
   };
   const refresh = () => {
     for (const k in accs) {
       const n = selectedIn(k);
       accs[k].badge.textContent = String(n);
       accs[k].badge.hidden = !n;
+    }
+    for (const b of bikeBadges) {
+      const n = bikeGroups[b.i].rows.filter(p => ('p' + p.id) in state.itemSel).length;
+      b.badge.textContent = String(n);
+      b.badge.hidden = !n;
     }
     total.textContent = t('grant.list.selected', { n: Object.keys(state.itemSel).length });
   };
@@ -720,6 +746,53 @@ function itemPicker(cat, cur) {
       el('span', { class: 'hint', text: t('grant.list.unlock') }));
   };
 
+  // 一款涂装一行。存档里没有「涂装 id -> 有无」这种东西：每辆车只有 items2[664+车号]
+  // 一条值，低 24 位是「这辆车每一款涂装拥有与否」的位掩码，高 8 位是当前装备的那一款。
+  // 所以勾一款 = 把那一位置 1（客户端自己会按位读；服务器写的也是这条）。
+  const paintRow = p => {
+    const name = (LANG === 'cn' ? p.cn : p.en) || p.en || p.name || ('#' + p.id);
+    const selKey = 'p' + p.id;
+    const owned = isOwned(p);
+    const box = el('input', { type: 'checkbox', class: 'tick' });
+    box.checked = selKey in state.itemSel;
+    box.onchange = () => {
+      if (box.checked) state.itemSel[selKey] = 1; else delete state.itemSel[selKey];
+      refresh();
+    };
+    const note = el('span', { class: 'setnote' });
+    if (!p.verified) note.append(el('span', { class: 'hint', text: t('grant.list.noloc') }));
+    // SkinData 里的内部名（Snakebite / Boogeyman …）跟商店名常常不是一回事，两个都给。
+    if (p.comment && p.comment !== name) note.append(el('span', { class: 'hint', text: p.comment }));
+    if (p.diamond) note.append(el('span', { class: 'hint',
+      text: t('grant.list.price', { n: fmtNum(p.diamond) }) }));
+    const q = [name, p.id, p.name, p.bike_en, p.comment].join(' ').toLowerCase();
+    return el('div', { class: 'irow setrow', dataset: { q } },
+      el('label', { class: 'ibox' }, box),
+      el('span', { class: 'iname' }, el('span', { class: 'setname', text: name }), note),
+      el('span', { class: 'hint mono', text: '#' + p.id + '　' + t('grant.list.slot', { n: p.slot }) }),
+      owned ? el('span', { class: 'pill', text: t('grant.list.owned') })
+            : el('span', { class: 'hint', text: t('grant.list.unlock') }));
+  };
+
+  // 一辆车一组（嵌套折叠）：108 款摊平了没法看，而位掩码本来就是按车分的。
+  const bikeGroup = (g, i) => {
+    const own = g.rows.filter(isOwned).length;
+    const inner = el('div', { class: 'accbody' });
+    for (const p of g.rows) inner.append(paintRow(p));
+    const key = 'paint:' + g.bike;
+    const h = head(key, g.name || ('#' + g.bike),
+                   t('grant.list.skinOwned', { n: own, m: g.rows.length }), !!state.itemOpen[key]);
+    const acc = el('div', { class: 'acc acc-sub' + (state.itemOpen[key] ? ' open' : ''), dataset: { k: key } },
+                   h.btn, inner);
+    h.btn.addEventListener('click', () => {
+      const on = acc.classList.toggle('open');
+      state.itemOpen[key] = on;
+      h.btn.setAttribute('aria-expanded', String(on));
+    });
+    bikeBadges.push({ i, badge: h.badge });
+    return acc;
+  };
+
   for (const g of groups) {
     const flag = !!FLAG_CATS[g.meta.key];
     // 「未验证」是按物品带的（存档里真的没确认过怎么写），不是按分类配的：
@@ -731,6 +804,21 @@ function itemPicker(cat, cur) {
       body.append(el('p', { class: 'hint p-warn', text: t('grant.list.derived') }));
       for (const o of sets) body.append(setRow(o));
       const h = head(g.meta.key, catLabel(g.meta), sets.length, !!state.itemOpen[g.meta.key]);
+      const acc = el('div', { class: 'acc' + (state.itemOpen[g.meta.key] ? ' open' : '') }, h.btn, body);
+      h.btn.addEventListener('click', () => {
+        const on = acc.classList.toggle('open');
+        state.itemOpen[g.meta.key] = on;
+        h.btn.setAttribute('aria-expanded', String(on));
+      });
+      accs[g.meta.key] = { acc, badge: h.badge, body };
+      root.append(acc);
+      continue;
+    }
+    if (g.meta.key === 'paint' && paints.length) {
+      body.append(el('p', { class: 'hint', text: t('grant.list.paintHint') }));
+      bikeGroups.forEach((bg, i) => body.append(bikeGroup(bg, i)));
+      const h = head(g.meta.key, t('grant.list.paintCard'), paints.length,
+                     !!state.itemOpen[g.meta.key]);
       const acc = el('div', { class: 'acc' + (state.itemOpen[g.meta.key] ? ' open' : '') }, h.btn, body);
       h.btn.addEventListener('click', () => {
         const on = acc.classList.toggle('open');
@@ -788,6 +876,11 @@ function itemPicker(cat, cur) {
       }
       accs[g.meta.key].acc.hidden = !vis;
       if (qq && vis) accs[g.meta.key].acc.classList.add('open');
+      // 涂装是嵌套折叠：搜索时把「有命中的那辆车」展开，清空搜索后恢复玩家自己的展开状态。
+      for (const a of accs[g.meta.key].body.querySelectorAll('.acc-sub')) {
+        a.classList.toggle('open',
+          qq ? a.querySelector('.irow:not([hidden])') !== null : !!state.itemOpen[a.dataset.k]);
+      }
       shown += vis;
     }
     empty.hidden = shown > 0;
@@ -798,6 +891,12 @@ function itemPicker(cat, cur) {
       item_id: Number(id), amount: Number(state.itemSel[id]) || 0,
       mode: FLAG_CATS[(cat.items[id] || {}).cat] ? 'set' : state.grantMode,
     })).filter(x => x.amount !== 0 && cat.items[x.item_id]),
+    // 涂装不走 items2 的 id（每个编号一半还同时是零件号），单独一堆 id 交给服务端写位。
+    paintPicks: () => selKeys().filter(k => k.charAt(0) === 'p').map(k => Number(k.slice(1))),
+    paintName: id => {
+      const p = (cat.paints || {})[id];
+      return p ? ((LANG === 'cn' ? p.cn : p.en) || p.en || p.name || ('#' + id)) : ('#' + id);
+    },
     name: id => (cat.items[id] && itemName(cat.items[id])) || ('#' + id),
     clear: () => { state.itemSel = {}; } };
 }
@@ -916,13 +1015,17 @@ async function screenGrant() {
     class: 'btn primary', text: t('grant.submit'),
     onclick: () => guarded(async () => {
       const items = list ? list.picks() : [];
-      if (!items.length) { toast(t('grant.zero'), { kind: 'bad' }); return; }
+      const paints = list ? list.paintPicks() : [];
+      if (!items.length && !paints.length) { toast(t('grant.zero'), { kind: 'bad' }); return; }
       submit.disabled = true;
       try {
-        const r = await post('/__api/admin/grant', { profile: state.grantProfile, items });
+        const r = await post('/__api/admin/grant', { profile: state.grantProfile, items, paints });
         const summary = r.applied.map(a =>
           (list ? list.name(a.item_id) : '#' + a.item_id) + ' ' +
-          fmtNum(a.before) + ' → ' + fmtNum(a.after)).join('　');
+          fmtNum(a.before) + ' → ' + fmtNum(a.after))
+          .concat((r.paint_applied || []).map(a =>
+            (list ? list.paintName(a.paint_id) : '#' + a.paint_id) + ' ' +
+            t('grant.list.owned') + '（' + t('grant.list.slot', { n: a.slot }) + '）')).join('　');
         toast(t('grant.doneBody', {
           profile: state.grantProfile.slice(0, 8),
           summary: summary,

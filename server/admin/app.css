@@ -405,6 +405,15 @@ table.list.compact td { padding: 7px 14px; }
   padding: 1px 7px; border-radius: 999px; font-size: 11px; line-height: 1.6;
   background: color-mix(in srgb, var(--accent) 22%, transparent); color: var(--text);
 }
+/* 涂装：108 款按「车」分组，子组是嵌在外层折叠里的折叠。
+   ★ 展开规则必须限定直接子代 —— `.acc.open .accbody` 是后代选择器，
+   外层一展开会把里面所有关着的子组一起撑开。 */
+.acc-sub { margin: 2px 0 2px 10px; border-left: 2px solid color-mix(in srgb, var(--stroke) 90%, transparent); }
+.acc-sub > .acchead { padding: 8px 11px; font-size: 12.5px; }
+.acc .acc-sub > .accbody { display: none; max-height: none; }
+.acc .acc-sub.open > .accbody { display: block; }
+.acc-sub .acc-sub > .accbody { padding-bottom: 6px; }
+
 @media (max-width: 760px) {
   .irow { grid-template-columns: 26px 1fr 88px; }
   .irow .ibal, .irow .mono { display: none; }
