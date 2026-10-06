@@ -10,6 +10,7 @@
 
 全部写盘都在 TemporaryDirectory 里；不启动服务器、不连设备。
 """
+import email.message
 import json
 import io
 import os
@@ -62,13 +63,15 @@ class Resp(object):
         return c.split("tf_admin=", 1)[1].split(";", 1)[0]
 
 
-def request(path, body=None, token=None, query="", method="GET"):
+def request(path, body=None, token=None, query="", method="GET", host=None):
     """离线调一次 _introspect。返回 (handled, Resp|None)。"""
     payload = b"" if body is None else json.dumps(body).encode("utf-8")
     h = object.__new__(srv.Handler)
     h.command = method
     h.client_address = ("127.0.0.1", 12345)
     h.headers = {"Content-Type": "application/json"}
+    if host:                      # 不传就没有 Host，_public_host 会去探测真机 IP
+        h.headers["Host"] = host
     if token is not None:
         h.headers["Cookie"] = "tf_admin=" + token
     box = []
@@ -81,7 +84,7 @@ def request(path, body=None, token=None, query="", method="GET"):
     return handled, (box[0] if box else None)
 
 
-def request_handle(path, method="GET", token=None, body=b"", query=""):
+def request_handle(path, method="GET", token=None, body=b"", query="", host=None):
     """走**真正的 `_handle`**，包含它在 `_introspect` 之前抄的那些近路。
 
     门禁测试必须走这一条：`_handle` 里的 `if path == "/__xxx": return` 就是绕过
@@ -92,6 +95,8 @@ def request_handle(path, method="GET", token=None, body=b"", query=""):
     h.client_address = ("127.0.0.1", 12345)
     h.path = path + ("?" + query if query else "")
     h.headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    if host:
+        h.headers["Host"] = host
     if token is not None:
         h.headers["Cookie"] = "tf_admin=" + token
     h.rfile = io.BytesIO(body)
@@ -237,6 +242,7 @@ class AdminGate(Base):
              ("POST", "/__api/password"), ("POST", "/__api/delete"),
              ("POST", "/__api/admin/grant"), ("POST", "/__api/admin/rollback"),
              ("POST", "/__api/admin/revert"), ("GET", "/__api/admin/pvp"),
+             ("GET", "/__api/admin/info"),
              ("POST", "/__api/admin/pvp"),
              ("POST", "/__api/admin/sessions/clear"),
              ("POST", "/__api/admin/password")]
@@ -726,6 +732,40 @@ class Endpoints(Base):
                              body={"profile": PID, "ts": "1700000000"})
         self.assertEqual(r.status, 400)
 
+    def test_info_hands_out_the_addresses(self):
+        """后台要能把「玩家注册入口」发给别人，所以端点必须回能直接用的绝对地址。"""
+        token = self.login()
+        handled, r = request("/__api/admin/info", token=token, host="192.168.9.9:9999")
+        self.assertTrue(handled)
+        self.assertEqual(r.status, 200)
+        j = r.json()
+        self.assertEqual(j["username"], "admin")
+        self.assertEqual(j["register_url"], "http://192.168.9.9:9999/__ui")
+        self.assertEqual(j["admin_url"], "http://192.168.9.9:9999/__admin")
+
+    def test_info_never_hands_out_loopback(self):
+        """在 PC 上用 127.0.0.1 打开后台时，发出去的地址必须是玩家能连上的那个。"""
+        token = self.login()
+        with patch.object(srv, "_lan_ip", return_value="10.1.2.3"):
+            handled, r = request("/__api/admin/info", token=token, host="127.0.0.1:8123")
+        self.assertEqual(r.json()["register_url"], "http://10.1.2.3:8123/__ui")
+        self.assertEqual(r.json()["admin_url"], "http://10.1.2.3:8123/__admin")
+
+    def test_public_host_reads_the_real_header_object(self):
+        """★ 真机上 headers 是 email.message.Message 而不是 dict。
+
+        只认 dict 时 `_req_host` 永远取不到 Host，`_public_host` 就退回默认端口 8000：
+        真机实测服务器跑在 8123，发给玩家的地址却是 `http://192.168.x.x:8000/__ui`。
+        """
+        msg = email.message.Message()
+        msg["Host"] = "192.168.9.9:8123"
+        self.assertEqual(srv._req_host(msg), "192.168.9.9:8123")
+        self.assertEqual(srv._public_host(msg), "192.168.9.9:8123")   # 非回环原样带回
+        loop = email.message.Message()
+        loop["Host"] = "127.0.0.1:8123"
+        with patch.object(srv, "_lan_ip", return_value="10.1.2.3"):
+            self.assertEqual(srv._public_host(loop), "10.1.2.3:8123")
+
     def test_help_lists_admin_ui_and_new_endpoints(self):
         token = self.login()
         handled, r = request("/__help", token=token)
@@ -733,7 +773,7 @@ class Endpoints(Base):
         blob = json.dumps(r.json(), ensure_ascii=False)
         self.assertIn("/__admin", blob)
         for ep in ("/__api/admin/login", "/__api/admin/grant", "/__api/admin/pvp",
-                   "/__api/admin/rollback",
+                   "/__api/admin/rollback", "/__api/admin/info",
                    "/__api/admin/revert", "/__api/admin/password",
                    "/__api/admin/sessions/clear"):
             self.assertIn(ep, blob, "%s 没登记进 /__help" % ep)

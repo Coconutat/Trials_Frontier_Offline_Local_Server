@@ -147,7 +147,8 @@ await send('Network.setCookie',
 // act 是切过去之后要点的东西（存档屏的关键余额在「详情」里，列表上只有元数据）。
 // 改文案时要同步这里 —— 宁可失败也不要让检查悄悄变成空断言。
 const SCREENS = [
-  { hash: '#/accounts', title: '账号', must: ['登录会话', '设备', '管理员口令'] },
+  { hash: '#/accounts', title: '账号',
+    must: ['玩家注册入口', '复制', '登录会话', '设备', '管理员口令'] },
   {
     hash: '#/saves', title: '存档', must: ['存档槽', '内容丰富度', '写入时间'],
     act: `[...document.querySelectorAll('#pane tbody tr')]
@@ -159,13 +160,14 @@ const SCREENS = [
     hash: '#/grant', title: '下发物品',
     must: ['竞技场', '金票', '筹码', '存档物品', '金币', '钻石', '云端'],
     // 默认选中的是列表第一个（<anonymous>）。切到 ccb 那个真档上，确认竞技场卡
-    // 读到的是服务端 pvp_state.json 里的真值（115313 是他的筹码，别处不会出现）。
+    // 读到的是服务端 pvp_state.json 里的真值。★ 别写死余额：那是随时可改的线上
+    // 数值（改过一次就把断言变成假失败），所以只钉「段位 24」这种结构性的东西。
     act: `(() => {
             const s = document.getElementById('grantSlot');
             s.value = [...s.options].find(o => o.value.startsWith('53ebbd18')).value;
             s.dispatchEvent(new Event('change'));
           })()`,
-    mustAfter: ['竞技场', '当前 13', '115,313', '段位 24'],
+    mustAfter: ['竞技场', '当前', '段位 24', '下发到竞技场'],
   },
 ];
 
