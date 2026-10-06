@@ -36,10 +36,16 @@ python -m py_compile server/tf_server.py
 ```powershell
 # Windows 上重启（杀掉占着 8000 的那个进程再拉起）
 Stop-Process -Id (Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess -Force
-Start-Process C:\Python314\python.exe -ArgumentList "server\tf_server.py","--host","0.0.0.0","--port","8000" `
+Start-Process C:\Python314\python.exe `
+  -ArgumentList "-u","server\tf_server.py","--host","0.0.0.0","--port","8000" `
   -WorkingDirectory <仓库根> -WindowStyle Hidden `
-  -RedirectStandardOutput <日志> -RedirectStandardError <日志>
+  -RedirectStandardOutput server\data\server.log -RedirectStandardError server\data\server.err.log
 ```
+
+> ★ `-u`（无缓冲）与两个 `-Redirect*` **都要带上**：`-WindowStyle Hidden` 起的进程没有控制台，
+> 不带重定向时所有 `print()`（对局开局 `[pvp] open …`、收局 `[pvp] close …`、`[liveevent] …`、
+> `[save] …`）**直接丢掉**，出问题就只能靠请求日志倒推。
+> `server\data\*.log` 已在 `.gitignore` 里（含真人 id 与对局细节，只当现场证据用）。
 
 真机排查时最有用的一条命令（日志是 JSONL，一行一条请求）：
 
@@ -48,6 +54,9 @@ Start-Process C:\Python314\python.exe -ArgumentList "server\tf_server.py","--hos
 Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
   ForEach-Object { $_ | ConvertFrom-Json } |
   Where-Object { $_.status -ne 200 } | Select-Object -Last 20 ts, method, path, status
+
+# 看 print 出来的现场（开局 / 收局 / 存档摘要）
+Get-Content server\data\server.log -Tail 50
 ```
 
 > ⚠ `ts` 是 ISO 时间字符串，比较请用 `[datetime]::Parse(...)`，不要用 `.Substring()`；
@@ -247,6 +256,15 @@ python -m unittest discover -s tests -v
 * 排队表有 TTL（`_PVP_QUEUE_TTL = 1800`），拿不到真人就回机器人。
 * 机器人成绩 = 玩家成绩 × `bot_time_margin_pct` + `bot_time_margin_ms`（默认 1.018 / 400ms）。
 * 赛季星星曲线 `season.star_array` 是 25 级天梯，`chip_equation_x/y` 决定筹码结算。
+* **对局胜负 = 占住的赛道比对手多**（`_pvp_match_won`，2026-10-06 改）。客户端屏幕
+  （`parseMatch` 的 score 比较）和这个函数都只看「每条赛道谁更快」，所以 **1:0 也算赢**；
+  0:0（谁都没跑出成绩）是平局 ⇒ 不写 `last_match_winner`、段位与连胜不动。
+  ★ 由来的真机案例（用户 m08968）：`matchmaking.match_duration_seconds` 被手写成 300 秒的
+  测试值，只跑完 1 条赛道就到点，客户端下一次 `/start_race` 吃 409 `match-ended` 后收局，
+  并在屏幕上判他胜利；老规则「3 条里占住 ≥2 条」却算出平局 —— 屏幕与服务端对不上。
+  现在归属只看份额，不再要求过半。收局时 `/close` 会往 stdout 打一行
+  `[pvp] close mid=… dur=…s elapsed=…s winner=… tracks=… done=n/N`（开局有对应的
+  `[pvp] open …`），配 `server\data\server.log` 一眼可查（见 §1 启动）。
 
 **发车（bike）**：原版对局的**车是随机的、但和图的级别挂钩**。客户端权威规则在
 `LevelManager::isCorrectBikeTier @0x47c170`：图的 `B` 字段（`/conf/levels.txt`，`0xff` = 不限）
@@ -497,6 +515,11 @@ python -m unittest discover -s tests -v
     `matchmaking.bike_story_only`（默认开）= 随机池只放剧情车 1..9；`matchmaking.bike_id`
     只在关掉随机时用（★ 必须能跑每张候选图）。车号框带 `items.json` 的车表下拉（19 辆，
     显示 `#号 名字 · T级别`），填不存在的车号回 `bad-bike:<id>`。
+   - **对局时长的预设 + 随便填**：两个时长字段（`matchmaking.match_duration_seconds` /
+     `matchmaking.friendly_match_duration`，范围 60..2592000）都带
+     `5 分钟 / 30 分钟 / 1 小时 / 还原 6 小时` 四个一键按钮，**数字框本身随便填**；
+     「当前」那行同时给人话（`当前：300（5 分钟）`，前端 `durText()`），现状卡还有一条
+     「300 秒 = 测试值」的警告（`admin_bunker_status()`）。
   - **绝不直接编辑 `data/pvp_state.json`**：金票 / 筹码 / 段位 / 星 / 连胜只走 `/__api/admin/*`
     （内部走 `_pvp_request` 事务），手改文件会被服务端下次写盘覆盖。
 

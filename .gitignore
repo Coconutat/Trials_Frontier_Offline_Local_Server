@@ -77,3 +77,6 @@ server/data/ghosts/inbox/
 # wts_rewards.json 是游戏奖励表（WebUI 要读），单独放行、必须入库。
 server/data/*.json
 !server/data/wts_rewards.json
+# 8123 的 stdout/stderr（重定向到文件，见 server/README.md「启动」一节）：
+# 含真人 id 与对局细节，只当现场证据用，不入库。
+server/data/*.log

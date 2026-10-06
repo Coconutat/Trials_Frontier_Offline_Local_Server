@@ -56,9 +56,11 @@ server/data/ghosts/
 | `server/data/save/` | **玩家真实存档**（金币、赛道纪录、identifier） |
 | `server/data/ghosts/store/` / `index.json` / `replays.json` / `inbox/` | 玩家上传的幽灵与登记表 |
 | `server/data/tf_config.json` | **线上手调参数**（已改成不入库，见 §7） |
+| `server/data/server.log` / `server.err.log` | 8123 的 stdout/stderr（`-u` + `-Redirect*` 落的现场：`[pvp] open/close …`、`[save] …`、`[admin] …`；含真人 id） |
+| `work/trials-frontier/notes/server-log.jsonl` | 每请求一条 JSONL（**含请求头**），19 MB 量级且在长，不入库只当证据 |
 | `APKS/` / `tmp/` / `dist/*`（除 `dist/README.md`）/ `pvp_docs/` | 原版 APK 备份与手机截图 / 构建中间产物 / 交付包 / 超范围设计稿 |
 
-`.gitignore` 末尾用 `server/data/*.json` 兜底，**例外放行** `!server/data/wts_rewards.json`（游戏奖励表，WebUI 要用，必须入库）。
+`.gitignore` 末尾用 `server/data/*.json` 兜底，**例外放行** `!server/data/wts_rewards.json`（游戏奖励表，WebUI 要用，必须入库）；`server/data/*.log` 单独一行兜住 8123 的 stdout/stderr。
 
 ## 3. 个人信息残留
 

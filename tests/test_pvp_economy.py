@@ -198,6 +198,23 @@ class PVPEconomyTest(unittest.TestCase):
         self.assertEqual(srv._pvp_chips_for(PLAYER), expected)
         self.assertEqual(srv._pvp_players[PLAYER]["star"], 1)
 
+    def test_match_won_needs_only_a_majority_of_played_tracks(self):
+        # 用户 m08968 真机：对局被计时器截断（`match_duration_seconds = 300` 的测试值）
+        # 时 3 条赛道只跑完 1 条 —— 客户端屏幕判**胜利**，老规则「占住 ≥2 条」却算出
+        # 0 个赢家，服务端当平局：星章不动、和屏幕完全对不上。
+        mid = self.match()["id"]
+        m = srv._pvp_matches[mid]
+        bot = srv._pvp_bot_id()
+        self.assertFalse(srv._pvp_match_won(m, PLAYER), "0:0 是平局，谁都不赢")
+        self.race(mid, 1041)                       # 只跑 1 条，且快过人机（人机永远更慢）
+        self.assertEqual(srv._pvp_owner_of(m, 1041), PLAYER)
+        self.assertTrue(srv._pvp_match_won(m, PLAYER), "1:0 也算赢")
+        self.assertFalse(srv._pvp_match_won(m, bot))
+        for tid in (1062, 1024):                   # 人机抢走另两条 ⇒ 1:2 就该输
+            m["results"].setdefault(bot, {})[tid] = {"score": srv._pvp_score_int(1)}
+        self.assertFalse(srv._pvp_match_won(m, PLAYER))
+        self.assertTrue(srv._pvp_match_won(m, bot))
+
     def test_reward_deltas_retry_semantics_and_expiry(self):
         mid = self.match()["id"]
         rid = self.race(mid)[2]["race_id"]

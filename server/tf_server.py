@@ -4631,12 +4631,28 @@ def _pvp_owner_of(m, tid):
 
 
 def _pvp_match_won(m, who):
-    """这局 `who` 赢了吗 —— 3 条赛道里占住 ≥2 条即赢（用户 m04404 引用的规则）。"""
-    owners = {}
+    """这局 `who` 赢了吗 —— **占住的赛道比对手多**就算赢。
+
+    ★ 2026-10-06 由「3 条里占住 ≥2 条」改成「比对手占得多」（用户 m08968 真机）：
+      那一局是到点截断的（`matchmaking.match_duration_seconds = 300` 的测试值），
+      3 条赛道只跑完 1 条、玩家占住它 —— 客户端屏幕判**胜利**，老规则却算出 0 个
+      赢家 ⇒ 服务端当平局：星章不动、连胜清零，和屏幕完全对不上。
+      现在 1:0 与 2:1 都算赢，**0:0 仍是平局**（谁都没跑出成绩）。
+      份额完全取自 `_pvp_owner_of`（与客户端 `parseMatch` 同一套 score 比较）。
+    """
+    pids = list(m.get("players") or [])
+    if len(pids) < 2:
+        pids = (pids + [_pvp_bot_id()])[:2]
+    if who not in pids:
+        return False
+    mine = theirs = 0
     for tid in (m.get("tracks") or []):
         o = _pvp_owner_of(m, tid)
-        owners[o] = owners.get(o, 0) + 1
-    return owners.get(who, 0) >= 2
+        if o == who:
+            mine += 1
+        elif o is not None and o in pids:
+            theirs += 1
+    return mine > theirs
 
 
 def _chip_curve():
@@ -4992,6 +5008,11 @@ def _pvp_make_match(players, track=None, bot=False):
         #   结算不受影响：`_pvp_bank_match_chips` 只加「本局产出」= match − base。
         _pvp_matches[mid]["chip_base"][p] = 0
     _pvp_mark_dirty()
+    # Log one line per match: 用户 m08968「对局突然结束」这类问题，靠 stdout 里的
+    # `open` / `close` 两行就能定位（开局时间、时长、赛道、是否人机）。
+    print("[pvp] open mid=%s players=%s tracks=%s dur=%ss bot=%s"
+          % (mid, ",".join(players), ",".join(str(t) for t in tracks), dur, bool(bot)),
+          flush=True)
     return mid
 
 
@@ -5480,6 +5501,18 @@ def h_pvp_close(path, query, body, headers):
         return _pvp_error(400, "invalid-close")
     _pvp_bank_match_chips(match)
     winner = next((p for p in match["players"] if _pvp_match_won(match, p)), "")
+    # ★ 一行对局总结（用户 m08968：对局「突然结束」必须有据可查）。到点后客户端的
+    #   下一次 start_race 会吃 409 `match-ended`（见 h_pvp_start_race），它据此收局；
+    #   所以这里打 `elapsed` 与「跑出成绩的赛道数」，一眼就能看出是不是被计时器截断的。
+    _mid = next((k for k, v in _pvp_matches.items() if v is match), "?")
+    _owners = ",".join("%s=%s" % (tid, (_pvp_owner_of(match, tid) or "-")[:8])
+                       for tid in (match.get("tracks") or []))
+    _done = sum(1 for tid in (match.get("tracks") or [])
+                if any(tid in ((match.get("results") or {}).get(p) or {})
+                       for p in match["players"]))
+    print("[pvp] close mid=%s closer=%s dur=%ss elapsed=%ss winner=%s tracks=%s done=%d/%d"
+          % (_mid, pid, match["dur"], int(time.time()) - int(match["start"]),
+             winner or "-", _owners, _done, len(match.get("tracks") or [])), flush=True)
     state = _pvp_player_state(pid)
     rank = state["rank"]
     caps = _pvp_star_array()

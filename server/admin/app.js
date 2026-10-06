@@ -1640,6 +1640,21 @@ function bunkerVal(f, v) {
   return fmtNum(v);
 }
 
+// 秒 → 人话。用户 m08968：线上 match_duration_seconds 被手写成 300（测试值），
+// 打进对局 5 分钟就被客户端按 start_time+total_time 收了局，光看数字不易发现。
+function durText(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if (s < 60) return t('app.span.s', { s: fmtNum(s) });
+  if (s < 3600) {
+    return s % 60 === 0 ? t('app.span.m', { m: fmtNum(s / 60) }) : t('app.span.s', { s: fmtNum(s) });
+  }
+  if (s % 3600 === 0) return t('app.span.h', { h: fmtNum(s / 3600) });
+  return t('app.span.hm', { h: fmtNum(Math.floor(s / 3600)),
+                            m: fmtNum(Math.round((s % 3600) / 60)) });
+}
+const DUR_KEYS = ['matchmaking.match_duration_seconds', 'matchmaking.friendly_match_duration'];
+function isDurKey(k) { return DUR_KEYS.indexOf(k) >= 0; }
+
 // 赛季奖励表：名次 0..25 一行，金币/钻石各一个数量框，特殊奖励一个「下拉 + 可手填」的
 // 输入框（原表 RewardID → 名字，见 item-ids.md §8c）。
 // ★ 数量是**每档增量**：客户端会把名次 R 及以上的档位累加起来发。
@@ -1814,7 +1829,9 @@ async function screenBunker() {
   // 一个字段 → 控件。清空数字框 = 删掉这个键（回到代码默认值），服务端支持。
   function bControl(f) {
     const k = f.key, kind = f.kind;
-    const cur = el('span', { class: 'hint', text: t('bunker.nowIs', { v: bunkerVal(f, f.now) }) });
+    const cur = el('span', { class: 'hint', text: isDurKey(k)
+      ? t('bunker.nowIsDur', { v: bunkerVal(f, f.now), d: durText(f.now) })
+      : t('bunker.nowIs', { v: bunkerVal(f, f.now) }) });
     if (kind === 'int' || kind === 'float') {
       // 车号给一个下拉提示（19 台车，带级别），并实时显示选中的是哪台车。
       if (k === 'matchmaking.bike_id') {
@@ -1830,9 +1847,10 @@ async function screenBunker() {
                        { min: f.min, max: f.max, list: 'tfBikesBunker' }), dl, tip, cur];
       }
       const box = numBox(draft[k], v => set(k, v), { min: f.min, max: f.max });
-      if (k === 'matchmaking.match_duration_seconds') {
-        const presets = [[300, t('app.span.m', { m: 5 })], [3600, t('weekly.rules.p1h')],
-                         [21600, t('bunker.reset6h')]];
+      // 时长（排位 6 小时 / 好友局 1 小时）：常用值一键填，数字框本身随便填（60..2592000）。
+      if (isDurKey(k)) {
+        const presets = [[300, t('app.span.m', { m: 5 })], [1800, t('app.span.m', { m: 30 })],
+                         [3600, t('app.span.h', { h: 1 })], [21600, t('bunker.reset6h')]];
         return presets.map(p => el('button', { class: 'btn tiny', type: 'button', text: p[1],
           onclick: () => { draft[k] = p[0]; box.value = String(p[0]); } })).concat([box, cur]);
       }
