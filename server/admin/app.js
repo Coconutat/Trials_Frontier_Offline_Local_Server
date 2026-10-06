@@ -1,0 +1,865 @@
+'use strict';
+/* ============================================================================
+   Trials Frontier 后台 · 前端
+   ----------------------------------------------------------------------------
+   约定：
+     · 文案一律走 t()，字典在 /__admin/i18n.json（中英两节键必须一一对应，
+       tools 侧有离线自检）。
+     · **玩家可控的字符串（账号名、平台名、路径）只用 textContent 写入**，
+       绝不拼 innerHTML —— 这些值直接来自游戏客户端上报，是本项目的信任边界。
+     · 危险操作分两档：可撤销的（下发 / 回滚 / 清会话）给就地「撤销」；
+       真正不可逆的（删账号）才弹二次确认。
+   ========================================================================== */
+
+// ─────────────────────────────────────────────── 弹簧缓动
+// apple-design 要的是弹簧（阻尼 + 响应时长），不是固定时长 + 贝塞尔。
+// 把一个阻尼谐振子的阶跃响应采样成 CSS linear() 缓动串：
+//   x(t) = 1 − e^(−ζω₀t)·[cos(ω_d t) + (ζω₀/ω_d)·sin(ω_d t)],  ω₀ = 2π/response
+// ζ=1（关键阻尼）时 ω_d→0，取极限就是 1 − e^(−ω₀t)(1+ω₀t)。
+function springEase(damping, response) {
+  const w0 = 2 * Math.PI / response;
+  const N = 34;
+  // 采样到「已经基本静止」为止：ζ=1 约 1.4 个响应，欠阻尼约 1.8 个。
+  const settle = response * (damping >= 0.999 ? 1.4 : 1.8);
+  const pts = [];
+  for (let i = 0; i <= N; i++) {
+    const tt = settle * i / N;
+    const e = Math.exp(-damping * w0 * tt);
+    let v;
+    if (damping >= 0.999) {
+      v = 1 - e * (1 + w0 * tt);
+    } else {
+      const wd = w0 * Math.sqrt(1 - damping * damping);
+      v = 1 - e * (Math.cos(wd * tt) + (damping * w0 / wd) * Math.sin(wd * tt));
+    }
+    pts.push(Math.round(v * 1e4) / 1e4);
+  }
+  pts[0] = 0;
+  pts[N] = 1;
+  return { duration: settle * 1000, easing: 'linear(' + pts.join(',') + ')' };
+}
+
+// 自检：采样必须全是有限值、端点精确、关键阻尼不许冲过头、欠阻尼必须有回弹。
+// （这几条任一不成立，动效就会变成跳动或 NaN，肉眼未必立刻看得出来。）
+(function springSelfCheck() {
+  const cases = [[1.0, 0.34], [1.0, 0.3], [0.8, 0.42]];
+  for (const [z, r] of cases) {
+    const s = springEase(z, r);
+    const vals = s.easing.slice('linear('.length, -1).split(',').map(Number);
+    console.assert(vals.every(Number.isFinite), 'spring 出现非有限值', z, r);
+    console.assert(vals[0] === 0 && vals[vals.length - 1] === 1, 'spring 端点不对', z, r);
+    console.assert(s.duration > 0 && s.duration < 2000, 'spring 时长离谱', z, r, s.duration);
+    if (z >= 0.999) {
+      console.assert(Math.max.apply(null, vals) <= 1.0001, '关键阻尼不许回弹', z, r);
+    } else {
+      console.assert(Math.max.apply(null, vals) > 1, '欠阻尼应当有回弹', z, r);
+    }
+  }
+})();
+
+const HAS_LINEAR = !!(window.CSS && CSS.supports &&
+                      CSS.supports('transition-timing-function', 'linear(0,1)'));
+const SPRING = HAS_LINEAR ? springEase(1.0, 0.34) : { duration: 340, easing: 'cubic-bezier(.32,.72,0,1)' };
+
+function installSprings() {
+  if (!HAS_LINEAR) return;                 // 老浏览器留在 CSS 里的 cubic-bezier 退路上
+  const b = springEase(0.8, 0.34);
+  const root = document.documentElement.style;
+  root.setProperty('--spring', SPRING.easing);
+  root.setProperty('--spring-bouncy', b.easing);
+  root.setProperty('--dur', Math.round(SPRING.duration) + 'ms');
+}
+
+// ─────────────────────────────────────────────── 小工具
+
+const $ = (sel, root) => (root || document).querySelector(sel);
+
+function el(tag, props, ...kids) {
+  const n = document.createElement(tag);
+  if (props) {
+    for (const k of Object.keys(props)) {
+      const v = props[k];
+      if (v == null || v === false) continue;
+      if (k === 'text') n.textContent = String(v);
+      else if (k === 'class') n.className = v;
+      else if (k === 'style') n.style.cssText = v;
+      else if (k === 'dataset') Object.assign(n.dataset, v);
+      else if (k.slice(0, 2) === 'on' && typeof v === 'function') {
+        n.addEventListener(k.slice(2).toLowerCase(), v);
+      } else n.setAttribute(k, v === true ? '' : String(v));
+    }
+  }
+  for (const kid of kids) {
+    if (kid == null || kid === false) continue;
+    const list = Array.isArray(kid) ? kid : [kid];
+    for (const one of list) {
+      if (one == null || one === false) continue;
+      n.append(one instanceof Node ? one : document.createTextNode(String(one)));
+    }
+  }
+  return n;
+}
+
+function fmtTime(sec) {
+  const n = Number(sec);
+  if (!n) return t('app.never');
+  const d = new Date(n * 1000);
+  if (isNaN(d.getTime())) return t('app.unknown');
+  return d.toLocaleString(locale(), { year: 'numeric', month: '2-digit', day: '2-digit',
+                                      hour: '2-digit', minute: '2-digit' });
+}
+function fmtNum(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? v.toLocaleString(locale()) : '—';
+}
+function dash() { return el('span', { class: 'muted', text: '—' }); }
+
+async function copyText(s) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(s);
+      return true;
+    }
+  } catch (e) { /* 继续走退路 */ }
+  // 明文 HTTP 是**非安全上下文**，没有 clipboard API —— 而本项目恰恰只能走明文
+  // （客户端 manifest 不接受 HTTPS），所以这条退路是常态而不是兜底。
+  const ta = el('textarea', { style: 'position:fixed;top:-1000px;left:-1000px', text: s });
+  document.body.append(ta);
+  ta.select();
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+  ta.remove();
+  return ok;
+}
+
+function idCell(id) {
+  const s = id == null ? '' : String(id);
+  if (!s) return dash();
+  const short = s.length > 16 ? s.slice(0, 8) + '…' + s.slice(-4) : s;
+  return el('span', {
+    class: 'mono', text: short, title: s, style: 'cursor:copy',
+    onclick: async () => {
+      const ok = await copyText(s);
+      toast(ok ? t('app.copied') : s, { kind: ok ? 'good' : null, timeout: 1800 });
+    },
+  });
+}
+
+function table(cols, rows) {
+  const thead = el('thead', null, el('tr', null,
+    cols.map(c => el('th', { class: c.cls || null, text: c.label }))));
+  const tbody = el('tbody', null, rows.map(r => el('tr', null, cols.map(c => {
+    const td = el('td', { class: c.cls || null });
+    const v = c.render ? c.render(r) : r[c.k];
+    if (v instanceof Node) td.append(v);
+    else if (v != null) td.textContent = String(v);
+    return td;
+  }))));
+  return el('div', { class: 'scroll' }, el('table', { class: 'list' }, thead, tbody));
+}
+
+function reveal(nodes) {
+  nodes.forEach((n, i) => {
+    if (!(n instanceof HTMLElement) || typeof n.animate !== 'function') return;
+    try {
+      n.animate([{ opacity: 0, transform: 'translate3d(0,9px,0)' },
+                 { opacity: 1, transform: 'none' }],
+                { duration: SPRING.duration, delay: Math.min(i, 6) * 32,
+                  easing: SPRING.easing, fill: 'both' });
+    } catch (e) { /* 动画失败不该影响内容 */ }
+  });
+}
+
+// ─────────────────────────────────────────────── i18n
+
+let DICT = { cn: {}, en: {} };
+let LANG = 'cn';
+
+function locale() { return LANG === 'cn' ? 'zh-CN' : 'en-US'; }
+
+function t(key, vars) {
+  const s = (DICT[LANG] && DICT[LANG][key]) || DICT.cn[key] || key;
+  if (!vars) return s;
+  return s.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+}
+
+function applyI18n(root) {
+  for (const n of root.querySelectorAll('[data-i18n]')) n.textContent = t(n.dataset.i18n);
+}
+
+function setLang(lang) {
+  if (lang !== 'cn' && lang !== 'en') return;
+  LANG = lang;
+  try { localStorage.setItem('tf_lang', lang); } catch (e) { /* 隐私模式 */ }
+  applyLang();
+  document.title = t('app.name');
+  if (!$('#shell').hidden) show(state.screen);
+}
+
+function applyLang() {
+  document.documentElement.lang = locale();
+  document.documentElement.dataset.lang = LANG;
+  applyI18n(document);
+  for (const b of document.querySelectorAll('#langSeg button')) {
+    b.setAttribute('aria-pressed', String(b.dataset.lang === LANG));
+  }
+  const dot = $('#statusDot');
+  if (dot.className.indexOf('on') >= 0) dot.title = t('status.online');
+  else if (dot.className.indexOf('off') >= 0) dot.title = t('status.offline');
+}
+
+function pickLang() {
+  let saved = null;
+  try { saved = localStorage.getItem('tf_lang'); } catch (e) { /* 隐私模式 */ }
+  if (saved === 'cn' || saved === 'en') return saved;
+  return String(navigator.language || '').toLowerCase().indexOf('zh') === 0 ? 'cn' : 'en';
+}
+
+// ─────────────────────────────────────────────── HTTP
+
+async function api(path, opts) {
+  let res;
+  try {
+    res = await fetch(path, Object.assign({ credentials: 'same-origin' }, opts || {}));
+  } catch (e) {
+    throw Object.assign(new Error(t('msg.netError')), { net: true });
+  }
+  const txt = await res.text();
+  let body = null;
+  if (txt) { try { body = JSON.parse(txt); } catch (e) { body = { raw: txt }; } }
+  if (res.status === 401) {
+    throw Object.assign(new Error((body && body.message) || 'unauthorized'), { auth: true });
+  }
+  if (!res.ok) {
+    throw Object.assign(new Error((body && (body.message || body.error)) || ('HTTP ' + res.status)),
+                        { status: res.status, body });
+  }
+  return body;
+}
+
+function post(path, obj) {
+  return api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                     body: JSON.stringify(obj || {}) });
+}
+
+async function guarded(fn) {
+  try {
+    await fn();
+  } catch (e) {
+    if (e.auth) { showLogin(t('msg.authRequired')); return; }
+    toast(e.message || t('app.error'), { kind: 'bad' });
+    const pane = $('#pane');
+    if (pane) pane.replaceChildren(el('section', { class: 'card' },
+      el('div', { class: 'card-body' },
+        el('h2', { text: t('app.error') }),
+        el('p', { class: 'lead', text: e.message || '' }),
+        el('button', { class: 'btn', text: t('app.retry'), onclick: () => show(state.screen) }))));
+  }
+}
+
+// ─────────────────────────────────────────────── 提示条 / 确认框
+
+function toast(msg, opts) {
+  opts = opts || {};
+  const node = el('div', { class: 'toast' + (opts.kind ? ' ' + opts.kind : '') },
+    el('div', { class: 'grow', text: msg }),
+    opts.action ? el('button', {
+      class: 'btn tiny', text: opts.action.label,
+      onclick: () => { close(); opts.action.run(); },
+    }) : null,
+    el('button', { class: 'btn tiny bare', text: t('app.close'), onclick: () => close() }));
+  let closed = false;
+  function close() {
+    if (closed) return;
+    closed = true;
+    node.classList.add('out');
+    setTimeout(() => node.remove(), 240);
+  }
+  $('#toasts').append(node);
+  const ms = opts.timeout == null ? (opts.action ? 15000 : 4200) : opts.timeout;
+  if (ms) setTimeout(close, ms);
+  return close;
+}
+
+function confirmDialog(o) {
+  o = o || {};
+  return new Promise(resolve => {
+    const m = $('#modal'), ok = $('#modalOk'), cancel = $('#modalCancel'), body = $('#modalBody');
+    $('#modalTitle').textContent = o.title || t('app.confirm');
+    body.replaceChildren(o.body ? el('p', { text: o.body }) : document.createTextNode(''));
+    ok.textContent = o.okLabel || t('app.confirm');
+    m.hidden = false;
+    ok.focus();
+    function done(v) {
+      m.hidden = true;
+      ok.removeEventListener('click', onOk);
+      cancel.removeEventListener('click', onCancel);
+      m.removeEventListener('click', onBg);
+      document.removeEventListener('keydown', onKey);
+      resolve(v);
+    }
+    function onOk() { done(true); }
+    function onCancel() { done(false); }
+    function onBg(e) { if (e.target === m) done(false); }
+    function onKey(e) { if (e.key === 'Escape') done(false); }
+    ok.addEventListener('click', onOk);
+    cancel.addEventListener('click', onCancel);
+    m.addEventListener('click', onBg);
+    document.addEventListener('keydown', onKey);
+  });
+}
+
+// ─────────────────────────────────────────────── 状态 / 路由
+
+const state = { screen: 'accounts', saves: [], detail: null, grantProfile: '',
+                grantAmounts: {}, grantMode: 'add',
+                pvpAmounts: {}, pvpMode: 'add' };
+
+const SCREENS = {
+  accounts: { titleKey: 'nav.accounts', load: screenAccounts },
+  saves: { titleKey: 'nav.saves', load: screenSaves },
+  grant: { titleKey: 'nav.grant', load: screenGrant },
+};
+
+function route() {
+  const raw = location.hash.replace(/^#\/?/, '').split('?')[0];
+  show(raw in SCREENS ? raw : 'accounts');
+}
+
+async function show(name) {
+  state.screen = name;
+  $('#pageTitle').textContent = t(SCREENS[name].titleKey);
+  for (const a of document.querySelectorAll('.nav a')) {
+    if (a.dataset.nav === name) a.setAttribute('aria-current', 'page');
+    else a.removeAttribute('aria-current');
+  }
+  movePill();
+  const pane = $('#pane');
+  pane.replaceChildren(el('div', { class: 'loading', text: t('app.loading') }));
+  await guarded(async () => {
+    const nodes = await SCREENS[name].load();
+    pane.replaceChildren.apply(pane, nodes);
+    reveal(Array.prototype.slice.call(pane.children));
+  });
+}
+
+function movePill() {
+  const link = document.querySelector('.nav a[data-nav="' + state.screen + '"]');
+  const pill = $('#navPill');
+  if (!link || !pill || getComputedStyle(pill).display === 'none') return;
+  const nb = $('#nav').getBoundingClientRect(), lb = link.getBoundingClientRect();
+  if (!lb.height) return;
+  pill.style.opacity = '1';
+  pill.style.height = lb.height + 'px';
+  pill.style.transform = 'translateY(' + (lb.top - nb.top) + 'px)';
+}
+
+// ─────────────────────────────────────────────── 屏 · 账号
+
+function items2Map(content) {
+  const out = {};
+  const pairs = content && content.items2;
+  if (!Array.isArray(pairs)) return out;
+  for (let i = 0; i + 1 < pairs.length; i += 2) {
+    const k = Number(pairs[i]), v = Number(pairs[i + 1]);
+    if (Number.isFinite(k)) out[k] = Number.isFinite(v) ? v : 0;
+  }
+  return out;
+}
+
+function richCell(n) {
+  const v = Number(n) || 0;
+  return el('span', { class: 'nowrap' },
+    el('span', { class: 'num', text: fmtNum(v) }),
+    v < 10 ? el('span', { class: 'badge bad', style: 'margin-left:6px', text: t('saves.lowRich') }) : null);
+}
+
+async function screenAccounts() {
+  const [accs, devs, ses] = await Promise.all([
+    api('/__accounts'), api('/__devices'), api('/__sessions')]);
+  const perUser = {};
+  for (const s of Object.values(ses.sessions || {})) {
+    const u = s && s.user;
+    if (u) perUser[u] = (perUser[u] || 0) + 1;
+  }
+
+  async function clearSessions(username) {
+    const r = await post('/__api/admin/sessions/clear', username ? { username } : {});
+    toast(t('accounts.sessions.cleared', { n: r.removed }), { kind: 'good' });
+    show('accounts');
+  }
+
+  const sessCard = el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('accounts.sessions.title') }),
+      el('span', { class: 'badge', text: t('app.count', { n: ses.count }) }),
+      el('button', {
+        class: 'btn tiny danger', text: t('accounts.sessions.clearAll'),
+        onclick: async () => {
+          if (!await confirmDialog({ title: t('accounts.sessions.confirmTitle'),
+                                     body: t('accounts.sessions.confirmBody', { n: ses.count }),
+                                     okLabel: t('accounts.sessions.clearAll') })) return;
+          await clearSessions(null);
+        },
+      })),
+    el('div', { class: 'card-body' },
+      el('p', { class: 'lead', text: t('accounts.sessions.lead') })));
+
+  const cols = [
+    { label: t('accounts.col.user'), render: a => el('span', null,
+        el('b', { text: a.username }),
+        a.banned ? el('span', { class: 'badge bad', style: 'margin-left:6px', text: t('accounts.banned') }) : null) },
+    { label: t('accounts.col.profile'), render: a => idCell(a.profileId) },
+    { label: t('accounts.col.platform'), render: a => a.nameOnPlatform || dash() },
+    { label: t('accounts.col.created'), cls: 'nowrap', render: a => fmtTime(a.created) },
+    { label: t('accounts.col.lastLogin'), cls: 'nowrap', render: a => fmtTime(a.last_login) },
+    { label: t('accounts.col.logins'), cls: 'r num', render: a => fmtNum(a.logins) },
+    { label: t('accounts.col.remember'), render: a => a.rememberTicket
+        ? el('span', { class: 'badge acc', text: fmtNum(a.remember_uses) })
+        : dash() },
+    { label: t('accounts.sessions.title'), cls: 'r num',
+      render: a => fmtNum(perUser[a.username] || 0) },
+    { label: t('accounts.col.actions'), cls: 'act', render: a => el('span',
+        { style: 'display:inline-flex;gap:6px' },
+        el('button', { class: 'btn tiny', text: t('accounts.sessions.clearOne'),
+                       onclick: () => guarded(() => clearSessions(a.username)) }),
+        el('button', { class: 'btn tiny danger', text: t('accounts.delete'),
+                       onclick: () => guarded(async () => {
+                         if (!await confirmDialog({
+                           title: t('accounts.deleteConfirmTitle', { name: a.username }),
+                           body: t('accounts.deleteConfirmBody'),
+                           okLabel: t('accounts.delete') })) return;
+                         await post('/__api/delete', { username: a.username });
+                         toast(t('accounts.deleteDone', { name: a.username }), { kind: 'good' });
+                         show('accounts');
+                       }) })) },
+  ];
+
+  const accCard = el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('accounts.title') }),
+      el('span', { class: 'badge', text: t('app.count', { n: accs.count }) })),
+    table(cols, accs.accounts || []));
+
+  const devCols = [
+    { label: t('accounts.devices.col.device'), render: d => el('span', { class: 'mono', text: d.deviceId }) },
+    { label: t('accounts.devices.col.profile'), render: d => idCell(d.profileId) },
+    { label: t('accounts.devices.col.platform'), render: d => d.nameOnPlatform || dash() },
+    { label: t('accounts.devices.col.lastSeen'), cls: 'nowrap', render: d => fmtTime(d.last_seen) },
+    { label: t('accounts.devices.col.sessions'), cls: 'r num', render: d => fmtNum(d.sessions) },
+  ];
+  const devCard = el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('accounts.devices.title') }),
+      el('span', { class: 'badge', text: t('app.count', { n: devs.count }) })),
+    el('div', { class: 'card-body' },
+      el('p', { class: 'lead', text: t('accounts.devices.lead') })),
+    table(devCols, devs.devices || []));
+
+  const pwInput = el('input', { type: 'password', autocomplete: 'new-password',
+                                placeholder: t('accounts.admin.placeholder'),
+                                style: 'max-width:260px' });
+  const pwBtn = el('button', {
+    class: 'btn primary', text: t('accounts.admin.set'),
+    onclick: () => guarded(async () => {
+      if (pwInput.value.length < 8) { toast(t('accounts.admin.tooShort'), { kind: 'bad' }); return; }
+      pwBtn.disabled = true;
+      try {
+        await post('/__api/admin/password', { password: pwInput.value });
+        pwInput.value = '';
+        toast(t('accounts.admin.done'), { kind: 'good' });
+      } finally { pwBtn.disabled = false; }
+    }),
+  });
+  const pwCard = el('section', { class: 'card pad' },
+    el('h2', { text: t('accounts.admin.title') }),
+    el('p', { class: 'lead', text: t('accounts.admin.lead') }),
+    el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' }, pwInput, pwBtn));
+
+  return [sessCard, accCard, devCard, pwCard];
+}
+
+// ─────────────────────────────────────────────── 屏 · 存档
+
+function snapshotLabel(ts) {
+  const s = String(ts);
+  if (s.indexOf('pre_grant_') === 0) return t('saves.snapshotGrant');
+  if (s.indexOf('pre_restore_') === 0) return t('saves.snapshotRestore');
+  const n = Number(s);
+  return Number.isFinite(n) && n > 1e9 ? fmtTime(n) : s;
+}
+
+function kindBadge(s) {
+  if (s.kind === 'anon') return el('span', { class: 'badge', text: t('saves.kind.anon') });
+  if (s.kind === 'account') return el('span', { class: 'badge acc', text: t('saves.kind.account') });
+  return el('span', { class: 'badge warn', text: t('saves.kind.none') });
+}
+
+async function doRollback(profileId, ts, curRich, newRich) {
+  if (!await confirmDialog({
+    title: t('saves.rollbackConfirmTitle', { ts: snapshotLabel(ts) }),
+    body: t('saves.rollbackConfirmBody', { rich: curRich, new: newRich }),
+    okLabel: t('saves.rollback'),
+  })) return;
+  const r = await post('/__api/admin/rollback', { profile: profileId, ts });
+  toast(t('saves.rollbackDone', { ts: snapshotLabel(ts) }), {
+    kind: 'good',
+    action: r.snapshot ? {
+      label: t('saves.undoRollback'),
+      run: () => guarded(async () => {
+        await post('/__api/admin/revert', { profile: profileId, snapshot: r.snapshot });
+        toast(t('saves.undoRollbackDone', { ts: snapshotLabel(r.snapshot) }), { kind: 'good' });
+        show('saves');
+      }),
+    } : null,
+  });
+  show('saves');
+}
+
+function snapshotList(profileId, curRich, hist) {
+  if (!hist.length) return el('p', { class: 'hint', text: t('saves.noHistory') });
+  return el('div', { class: 'snaps' }, hist.map(h => el('div', { class: 'row' },
+    el('div', { class: 'grow' },
+      el('div', null, el('b', { text: snapshotLabel(h.ts) })),
+      el('div', { class: 'nm muted', text: h.ts + '  ·  ' + (h.saved_at_iso || '') })),
+    el('span', { class: 'nowrap muted' },
+      t('saves.col.items') + ' ' + fmtNum(h.items) + ' · ' +
+      t('saves.col.tracks') + ' ' + fmtNum(h.tracks)),
+    richCell(h.richness),
+    el('button', { class: 'btn tiny', text: t('saves.rollback'),
+                   onclick: () => guarded(() => doRollback(profileId, h.ts, curRich, h.richness)) }))));
+}
+
+function saveDetailCard(d) {
+  const m = items2Map(d.doc && d.doc.content);
+  const kv = el('div', { class: 'kv' },
+    el('div', null, el('div', { class: 'k', text: t('grant.item1') }),
+        el('div', { class: 'v', text: fmtNum(m[1]) })),
+    el('div', null, el('div', { class: 'k', text: t('grant.item2') }),
+        el('div', { class: 'v', text: fmtNum(m[2]) })),
+    el('div', null, el('div', { class: 'k', text: t('saves.item135') }),
+        el('div', { class: 'v', text: m[135] == null ? '—' : fmtNum(m[135]) })),
+    el('div', null, el('div', { class: 'k', text: t('saves.version') }),
+        el('div', { class: 'v', text: fmtNum((d.doc && d.doc.version) || 0) })),
+    el('div', null, el('div', { class: 'k', text: t('saves.col.richness') }),
+        el('div', { class: 'v', text: fmtNum(d.row ? d.row.richness : 0) })));
+  return el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('saves.detailTitle') }),
+      el('span', { class: 'mono muted', text: d.profileId }),
+      el('button', { class: 'btn tiny', text: t('app.close'),
+                     onclick: () => { state.detail = null; show('saves'); } })),
+    el('div', { class: 'card-body' },
+      kv,
+      el('p', { class: 'hint', text: t('saves.versionHint') }),
+      el('p', { class: 'hint', text: t('saves.richnessHint') })),
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('saves.historyTitle') }),
+      el('span', { class: 'badge', text: t('app.count', { n: d.history.length }) })),
+    el('div', { class: 'card-body' }, el('p', { class: 'lead', text: t('saves.historyLead') })),
+    snapshotList(d.profileId, d.row ? d.row.richness : 0, d.history));
+}
+
+async function screenSaves() {
+  const data = await api('/__saves');
+  state.saves = data.saves || [];
+  const nodes = [el('p', { class: 'lead', text: t('saves.lead') })];
+
+  if (state.detail) nodes.push(saveDetailCard(state.detail));
+
+  const cols = [
+    { label: t('saves.col.profile'), render: s => idCell(s.profileId) },
+    { label: t('saves.col.account'), render: s => s.account || el('span', { class: 'muted', text: t('saves.anonAccount') }) },
+    { label: t('saves.col.kind'), render: s => kindBadge(s) },
+    { label: t('saves.col.items'), cls: 'r num', render: s => fmtNum(s.items) },
+    { label: t('saves.col.tracks'), cls: 'r num', render: s => fmtNum(s.tracks) },
+    { label: t('saves.col.richness'), cls: 'r', render: s => richCell(s.richness) },
+    { label: t('saves.col.savedAt'), cls: 'nowrap', render: s => fmtTime(s.saved_at) },
+    { label: t('app.actions'), cls: 'act', render: s => el('button', {
+        class: 'btn tiny', text: t('saves.inspect'),
+        onclick: () => guarded(async () => {
+          const [doc, hist] = await Promise.all([
+            api('/__save?profile=' + encodeURIComponent(s.profileId)),
+            api('/__history?profile=' + encodeURIComponent(s.profileId))]);
+          state.detail = { profileId: s.profileId, row: s, doc: doc,
+                           history: hist.history || [] };
+          show('saves');
+        }) }) },
+  ];
+
+  nodes.push(el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('saves.title') }),
+      el('span', { class: 'badge', text: t('app.count', { n: state.saves.length }) })),
+    state.saves.length ? table(cols, state.saves)
+                       : el('div', { class: 'empty', text: t('app.empty') })));
+  return nodes;
+}
+
+// ─────────────────────────────────────────────── 屏 · 下发物品
+
+// 存档里能安全写下去的：items2 里只有这两个是「一个 id 对一个计数器」。
+// ⚠ 金票**不在这里** —— 玩家在竞技场看到的那几张是服务端 pvp_state.json 里的
+//   计数器，跟 items2 的 id 135 是两码事（真机实测，m00702）。
+const GRANT_ITEMS = [1, 2];
+// 竞技场余额：改服务端 pvp_state.json，客户端下次读 PVP 响应就看到，无需玩家操作。
+const PVP_ITEMS = ['golden_ticket', 'chips'];
+
+const PVP_LABEL = { golden_ticket: 'grant.pvpGolden', chips: 'grant.pvpChips' };
+
+function modeSeg(cur, onpick) {
+  return el('div', { class: 'seg' }, ['add', 'set'].map(mo => el('button', {
+    type: 'button', text: mo === 'add' ? t('grant.modeAdd') : t('grant.modeSet'),
+    'aria-pressed': String(cur === mo),
+    onclick: () => onpick(mo),
+  })));
+}
+
+async function screenGrant() {
+  const data = await api('/__saves');
+  state.saves = data.saves || [];
+  const nodes = [el('p', { class: 'lead', text: t('grant.lead') })];
+
+  if (!state.saves.length) {
+    nodes.push(el('section', { class: 'card' },
+      el('div', { class: 'empty', text: t('grant.noSave') })));
+    return nodes;
+  }
+  if (!state.saves.some(s => s.profileId === state.grantProfile)) {
+    state.grantProfile = state.saves[0].profileId;
+  }
+
+  const sel = el('select', { id: 'grantSlot', onchange: e => {
+    state.grantProfile = e.target.value;
+    state.grantAmounts = {};
+    state.pvpAmounts = {};
+    show('grant');
+  } }, state.saves.map(s => el('option', {
+    value: s.profileId, selected: s.profileId === state.grantProfile,
+    text: (s.account || t('saves.anonAccount')) + ' · ' + s.profileId.slice(0, 8) +
+          ' · ' + t('saves.col.richness') + ' ' + s.richness,
+  })));
+
+  let doc = null;
+  try {
+    doc = await api('/__save?profile=' + encodeURIComponent(state.grantProfile));
+  } catch (e) {
+    if (e.auth || e.net) throw e;
+    nodes.push(el('section', { class: 'card' },
+      el('div', { class: 'empty', text: t('grant.noSave') })));
+    return nodes;
+  }
+  // 竞技场读不到不算致命（刚建的槽可能还没打过 PVP），照常渲染，数值显示 —。
+  let pvp = null;
+  try {
+    pvp = (await api('/__api/admin/pvp?profile=' + encodeURIComponent(state.grantProfile))).player;
+  } catch (e) { if (e.auth || e.net) throw e; }
+
+  const m = items2Map(doc && doc.content);
+  const row = state.saves.filter(s => s.profileId === state.grantProfile)[0];
+  const bal = n => (n == null ? '—' : fmtNum(n));
+
+  const pick = el('section', { class: 'card' },
+    el('div', { class: 'card-head' }, el('h2', { class: 'grow', text: t('grant.pick') })),
+    el('div', { class: 'card-body' },
+      sel,
+      row ? el('div', { class: 'kv' },
+        el('div', null, el('div', { class: 'k', text: t('saves.col.richness') }),
+            el('div', { class: 'v', text: fmtNum(row.richness) })),
+        el('div', null, el('div', { class: 'k', text: t('saves.version') }),
+            el('div', { class: 'v', text: fmtNum(doc && doc.version) }))) : null));
+
+  // ── 竞技场：服务端即时生效 ────────────────────────────────────────────────
+  const pvpRows = PVP_ITEMS.map(name => el('div', { class: 'itemrow' },
+    el('div', { class: 'nm' },
+      el('b', { text: t(PVP_LABEL[name]) }),
+      el('span', { class: 'hint mono', text: name })),
+    el('div', { class: 'bal', text: t('grant.balance') + ' ' + bal(pvp && pvp[name]) }),
+    el('input', {
+      type: 'number', min: '0', step: '1', value: state.pvpAmounts[name] || '',
+      placeholder: '0', oninput: e => { state.pvpAmounts[name] = e.target.value; },
+    })));
+
+  const pvpSubmit = el('button', {
+    class: 'btn primary', text: t('grant.pvpSubmit'),
+    onclick: () => guarded(async () => {
+      const fields = {};
+      PVP_ITEMS.forEach(n => {
+        const v = Number(state.pvpAmounts[n] || 0);
+        if (v) fields[n] = v;
+      });
+      if (!Object.keys(fields).length) { toast(t('grant.zero'), { kind: 'bad' }); return; }
+      pvpSubmit.disabled = true;
+      try {
+        const r = await post('/__api/admin/pvp',
+          { profile: state.grantProfile, fields, mode: state.pvpMode });
+        toast(t('grant.pvpDone', { summary: r.applied.map(a =>
+          t(PVP_LABEL[a.field]) + ' ' + fmtNum(a.before) + ' → ' + fmtNum(a.after)
+        ).join('　') }), { kind: 'good' });
+        state.pvpAmounts = {};
+        show('grant');
+      } finally { pvpSubmit.disabled = false; }
+    }),
+  });
+
+  const pvpCard = el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('grant.pvpTitle') }),
+      modeSeg(state.pvpMode, mo => { state.pvpMode = mo; show('grant'); })),
+    el('div', { class: 'card-body' },
+      el('p', { class: 'lead', text: t('grant.pvpLead') }),
+      el('p', { class: 'hint mono', text: t('grant.pvpPlace') }),
+      pvpRows,
+      el('p', { class: 'hint', text: (pvp && pvp.known) ? [
+        t('grant.pvpRank') + ' ' + bal(pvp.rank),
+        t('grant.pvpStar') + ' ' + bal(pvp.star),
+        t('grant.pvpSeason') + ' ' + bal(pvp.season),
+        t('grant.pvpStreak') + ' ' + bal(pvp.win_streak),
+      ].join('　') : t('grant.pvpNever') })),
+    el('div', { class: 'card-head' }, el('span', { class: 'grow' }), pvpSubmit));
+
+  // ── 存档物品：要玩家在游戏里选「用云端」────────────────────────────────────
+  const saveRows = GRANT_ITEMS.map(id => el('div', { class: 'itemrow' },
+    el('div', { class: 'nm' },
+      el('b', { text: t('grant.item' + id) }),
+      el('span', { class: 'hint mono', text: 'items2 id ' + id })),
+    el('div', { class: 'bal', text: t('grant.balance') + ' ' + (m[id] == null ? '—' : fmtNum(m[id])) }),
+    el('input', {
+      type: 'number', min: '0', step: '1', value: state.grantAmounts[id] || '',
+      placeholder: '0', oninput: e => { state.grantAmounts[id] = e.target.value; },
+    })));
+
+  const submit = el('button', {
+    class: 'btn primary', text: t('grant.submit'),
+    onclick: () => guarded(async () => {
+      const items = GRANT_ITEMS.map(id => ({
+        item_id: id, amount: Number(state.grantAmounts[id] || 0), mode: state.grantMode,
+      })).filter(x => x.amount !== 0);
+      if (!items.length) { toast(t('grant.zero'), { kind: 'bad' }); return; }
+      submit.disabled = true;
+      try {
+        const r = await post('/__api/admin/grant', { profile: state.grantProfile, items });
+        const summary = r.applied.map(a =>
+          t('grant.item' + a.item_id) + ' ' + fmtNum(a.before) + ' → ' + fmtNum(a.after)).join('　');
+        toast(t('grant.doneBody', {
+          profile: state.grantProfile.slice(0, 8),
+          summary: summary,
+          from: r.server_version - 1,
+          to: r.server_version,
+        }), {
+          kind: 'good',
+          action: { label: t('grant.undo'), run: () => guarded(async () => {
+            await post('/__api/admin/revert', { profile: state.grantProfile, snapshot: r.snapshot });
+            toast(t('grant.undone', { ts: snapshotLabel(r.snapshot) }), { kind: 'good' });
+            show('grant');
+          }) },
+        });
+        state.grantAmounts = {};
+        show('grant');
+      } finally { submit.disabled = false; }
+    }),
+  });
+
+  const warn = el('section', { class: 'card pad', style: 'border-color:color-mix(in srgb, var(--warn) 40%, transparent)' },
+    el('h2', null, el('span', { class: 'badge warn', text: '!' }), ' ', t('grant.warnTitle')),
+    el('p', { class: 'lead', text: t('grant.warnBody') }),
+    el('p', { class: 'lead p-warn', text: t('grant.warnBody2') }));
+
+  nodes.push(pick, pvpCard, warn, el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t('grant.saveTitle') }),
+      modeSeg(state.grantMode, mo => { state.grantMode = mo; show('grant'); })),
+    el('div', { class: 'card-body' }, saveRows, el('p', { class: 'hint', text: t('grant.whitelist') })),
+    el('div', { class: 'card-head' }, el('span', { class: 'grow' }), submit)));
+  return nodes;
+}
+
+// ─────────────────────────────────────────────── 壳 / 登录
+
+function showLogin(msg) {
+  $('#shell').hidden = true;
+  $('#login').hidden = false;
+  const err = $('#loginErr');
+  if (msg) { err.textContent = msg; err.hidden = false; } else { err.hidden = true; }
+}
+
+function enterShell(username) {
+  $('#login').hidden = true;
+  $('#shell').hidden = false;
+  $('#whoami').textContent = username || '—';
+  route();
+  // 侧栏 pill 要等布局稳定后再量位置（首帧里 sidebar 还没铺开）。
+  requestAnimationFrame(movePill);
+}
+
+async function onLogin(e) {
+  e.preventDefault();
+  const form = e.target, err = $('#loginErr');
+  const btn = form.querySelector('button[type=submit]');
+  err.hidden = true;
+  btn.disabled = true;
+  try {
+    const r = await post('/__api/admin/login', {
+      username: form.username.value, password: form.password.value });
+    form.password.value = '';
+    enterShell(r.username);
+    toast(t('login.welcome', { name: r.username }), { kind: 'good', timeout: 2600 });
+    ping();
+  } catch (e2) {
+    err.textContent = e2.message || t('login.fail');
+    err.hidden = false;
+  } finally { btn.disabled = false; }
+}
+
+async function onLogout() {
+  try { await post('/__api/admin/logout', {}); } catch (e) { /* 本来就要退出 */ }
+  showLogin();
+}
+
+async function ping() {
+  const d = $('#statusDot');
+  try {
+    const r = await fetch('/__ping', { credentials: 'same-origin' });
+    d.className = 'dot ' + (r.ok ? 'on' : 'off');
+    d.title = r.ok ? t('status.online') : t('status.offline');
+  } catch (e) {
+    d.className = 'dot off';
+    d.title = t('status.offline');
+  }
+}
+
+async function boot() {
+  installSprings();
+  try {
+    const r = await fetch('/__admin/i18n.json', { credentials: 'same-origin' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    DICT = await r.json();
+  } catch (e) {
+    // 文案都没了就别装作能用，直接摊开说。
+    document.body.replaceChildren(el('div', { class: 'empty',
+      text: 'i18n.json 加载失败 / failed to load i18n.json: ' + e.message }));
+    return;
+  }
+  LANG = pickLang();
+  document.title = t('app.name');
+  applyLang();
+
+  $('#loginForm').addEventListener('submit', onLogin);
+  $('#btnLogout').addEventListener('click', onLogout);
+  $('#btnRefresh').addEventListener('click', () => show(state.screen));
+  $('#langSeg').addEventListener('click', e => {
+    const b = e.target.closest('button[data-lang]');
+    if (b) setLang(b.dataset.lang);
+  });
+  window.addEventListener('hashchange', route);
+  window.addEventListener('resize', movePill);
+
+  $('#boot').hidden = true;
+  try {
+    const me = await api('/__api/admin/me');
+    if (me && me.username) { enterShell(me.username); ping(); return; }
+  } catch (e) { /* 没登录就是这里，正常 */ }
+  showLogin();
+}
+
+boot();

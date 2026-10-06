@@ -832,6 +832,67 @@ def h_progress_version(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"version": ver, "time_stamp": ts}
 
 
+# 玩家等级（客户端的 "xp"）的唯一来源：它会自己上报，而不是我们存下来的。
+# 客户端每次启动都发 POST /public/targeting/v1/configuration，body 里带
+# {"xp": N, "player_name": ...}，实测随游玩递增：ccb@ccb.com 0→8→11→12→13→14、
+# HuaweiLover=3、LocalPlayer=8。★ 别再去存档里找了 —— items2 / profile /
+# settings / statistics2 / dailyexperience 全部翻过，没有这个数（见 b24）。
+# ★ 必须落盘。我原先判断"客户端每次启动都会重报，内存够了"是错的：用户每轮
+#   改完代码都会重启服务器，而他不会为了这个重开游戏 —— 于是云端摘要在
+#   「重启后、客户端下次上报前」这段空窗期里回 0，界面上又变成「等级 1」，
+#   正是他报的那个"很危险"的现象（m01175）。一个几十字节的文件换掉这类误判，值。
+_PLAYER_XP_PATH = os.path.join(HERE, "data", "player_levels.json")
+
+
+def _player_xp_load():
+    """读不出来就当他没有 —— 这只是个显示用的数字，绝不因为坏文件让服务器起不来。"""
+    try:
+        with open(_PLAYER_XP_PATH, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return {}
+    if not isinstance(obj, dict):
+        return {}
+    return {str(k): int(v) for k, v in obj.items()
+            if isinstance(v, int) or (isinstance(v, str) and v.lstrip("-").isdigit())}
+
+
+def _player_xp_save():
+    try:
+        os.makedirs(os.path.dirname(_PLAYER_XP_PATH), exist_ok=True)
+        tmp = _PLAYER_XP_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_player_xp, f)
+        os.replace(tmp, _PLAYER_XP_PATH)
+    except Exception:
+        pass
+
+
+_player_xp = _player_xp_load()
+
+
+def _remember_player_xp(headers, body):
+    """从 targeting 上报里记下玩家等级。
+
+    解析不出来就静默放过 —— 这只是个给「云端进度摘要」显示用的数字，不值得
+    为它把请求打回去。见 `_player_xp` 的注释。
+    """
+    try:
+        xp = int(json.loads(body.decode("utf-8")).get("xp"))
+    except Exception:
+        return
+    if xp < 0:
+        return
+    try:
+        pid = acct.serve_progress(headers, _client_ip(headers))[0]
+    except Exception:
+        return
+    # 同一次会话里客户端会把同一个数报很多遍，只有真变了才写盘。
+    if pid and _player_xp.get(pid) != xp:
+        _player_xp[pid] = xp
+        _player_xp_save()
+
+
 def h_progress_status(path, query, body, headers):
     """GET /public/playerprogress/v1/progress/status —— 云端进度摘要（cmd 0x25）。
 
@@ -850,13 +911,17 @@ def h_progress_status(path, query, body, headers):
         elif items[i] == 2:
             gems = int(items[i + 1] or 0)
     missions = len(((content or {}).get("missions2") or {}).get("solved") or [])
-    print("[save] 云端摘要：pid=%s note=%s coins=%d gems=%d missions=%d"
-          % (pid, note, coins, gems, missions), flush=True)
+    # ★ 这里以前写死 0，于是**每个**账号的「云端存档摘要」都显示最低等级 ——
+    # 玩家看到"云端的等级变成 1 了"会以为存档被清空，转头去点「用本地」，
+    # 正好把服务端的下发取消掉。玩家等级用客户端自己上报的那个数（见 _player_xp）。
+    level = _player_xp.get(pid, 0)
+    print("[save] 云端摘要：pid=%s note=%s coins=%d gems=%d missions=%d level=%d"
+          % (pid, note, coins, gems, missions, level), flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "coins": coins,
         "diamonds": gems,
         "missions_completed": missions,
-        "player_level": 0,
+        "player_level": level,
         "player_points": 0,
     }
 
@@ -948,7 +1013,10 @@ def h_profiles_query(path, query, body, headers):
         out.append({
             "profileId": pid, "userId": pid, "platformType": "ubimobile",
             "idOnPlatform": pid,
-            "nameOnPlatform": (FRIEND_NAMES.get(pid) or _WEEKLY_FAKE_NAMES.get(pid)
+            # 真人名字**必须**排在兜底池前面：否则别人在榜上看到的是
+            # 「Player53eb」这种由 pid 拼出来的假名，而不是 ccb@ccb.com（真机 m01172）。
+            "nameOnPlatform": (acct.name_for_profile(pid)
+                               or FRIEND_NAMES.get(pid) or _WEEKLY_FAKE_NAMES.get(pid)
                                or "Player" + pid[:4]),
         })
     return 200, {"Content-Type": "application/json"}, {"profiles": out}
@@ -1324,6 +1392,57 @@ def h_ghost(path, query, body, headers):
 #   "replay_id"   -> *(int*)(res+0xe4)
 # 所以 data/upgrades 必须是 JSON **整数**：之前的兜底 `{"data": []}` 会让
 # parseData 把数组节点的指针当位域用。
+# ★★ LeaderBoardData 的 `data`/`upgrades` 是**位域**，不是普通数字：
+#   `LeaderBoardData::parseData(res+0xb4)` / `parseUpgrades(res+0xb4)` 直接把它们解成
+#   外观与车辆升级，`tr::LeaderBoardData::getOutfit(int)` / `getBikeSkin()` 就是从解出来的
+#   结构里取值，在线解析出的对象随后被搬进
+#   `tr::OnlineDataContainer::{m_ghostOutfit, m_ghostBikeId, m_ghostBikeSkinIndex}`。
+#   反汇编 `encodeData()`@0x625178 与 `parseData()`@0x6250fc 得到 `data` 的布局：
+#     bits 0..7  = A  （encodeData 把它夹到 ≤0x63；真机所有行恒 0）
+#     bits 8..13 = C  （6 位，0x3F 是哨兵；真机取值 1/2/4/13）
+#     bits 14..19 / 20..25 / 26..31 = 骑手 outfit 的 part2 / part1 / part0，各 6 位
+#   part 的高 2 位与 bikeSkin 只在 `extradata` 里（`parseData2()`@0x625134）。
+#   真机 61 条真成绩 + 163 条占位行里 `data` **从没出现过 0**（最小 0x100，那是占位行 =
+#   三个 part 全 0，而 part==0 表示"没有这个部件"）——所以 `"data": 0` 解出来就是
+#   「幽灵服装/车身喷漆不对、骑手甚至没有脑袋」。
+def _lb_data(parts, c=1, a=0):
+    """按 `data` 的位布局拼一个值（`parts` = 骑手 part0/part1/part2，各 6 位）。"""
+    p0, p1, p2 = parts
+    return ((a & 0xFF) | ((c & 0x3F) << 8) | ((p2 & 0x3F) << 14)
+            | ((p1 & 0x3F) << 20) | ((p0 & 0x3F) << 26))
+
+
+# 真机实测出现过的整套骑手 part（part 0-79 有效，0 = 空）。
+_LB_GHOST_OUTFITS = (18, 23, 47, 8, 48)
+
+
+def _lb_ghost_data(owner):
+    """内置幽灵（owner 是 `6f857655` 这类 online-id 哈希）没有真成绩行可查时用的 `data`。
+
+    挑的都是客户端自己会产生的那几套骑手 part，并按 owner 稳定地分散，免得所有 AI 幽灵
+    穿同一件衣服。`upgrades` 的占位值本来就是 0。
+    """
+    seed = 0
+    for ch in str(owner or ""):
+        seed = (seed * 131 + ord(ch)) & 0xFFFFFFFF
+    p = _LB_GHOST_OUTFITS[seed % len(_LB_GHOST_OUTFITS)]
+    return _lb_data((p, p, p))
+
+
+def _ghost_appearance(track, rec, rows=None):
+    """幽灵的 `(data, upgrades)` 位域：优先用幽灵主人的**真实成绩行**，取不到退回基线。
+
+    `rows` 可以传一份已经读好的 leaderboards.json，免得每条幽灵都重读一次盘。
+    """
+    own = str((rec or {}).get("owner") or "")
+    if own and own not in OPPONENT_PIDS:
+        table = rows if rows is not None else _load_leaderboards()
+        row = ((table.get("track%d" % track) or {}).get(own) or {})
+        if row:
+            return int(row.get("data", 0) or 0), int(row.get("upgrades", 0) or 0)
+    return _lb_ghost_data(own), 0
+
+
 _ROBOT_NAMES = (
     "Robotman", "IronGear", "BrakeLess", "SandStorm", "GhostRider", "TangoPro",
     "HiVoltage", "RustBucket", "NitroNina", "WheelieKing", "CliffHanger",
@@ -1373,6 +1492,7 @@ def h_match_robot(path, query, body, headers):
             track = None
 
     name, drive, rec = _robot_opponent(track)
+    lb_data, lb_upgrades = _ghost_appearance(track, rec)
     print("[robot] %s 赛道 %s range=%s offset=%s -> 对手 %s (%d ms%s)"
           % (path, track, q.get("range"), q.get("offset"), name, drive,
              ", 幽灵 contentId=%s" % rec.get("contentId") if rec else ", 无幽灵"),
@@ -1382,9 +1502,10 @@ def h_match_robot(path, query, body, headers):
         #   的文件名，以及头像 URL 里的路径段。
         "player": name,
         "drivetime": drive,
-        # upgrades/data 是 LeaderBoardData 的位域整数，0 = 默认车。
-        "upgrades": 0,
-        "data": 0,
+        # upgrades/data 是 LeaderBoardData 的位域整数，见 `_lb_data`：
+        # 发 0 会被 parseData 解成「没有外观」→ 对手服装/车身喷漆不对、甚至没有脑袋。
+        "upgrades": lb_upgrades,
+        "data": lb_data,
         # score_value 用 1：parseJsonResponse 在调用 parseMatchMakingResult 之前
         # 就把 res+0xcc 预置成 1，说明这是客户端认的「有效」值。
         "score_value": 1,
@@ -2016,6 +2137,26 @@ def h_liveevents_accept(path, query, body, headers):
 # ---------------------------------------------------------------------------
 
 
+def _pvp_outfit_of(pid):
+    """这个玩家的骑手外观（24 位 = 3 个 8 位部件），取存档 `content.profile.outfit`。
+
+    ★ 为什么要它：对局界面（碉堡里那两张骑手立绘）由 `parseMatch` @0x4fd9d0 的
+      `player1`/`player2` 槽喂数据，槽里的 `outfit` 就是**对手穿的那套**。
+      原来这里发 0 → 客户端把对手画成 0 号部件（默认那套）。
+      真机证据（用户 m01793 的两张截图）：华为机上两侧骑手长得一模一样（都是自己
+      那套），ccb 机上是正常的骷髅白装 vs 黄盔迷彩 —— 因为 ccb 的存档
+      `profile.outfit = 0x121212` 而华为的是 0，发 0 时恰好把华为画对了、把 ccb 画错。
+      位布局（bits 26..31/20..25/14..19 = part0/1/2）见 `_lb_data`。
+    """
+    if not pid:
+        return 0
+    prof = ((acct.load_progress(pid) or {}).get("content") or {}).get("profile") or {}
+    try:
+        return int(prof.get("outfit") or 0) & 0xFFFFFF
+    except (TypeError, ValueError):
+        return 0
+
+
 def _pvp_player_info(chips=None, tickets=3, rank=None, pid=None):
     """`parseRankingData` @0x4fc918 的响应契约（键地址已逐个确认）。
 
@@ -2050,13 +2191,18 @@ def _pvp_season_window(season_id=None):
     return sid, (sid - 1) * duration, sid * duration
 
 
+# 新玩家初始金票数。老服务器的广告值就是 3，`_pvp_player_state()` 建新档要用，
+# 后台（WebUI）在玩家还没建过 PVP 档时也要显示同一个数，所以提成常量。
+_PVP_DEFAULT_GOLDEN_TICKET = 3
+
+
 def _pvp_player_state(pid):
     if pid not in _pvp_players:
         _pvp_players[pid] = {
             "rank": max(1, min(25, cfg_int("matchmaking", "start_rank", default=25))),
             "star": 0, "season": _pvp_season_window()[0], "win_streak": 0,
             # Preserve the old server's advertised initial golden-ticket balance.
-            "golden_ticket": 3,
+            "golden_ticket": _PVP_DEFAULT_GOLDEN_TICKET,
         }
         _pvp_mark_dirty()
     return _pvp_players[pid]
@@ -2512,6 +2658,76 @@ def _pvp_spend_chips(pid, amount):
     return st["chips"]
 
 
+# ---------------------------------------------- 后台（WebUI）改 PVP 服务端状态
+# 为什么 PVP 余额可以「下发即生效」而存档物品不行（真机实测，m00702）：
+#   存档 items2 是**客户端**整份上报覆盖的，服务端改了 version 也只能指望
+#   客户端弹冲突界面让玩家选「用云端」；实测冷启动路径上客户端拿到
+#   remote=115 之后仍然直接 POST 了自己的本地档，下发当场被抹掉。
+#   PVP 余额正相反：客户端**只发增减指令**（开局扣一张、礼物加 N 张），
+#   余额真源一直在服务端的 pvp_state.json，下次读 PVP 响应就看到了。
+PVP_GRANTABLE = ("golden_ticket", "chips")
+
+
+def pvp_read(profile_id):
+    """后台展示用：该玩家 id 的 PVP 服务端余额。不建档（只读不产生副作用）。
+
+    没建过 PVP 档时 golden_ticket 报**客户端会看到的默认值**
+    `_PVP_DEFAULT_GOLDEN_TICKET`，而不是 None —— 界面上要显示的就是玩家
+    此刻在游戏里看到的那个数。
+    """
+    st = _pvp_players.get(profile_id) or {}
+    ch = _pvp_chips.get(profile_id) or {}
+    return {
+        "known": profile_id in _pvp_players,
+        "golden_ticket": int(st.get("golden_ticket", _PVP_DEFAULT_GOLDEN_TICKET) or 0),
+        "chips": int(ch.get("chips", 0) or 0),
+        "rank": st.get("rank"),
+        "star": st.get("star"),
+        "season": st.get("season"),
+        "win_streak": st.get("win_streak"),
+    }
+
+
+def pvp_grant(profile_id, fields, mode="add"):
+    """后台改 PVP 服务端余额并**立刻落盘**。返回 (summary, error)。
+
+    fields: {"golden_ticket": 2000, "chips": 5000}；mode: "add" | "set"。
+    先整份校验再动手，避免只写了一半。
+    """
+    if not profile_id or not isinstance(fields, dict) or not fields:
+        return None, "bad-request"
+    if mode not in ("add", "set"):
+        return None, "bad-mode"
+    plan = []
+    for name, raw in fields.items():
+        if name not in PVP_GRANTABLE:
+            return None, "not-grantable:" + str(name)
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            return None, "bad-value:" + str(name)
+        if val < 0:
+            return None, "negative:" + str(name)
+        plan.append((name, val))
+    out = []
+    for name, val in plan:
+        if name == "golden_ticket":
+            st = _pvp_player_state(profile_id)     # 按需建档（会标脏）
+            before = int(st.get("golden_ticket") or 0)
+            st["golden_ticket"] = val if mode == "set" else before + val
+        else:
+            st = _pvp_chips_state(profile_id)
+            # 必须先把「按时间产出」的那部分结算掉再覆盖，否则会把挂账的筹码吞掉。
+            _pvp_chips_for(profile_id)
+            before = int(st.get("chips") or 0)
+            st["chips"] = val if mode == "set" else before + val
+        _pvp_mark_dirty()
+        out.append({"field": name, "before": before, "after": int(st["golden_ticket"]
+                   if name == "golden_ticket" else st["chips"])})
+    _pvp_state_save(force=True)                    # 后台改动立刻持久化，不等 10 秒节流
+    return {"applied": out, "mode": mode, "player": pvp_read(profile_id)}, None
+
+
 def _pvp_bot_id():
     return cfg("matchmaking", "bot_profile_id", default=None) or _PVP_ROBOT_ID
 
@@ -2860,8 +3076,8 @@ def _pvp_bank_match_chips(m):
     """整局跑完 → 把局内筹码结算进 `_pvp_chips`（幂等）。
 
     结算分两步：
-      1. **局内新产的筹码**进各自余额 —— 只加 `_pvp_match_chips - chip_base` 这一段差值，
-         否则 `chip_base` 里那份「入场时已有的余额」会被重复加一次；
+      1. **局内新产的筹码**进各自余额 —— 只加 `_pvp_match_chips - chip_base` 这一段差值。
+         `chip_base` 恒为 0（局内筹码从 0 起算，见建局处），所以差值就是本局产出；
       2. **赢家掠夺输家这一局里产出的筹码**：`chips.match_loser_keeps_pct`（默认 50）
          是输家保住的比例，其余转给赢家。
          ⚠ 抢的是**这一局里对方占赛道产出的那部分**（`gains`），
@@ -3029,7 +3245,8 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
             if sc > 0:
                 out[slot] = _pvp_track_result(_pvp_time_of_score(sc),
                                               _pvp_faults_of_score(sc),
-                                              bike_data=(rec.get("bike_data") or bike))
+                                              bike_data=(rec.get("bike_data") or bike),
+                                              outfit=(rec.get("outfit") or 0))
         return out
 
     # Each slot has its own tickets/rank; rewards remains a shared match pool.
@@ -3048,7 +3265,9 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
             "chips": chips,
             "rank": info["rank"],
             "elo_rank": info["elo_rank"],
-            "outfit": 0,
+            # ★ 对手的骑手外观：必须发这个玩家的真值，发 0 = 画成默认那套
+            #   （见 `_pvp_outfit_of` 的真机证据）。
+            "outfit": _pvp_outfit_of(pid),
             # Native +0x1b8: per-player special-reward progress, not the shared pool.
             "reward_data": int(_m.get("reward_data", {}).get(pid, 0)),
         }
@@ -3108,11 +3327,14 @@ def _pvp_make_match(players, track=None, bot=False):
     for p in players:
         if not p:
             continue
-        # ★ `chip_base` 必须是「这一局开始时此人已有的筹码余额」：
-        #   客户端画的那个数字是 `chip_base + 局内从占住赛道产的筹码`
-        #   （`_pvp_match_chips`），发 0 就等于每局都把对手的筹码清零
-        #   （用户 m04835：「这一把AI的筹码清零了」）。
-        _pvp_matches[mid]["chip_base"][p] = int(_pvp_chips_for(p) or 0)
+        # ★ `chip_base` 恒为 0：**局内筹码和局外钱包是两笔钱**（用户 m01903：
+        #   「局外筹码是局外筹码。局内筹码是0，只有赢得一条赛道，那个赛道开始产出
+        #   筹码才会增加。怎么可能是直接从玩家局外筹码同步」）。
+        #   客户端画的数字 = `chip_base + 局内占赛道产出的筹码`，所以发 0 时那个数字
+        #   就从 0 起步、只随占住的赛道长大。曾经把钱包余额灌进来，结果对手头像下面
+        #   直接显示你的存款（真机：115313 / 999999）。
+        #   结算不受影响：`_pvp_bank_match_chips` 只加「本局产出」= match − base。
+        _pvp_matches[mid]["chip_base"][p] = 0
     _pvp_mark_dirty()
     return mid
 
@@ -3476,6 +3698,16 @@ def h_pvp_start_race(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {}
 
 
+def _pvp_reported(value, mask, fallback=0):
+    """客户端在对局上报里带过来的外观字段。
+
+    `bike_data` 按字节读（`PVPTrack+0x2C`，0xb869e0），`outfit` 是 24 位 = 3×8 位骑手部件
+    （见 `_lb_data` 的位布局注释）。**只认整数**，类型不对或超范围一律回退 —— 这两个值
+    后面会被当位域/字节用，放进去一个字符串等于让客户端去解一个指针。
+    """
+    return value if type(value) is int and 0 <= value <= mask else fallback
+
+
 def h_pvp_race(path, query, body, headers):
     data, pid, match = _pvp_post_match(body, headers)
     if match is None:
@@ -3499,7 +3731,15 @@ def h_pvp_race(path, query, body, headers):
     previous_owner = _pvp_owner_of(match, tid)
     by = match.setdefault("results", {}).setdefault(pid, {})
     if score > int(by.get(tid, {}).get("score", 0)):
-        by[tid] = {"score": score, "additional_score": 0, "bike_data": cfg_int("matchmaking", "bike_id", default=1), "at": now}
+        # ★ `bike_data` / `outfit` 是**客户端自己报上来的**（模板 `{"…","outfit": %d,
+        #   "bike_data": %d}` @0xb86637 就在 `pvp_matches/v1/race` 的上报体里）。以前这里
+        #   写死 `matchmaking.bike_id`，于是不管你骑哪辆车、穿哪套衣服，对手看到的都是
+        #   那辆默认车 —— 「车子喷漆是错的」在 PvP 这条路上就是这么来的。
+        by[tid] = {"score": score, "additional_score": 0,
+                   "bike_data": _pvp_reported(data.get("bike_data"), 0xFF,
+                                              cfg_int("matchmaking", "bike_id", default=1)),
+                   "outfit": _pvp_reported(data.get("outfit"), 0xFFFFFF),
+                   "at": now}
     _pvp_bot_runs(match, tid, now=now, my_ms=_pvp_time_of_score(score))
     owner = _pvp_owner_of(match, tid)
     changed = owner != previous_owner
@@ -3844,6 +4084,8 @@ def h_targeting_configuration(path, query, body, headers):
     """
     print("[targeting] configuration body=%s"
           % body[:200].decode("utf-8", "replace"), flush=True)
+    # 顺手把客户端报的玩家等级记下来，给 /progress/status 的「云端摘要」用。
+    _remember_player_xp(headers, body)
     return 200, {"Content-Type": "application/json"}, {}
 
 
@@ -4008,13 +4250,17 @@ def _opponent_entries():
         recs.sort(key=lambda r: (r.get("drive_time") or 0, r.get("contentId") or 0))
         # 内置幽灵才折成假对手，撑起排行榜的行（行为与以前一致）。
         builtins = [r for r in recs if r.get("builtin") or r.get("legacy_path")]
+        real_rows = _load_leaderboards()      # 一次读好，别在循环里重读盘
         for pid, rec in zip(OPPONENT_PIDS, builtins):
+            lb_data, lb_upgrades = _ghost_appearance(track, rec, real_rows)
             rows.setdefault(pid, {})[board] = {
                 "player": pid,
                 "drivetime": int(rec.get("drive_time") or 0),
                 "submittime": int(rec.get("created") or 0),
-                "data": 0,
-                "upgrades": 0,
+                # ★ 不能发 0：见 `_lb_data` —— data 是 LeaderBoardData 的
+                #   外观位域，发 0 点进去挑战的幽灵就会「服装/车身喷漆不对、没有脑袋」。
+                "data": lb_data,
+                "upgrades": lb_upgrades,
                 "extradata": 0,
                 "updated": int(rec.get("updated") or 0),
             }
@@ -4282,11 +4528,18 @@ def _aggregate_global_entries():
                 "extradata": 0,
                 "global_score": 0.0,
                 "updated": 0,
+                "tracks": 0,
             })
-            out["data"] += 1
+            # ★ data 是 LeaderBoardData 的**外观位域**（parseData/getOutfit/getBikeSkin
+            #   直接解它），绝不能拿它当「跑过几条赛道」的计数器 —— 那样真人总榜行的
+            #   data 只剩个位数，客户端解出来就是「服装/车身喷漆不对、骑手没有脑袋」。
+            #   跟 upgrades/extradata 一样按位合并，计数另开 `tracks`（`_rank_entry`
+            #   的白名单会把它挡在响应之外）。
+            out["data"] |= int(row.get("data", 0) or 0)
             # upgrades/extradata 是位掩码，合并而非相加。
             out["upgrades"] |= int(row.get("upgrades", 0) or 0)
             out["extradata"] |= int(row.get("extradata", 0) or 0)
+            out["tracks"] += 1
             out["submittime"] = max(out["submittime"], int(row.get("submittime", 0) or 0))
             out["drivetime"] += drivetime
             out["score_value"] += int(row.get("score_value", 0) or 0)
@@ -4298,7 +4551,7 @@ def _aggregate_global_entries():
                 out["global_score"] += float(row.get("score_value", 0) or 0)
             out["updated"] = max(out["updated"], int(row.get("updated", 0) or 0))
     rows = list(totals.values())
-    rows.sort(key=lambda r: (-float(r["global_score"]), -int(r["data"]), r["player"]))
+    rows.sort(key=lambda r: (-float(r["global_score"]), -int(r["tracks"]), r["player"]))
     return [dict(row, rank=rank) for rank, row in enumerate(rows, 1)]
 
 
@@ -4659,6 +4912,24 @@ load();
 """
 
 
+# ------------------------------------------------ 后台管理页（/__admin）
+# 页面本体与静态资源都放在 server/admin/ 下的**真实文件**里，不再往 Python
+# 字符串里塞 HTML —— 改界面不用碰这个文件，也不引入任何构建步骤（纯标准库）。
+#
+# ★ 用「路径 -> 文件名」的白名单字典，而不是把 path 拼到目录后面：
+#   拼路径就等于把 `..%2f..%2ftf_server.py` 这类穿越交给 OS 去判断，
+#   白名单表里查不到就是 404，穿越无从谈起。
+_ADMIN_DIR = os.path.join(HERE, "admin")
+_ADMIN_FILES = {
+    "/__admin": ("index.html", "text/html; charset=utf-8"),
+    "/__admin/": ("index.html", "text/html; charset=utf-8"),
+    "/__admin/app.css": ("app.css", "text/css; charset=utf-8"),
+    "/__admin/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    # 文案单独放 JSON：Python 侧的离线自检能直接 load 它并核对中英键是否一一对应。
+    "/__admin/i18n.json": ("i18n.json", "application/json; charset=utf-8"),
+}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "TFLocal/0.1"
@@ -4699,11 +4970,8 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
 
         # 内省端点
-        if path == "/__log":
-            with LOG_LOCK:
-                data = json.dumps(RECENT[-100:], ensure_ascii=False, indent=1).encode("utf-8")
-            self._send(200, {"Content-Type": "application/json"}, data)
-            return
+        # ★ /__log 不在这里抄近路：它必须和别的 /__* 一样过 _introspect 里的门禁，
+        #   在 _handle 里提前 return 等于绕过访问控制（日志里有全部请求路径）。
         if path == "/__ping":
             self._send(200, {"Content-Type": "text/plain"}, b"pong\n")
             return
@@ -4777,9 +5045,64 @@ class Handler(BaseHTTPRequestHandler):
                        json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8"))
             return True
 
+        # ------------------------------------------------ 后台管理页 /__admin
+        # ★ 静态页放在门禁**之前**：登录表单本身要先能加载出来。
+        #   它不含任何数据，所有数据都走下面那些被门禁护住的 JSON 端点。
+        if path in _ADMIN_FILES:
+            name, ctype = _ADMIN_FILES[path]
+            try:
+                with open(os.path.join(_ADMIN_DIR, name), "rb") as f:
+                    blob = f.read()
+            except OSError as exc:
+                return js({"ok": False, "error": "admin-ui-missing",
+                           "path": os.path.join(_ADMIN_DIR, name), "detail": str(exc)}, 404)
+            self._send(200, {"Content-Type": ctype, "Cache-Control": "no-store"}, blob)
+            return True
+
+        def set_admin_cookie(status, obj, token=None):
+            """带 Cookie 的 JSON 响应：token=None 表示清除。"""
+            cookie = "tf_admin=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d" % (
+                token or "", acct.ADMIN_SESSION_TTL if token else 0)
+            # ★ 没有 Secure 标志是**故意**的：这个服务器只能走明文 HTTP（客户端
+            #   manifest 也只允许明文），带 Secure 浏览器就不会回传 Cookie，
+            #   登录会静默失效。HttpOnly + SameSite=Strict 已经够用。
+            self._send(status, {"Content-Type": "application/json", "Set-Cookie": cookie},
+                       json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+            return True
+
+        if path == "/__api/admin/login":
+            form = _json_body(body) or {}
+            token, err = acct.admin_login(form.get("username"), form.get("password"))
+            if token is None:
+                return js({"ok": False, "error": err,
+                           "message": "管理员账号或口令不对"}, 401)
+            return set_admin_cookie(200, {"ok": True, "username": form.get("username"),
+                                          "ttl": acct.ADMIN_SESSION_TTL}, token)
+        if path == "/__api/admin/logout":
+            acct.admin_logout(self._admin_token())
+            return set_admin_cookie(200, {"ok": True})
+        if path == "/__api/admin/me":
+            who = acct.admin_by_token(self._admin_token())
+            return js({"ok": bool(who), "username": (who or {}).get("username")})
+
+        # ★★ 访问控制边界。服务器绑 0.0.0.0（局域网里谁都能连），这里就是唯一的墙。
+        #    「公开」= 玩家在游戏里自助注册必须能打到，以及登录页自身。
+        #    其余 /__* 全部要管理员 —— 其中包括改前是裸奔的 /__config(POST)、
+        #    /__restore、/__api/login、/__api/password、/__api/delete。
+        #    代价：在局域网里用同一台机器开两个客户端互测时要先登录一次，可接受。
+        _PUBLIC = ("/__ping", "/__ui", "/__register", "/__api/register")
+        # 用 startswith 而不是白名单表：新增端点默认是**关**的，忘了加门禁也不会漏。
+        if path.startswith("/__") and path not in _PUBLIC:
+            if not acct.admin_by_token(self._admin_token()):
+                return js({"ok": False, "error": "admin-required",
+                           "message": "需要管理员登录（在 /__admin 登录）"}, 401)
+
         if path == "/__accounts":
             return js({"count": len(acct.list_accounts_public()),
                        "accounts": acct.list_accounts_public()})
+        if path == "/__log":
+            with LOG_LOCK:
+                return js(list(RECENT[-100:]))
         if path in ("/__register", "/__ui"):
             self._send(200, {"Content-Type": "text/html; charset=utf-8"},
                        _WEBUI_HTML.encode("utf-8"))
@@ -4818,6 +5141,71 @@ class Handler(BaseHTTPRequestHandler):
             if who is None:
                 return js({"ok": False, "error": err}, 400)
             return js({"ok": True, "username": who, "message": "账号已删除（存档目录保留）"})
+
+        # ---------------------------------------------- 后台运维动作（要管理员）
+        if path == "/__api/admin/grant":
+            form = _json_body(body) or {}
+            res, err = acct.grant_items(form.get("profile"), form.get("items") or [])
+            if res is None:
+                return js({"ok": False, "error": err,
+                           "message": {"no-save": "这个存档槽没有 latest.json",
+                                       "bad-profile": "没指定存档槽",
+                                       "bad-grant": "下发内容不合法",
+                                       }.get(err, "下发失败：" + str(err))}, 400)
+            return js({"ok": True, **res})
+        if path == "/__api/admin/pvp":
+            # 竞技场余额：改的是服务端 pvp_state.json，不需要玩家做任何操作。
+            form = _json_body(body) or {}
+            # GET 从查询串取存档槽，POST 从 JSON body 取。
+            pid = q.get("profile") if self.command == "GET" else form.get("profile")
+            if self.command == "GET":
+                if not pid:
+                    return js({"ok": False, "error": "bad-profile",
+                               "message": "没指定存档槽"}, 400)
+                return js({"ok": True, "player": pvp_read(pid)})
+            res, err = pvp_grant(pid, form.get("fields") or {}, form.get("mode") or "add")
+            if res is None:
+                return js({"ok": False, "error": err,
+                           "message": {"bad-request": "没指定存档槽或没填数量",
+                                       "bad-mode": "模式只能是 add 或 set",
+                                       }.get(err, "下发失败：" + str(err))}, 400)
+            return js({"ok": True, **res})
+        if path == "/__api/admin/rollback":
+            form = _json_body(body) or {}
+            snap, err = acct.rollback_save(form.get("profile"), form.get("ts"))
+            if err:
+                return js({"ok": False, "error": err}, 400)
+            # ★ 把恢复点名字回给前端，界面才能立刻给出「撤销这次回滚」。
+            return js({"ok": True, "profileId": form.get("profile"), "snapshot": snap,
+                       "server_version":
+                           (acct.load_progress(form.get("profile")) or {}).get("version")})
+        if path == "/__api/admin/revert":
+            form = _json_body(body) or {}
+            res, err = acct.restore_snapshot(form.get("profile"), form.get("snapshot"))
+            if res is None:
+                return js({"ok": False, "error": err}, 400)
+            return js({"ok": True, **res})
+        if path == "/__api/admin/sessions/clear":
+            form = _json_body(body) or {}
+            n = acct.clear_sessions(form.get("username"))
+            return js({"ok": True, "removed": n})
+        if path == "/__api/admin/password":
+            form = _json_body(body) or {}
+            me = acct.admin_by_token(self._admin_token()) or {}
+            pw = (form.get("password") or "").strip()
+            if len(pw) < 8:
+                return js({"ok": False, "error": "too-short",
+                           "message": "管理员口令至少 8 位"}, 400)
+            # ★ force=True：这是改自己的口令。admin_create 会顺手踢掉自己所有旧
+            #   会话（包括当前这张），所以下面要重新签发一张，否则改完立刻被登出。
+            who, err = acct.admin_create(me.get("username"), pw, force=True)
+            if who is None:
+                return js({"ok": False, "error": err}, 400)
+            token, _ = acct.admin_login(who, pw)
+            return set_admin_cookie(200, {"ok": True, "username": who,
+                                          "message": "管理员口令已更新，其它设备的登录已失效"},
+                                    token)
+
         if path == "/__devices":
             devs = acct.list_devices()
             return js({"count": len(devs), "devices": devs})
@@ -4924,18 +5312,42 @@ class Handler(BaseHTTPRequestHandler):
             return js({"config": tf_config(), "runtime": rt,
                        "note": "POST /__config {path:[…],value:…} 即改即生效（mtime 热加载）"})
         if path == "/__help":
-            return js({"endpoints": ["/__ping", "/__log", "/__accounts", "/__devices",
-                                     "/__sessions", "/__saves", "/__save?profile=<pid>",
-                                     "/__history?profile=<pid>",
-                                     "/__restore?profile=<pid>&ts=<时间戳|latest>",
-                                     "/__ghosts（内置幽灵文件 + 上传的幽灵仓库 + replay_id 登记）",
-                                     "/__leaderboards（排行榜落库与主榜聚合）",
-                                     "/__config（匹配/赛季运营参数；POST {path,value} 即改即生效）",
-                                     "/__register（注册网页，也可用 /__ui）",
-                                     "POST /__api/register {username,password,nameOnPlatform}",
-                                     "POST /__api/login {username,password}",
-                                     "POST /__api/password {username,password}"]})
+            # ★ 这是用户唯一的自发现入口：新增端点必须同步加到这里。
+            #   带 [admin] 的要管理员 Cookie，不带的是公开的。
+            return js({
+                "admin_ui": "/__admin",
+                "note": "除 [public] 外都需要先登录 /__admin（HttpOnly Cookie tf_admin，7 天）。",
+                "endpoints": [
+                    "[public] /__ping", "[public] /__ui", "[public] /__register",
+                    "[public] POST /__api/register {username,password,nameOnPlatform}",
+                    "POST /__api/admin/login {username,password} -> Set-Cookie",
+                    "POST /__api/admin/logout", "GET /__api/admin/me",
+                    "POST /__api/admin/password {password}",
+                    "POST /__api/admin/grant {profile,items:[{item_id,amount,mode}]}（存档物品，要玩家选「用云端」）",
+                    "GET|POST /__api/admin/pvp {profile,fields:{golden_ticket,chips},mode}（竞技场余额，即时生效）",
+                    "POST /__api/admin/rollback {profile,ts} -> {snapshot}",
+                    "POST /__api/admin/revert {profile,snapshot}",
+                    "POST /__api/admin/sessions/clear {username?}",
+                    "/__log", "/__accounts", "/__devices",
+                    "/__sessions", "/__saves", "/__save?profile=<pid>",
+                    "/__history?profile=<pid>",
+                    "/__restore?profile=<pid>&ts=<时间戳|latest>",
+                    "/__ghosts（内置幽灵文件 + 上传的幽灵仓库 + replay_id 登记）",
+                    "/__leaderboards（排行榜落库与主榜聚合）",
+                    "/__config（匹配/赛季运营参数；POST {path,value} 即改即生效）",
+                    "POST /__api/login {username,password}",
+                    "POST /__api/password {username,password}",
+                    "POST /__api/delete {username}"]})
         return False
+
+    def _admin_token(self):
+        """从 Cookie 里取管理员票据。只认 tf_admin 这一个键。"""
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "tf_admin":
+                return v.strip()
+        return ""
 
     def _send(self, status, headers, raw):
         try:
@@ -4972,25 +5384,76 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("OPTIONS")
 
 
+def _lan_ip():
+    """猜本机在局域网里的地址（只在内存里选路由，不发任何包）。
+
+    给手机看用：把手机浏览器指到这个 IP 才能打开后台。
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return "127.0.0.1"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--reset-admin", nargs="?", const="", default=None, metavar="口令",
+                    help="重建管理员口令并退出。不带值则随机生成一个。")
     args = ap.parse_args()
 
     if not os.path.exists(RULES_PATH):
         with open(RULES_PATH, "w", encoding="utf-8") as f:
             json.dump({"*": {"status": 200, "body": {}}}, f, indent=2)
 
+    # ★ 忘了管理员口令的兜底出口。不做「网页上重置」——那又变成一个无窗口期的
+    #   后门，能跑这条命令的人本来就有控制台权限。
+    if args.reset_admin is not None:
+        pw = args.reset_admin or acct.admin_new_password()
+        if len(pw) < 8:
+            print("口令至少 8 位。", flush=True)
+            return 1
+        who, err = acct.admin_create("admin", pw, force=True)
+        if who is None:
+            print("重建管理员失败：%s" % err, flush=True)
+            return 1
+        print("管理员口令已重置： %s / %s" % (who, pw), flush=True)
+        print("现在可以正常启动服务器了。", flush=True)
+        return 0
+
+    boot = acct.admin_bootstrap()
+
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print("Trials Frontier 本地服务器已启动： http://%s:%d" % (args.host, args.port), flush=True)
     print("规则文件： %s" % RULES_PATH, flush=True)
     print("请求日志： %s" % LOG_PATH, flush=True)
+    print("后台管理页： http://127.0.0.1:%d/__admin  （手机用 http://%s:%d/__admin）"
+          % (args.port, _lan_ip(), args.port), flush=True)
+    if boot:
+        user, pw = boot
+        print("", flush=True)
+        print("=" * 66, flush=True)
+        print("  第一次启动：已创建后台管理员账号（口令只显示这一次）", flush=True)
+        print("", flush=True)
+        print("      用户名： %s" % user, flush=True)
+        print("      口  令： %s" % pw, flush=True)
+        print("", flush=True)
+        print("  打开 http://127.0.0.1:%d/__admin 登录。" % args.port, flush=True)
+        print("  忘了口令就重跑： python tf_server.py --reset-admin", flush=True)
+        print("=" * 66, flush=True)
+        print("", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("停止。", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

@@ -52,6 +52,47 @@ get_pvp_ghost?track_id=%d&players=%s&limit=1&pvpid=%d          @0xb87af4
 ```
 （`enhancestats/batch_update` 用它批量同步；日志串 `SYNCING %d LEADERBOARDS` @0xb8801c）
 
+### ★ `data` / `extradata` / `upgrades` 的位布局（反汇编定论）
+信源：`tr::LeaderBoardData::parseData(int)` @0x006250fc · `encodeData()` @0x00625178 ·
+`parseData2(int)` @0x00625134（= `extradata`）· `encodeUpgrades()` @0x00625150；
+`setOutfit(int,int)` @0x00625210 / `getOutfit(int) const` @0x00625250、
+`setBikeSkin(int)` @0x0062526c / `getBikeSkin() const` @0x00625294。
+
+```
+data    : bits 0..7   = A（encodeData 夹到 ≤99，真机恒 0）
+          bits 8..13  = C（6 位；掩码全 0 时 parseData 解出 1，encodeData 把 ≤1 归 0）
+          bits 14..19 / 20..25 / 26..31 = 骑手 outfit 的 part2 / part1 / part0（各 6 位）
+          ⇒ 低 6 位在 [x0+0x20..0x22]，part 的高 2 位在 [x0+0x29] 的第 part*2 位
+          ⇒ outfit = 3×8 位 = 24 位 = 存档 `content.profile.outfit`（`& 0xFFFFFF`）
+extradata: bits 0..3 = bikeSkin 低 4 位；bits 12..19 = [x0+0x29]（outfit 高位 + bikeSkin 高位）
+          ⇒ **bikeSkin 只从 extradata 来**
+upgrades: bit0..5 未用；bits 6..15 = 10 位；bits 16..19 / 20..23 / 24..27 / 28..31 = 四个 4 位
+          （对应存档模板 "upgrades":{"bike_id","bike_lean","bike_speed","bike_grip",
+           "bike_acceleration"} 里的四个数值，@0xb8c1e2）
+```
+- 实机校验：ccb `content.profile.outfit = 0x121212`（三个 18）↔ 榜行 `data = 0x49248100`
+  解出 (18,18,18)；anon `0x171717` ↔ `0x5D75C200` → (23,23,23)。**榜行记的是那一场跑的时候
+  穿的那套**，同一玩家会变（ccb 38 行里有 (47,47,47)/(23,23,23)/(18,18,18)/(8,8,8)）。
+- 真行里观测到的 part 取值只有 8/18/23/47/48（**非 0**）；`outfit=0`（从未改装过的号，
+  如华为账号 11 行全是）才出现 parts (0,0,0)，此时 `data=0x100`，而 `encodeData` 把 C≤1 归 0
+  ⇒ **`data=0` 与 `0x100` 对客户端等价**、且 `0` 不是客户端会产生的值。
+- 排行榜行的 stats 模板里**只有 `data`+`upgrades`**
+  （`"stats": { "data": %u,"drivetime": %d, "global_score": %u,"upgrades": %u,"submittime": %u }`
+  @0xb88339，另一份用 `score_value` @0xb88394）⇒ 客户端能从榜行读到的外观就这两个位域；
+  `m_ghostBikeId` 在榜行里**没有载体**。
+- 真实上报里 **`extradata` 恒缺**（`server-log.jsonl` 11058 条里只有 4 条是手写测试体）
+  ⇒ `bikeSkin` 永远是 0。唯一带 `bike` 的上报是
+  `{"profile_id":"%s","track_name":"track%d","drive_time":%d,"faults":%d,"bike":%d}` @0xb87b82
+  （`resultservice/v1/replay_id`，实测 50 次）。
+- 幽灵搜索端的响应键是 **`contents` / `contentId` / `content_id` / `pvpid`**（@0xb87d18 一带，
+  **没有引号**，所以按 `"contents"` 搜会 0 命中）—— 那里也**没有任何外观字段**。
+- 服务端实现：`server/tf_server.py:1395-1429`（`_lb_data` / `_LB_GHOST_OUTFITS` /
+  `_lb_ghost_data` / `_ghost_appearance`）。
+- 复现（用仓库里现成的工具，别再写临时脚本）：
+  `python tools/re/symaddr.py <libTrialsGo.so> LeaderBoardData --sub` 拿地址 →
+  `python tools/re/disasm.py <libTrialsGo.so> 0x6250fc 56` 看 `parseData`；
+  `tools/re/callers.py <so> <符号>` 能追到**经 PLT** 的调用点。
+
 ### 幽灵的本地文件形态
 ```
 ghost_%x_%d.bin                       @0xb87586   %x = 玩家 online-id 哈希，%d = 赛道 id

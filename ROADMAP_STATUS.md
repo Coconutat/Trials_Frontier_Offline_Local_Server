@@ -13,7 +13,7 @@
 | 2 | 修复账号管理（注册 / 登录分离） | ✅ **已实现并 curl 实测（含内置注册页）** | 85% |
 | 2b | VIP 下发（买了 VIP 就激活 VIP 事件） | ✅ **已实机验证（m16）** | 100% |
 | 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **部分实现；本轮补齐碉堡奖励/结赛及基础货币链，21项隔离回归通过，待真机到账验证** | 不再沿用旧95%估计 |
-| 4 | WebUI 管理界面 | 🟡 **已起头：`/__ui` 注册页 + `/__api/*`** | 15% |
+| 4 | WebUI 管理界面 | 🟡 **前三屏已交付（`/__admin`：登录／账号／存档／下发，CN+EN，66 项后台回归 + headless 冒烟）；余 4 屏待真机验穿冲突下发后做** | 45% |
 | 5 | 一键开服打包成 exe | ⚪ 未开始 | 0% |
 | 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
 
@@ -664,9 +664,40 @@ TangoPro 11014，`track1087` 若干），正是用户反复点那颗灰按钮的
 
 ---
 
-## 4. WebUI 管理界面 —— 🟡 已起头（注册页 + 管理 API）
+## 4. WebUI 管理界面 —— 🟡 前三屏已交付（登录 + 账号 / 存档 / 下发）
 
-### 已有基础
+### ✅ 已交付（2026-10-06）
+
+挂在**同一个端口**的 `/__admin` 下（不是另起 `tf_webui.py`），静态四件套在 `server/admin/`：
+`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN，`localStorage.tf_lang` → `navigator.language`）。
+前端零依赖、零 CDN，弹簧缓动由 JS 采样成 CSS `linear(...)`（`springEase()`，`damping 1.0 /
+response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion / -transparency / -contrast` 全支持。
+
+| 屏 | 内容 |
+|---|---|
+| 登录 | 管理员口令（首启 12 位随机口令只打到控制台）；`--reset-admin` 兜底 |
+| 账号 | 会话卡（总数 / 一键清空）+ 账号表 9 列（含封禁徽标、可复制的 profileId、记住我用量）+ 设备表 + 改口令 |
+| 存档 | 槽位表（kind 徽标 / 物品数 / 赛道记录 / richness / 写入时间）+ 详情（关键余额 + 历史快照）+ 逐个「回滚到此」 |
+| 下发物品 | 存档槽下拉 + 金币(1) / 钻石(2) + 共用「增加/设为」+ 醒目警示卡（如实写明要玩家在游戏里点「用云端」）+ 白名单说明 |
+
+- **鉴权**：管理员账号独立于玩家账号，存 `data/admin.json`（`_hash_pw`，不入库）；登录发
+  `tf_admin` Cookie（`HttpOnly; SameSite=Strict`，**故意不加 `Secure`** —— 只能走明文 HTTP）。
+  门禁用 `startswith("/__") and not in _PUBLIC`，**新增端点默认是关的**。
+- **受控写档**：`grant_items()` 只动 `items2` + `version` + 审计字段，先埋 `pre_grant_` 快照；
+  `rollback_save()` 埋 `pre_restore_` 快照（回滚本身不可逆）；两者都能一键撤销。
+  带前缀的快照名在 `sorted()` 里排在纯数字时间戳之后，所以不会被 `SAVE_HISTORY_MAX` 的裁剪丢掉。
+- **回归**：`tests/test_admin_webui.py`（66 项）+ `tools/ui_smoke.mjs`（headless Edge + CDP
+  逐屏断言，对 `Runtime.exceptionThrown` / console error 零容忍）。
+  ⚠ 教训：只调 `_introspect` 的门禁测试会给**假绿灯** —— `_handle` 里在它之前的内联近路
+  就是绕过访问控制的洞（`/__log` 曾经这么裸奔过），所以门禁必须用真路由 `request_handle()` 测。
+
+### 还没做（等真机把「版本冲突下发」链路验穿再动手）
+
+概览 / 赛季（午夜杯）/ 运营参数 / 运行时+日志 四屏。剩余可管项：`season.rewards` 模板、
+`matchmaking.*`、`weekly.*`、`chips.*`、`/__config` 的可视化编辑、幽灵库浏览替换。
+
+### 历史：当时的已有基础
+
 服务器已有一批只读内省端点（`tf_server.py` 的 `_introspect`）：
 
 ```
@@ -675,11 +706,17 @@ TangoPro 11014，`track1087` 若干），正是用户反复点那颗灰按钮的
 /__restore?profile=<pid>&ts=<ts|latest>  /__ghosts
 ```
 
-### 建议实现路径
+### 当时的建议实现路径（部分已不适用，保留作决策记录）
+
 1. 新增 `server/tf_webui.py`（纯标准库 `http.server`，或 Flask 单文件），复用 `tflocal_accounts` 的读写函数。
+   → **实际做法相反**：不新增进程/端口，直接挂在 `tf_server.py` 的 `_introspect` 里，
+   静态文件走 `_ADMIN_FILES` 白名单（「路径 → 文件名」写死，杜绝路径穿越）。
 2. 页面：账号列表 / 新建账号 / 改口令 / 删除；存档列表 + 一键回滚；幽灵库浏览与替换；
    全局开关（`Anticheating_Enabled`、活动时间、商品表下发）。
+   → 前三项已做；幽灵库与全局开关留在后四屏。
 3. 与 `tf_server.py` 同进程不同端口（例如 8001），或用 `/admin` 前缀挂在同端口。
+   → 选了后者（`/__admin`），因为客户端连接的局域网 IP 与端口已经散落在 APK / `tf_server.txt` 里，
+   再多开一个端口只会多一个要填的地方。
 
 ### ★ 决策记录：这些运营参数交给 WebUI 管（用户 m04835，2026-10-04）
 

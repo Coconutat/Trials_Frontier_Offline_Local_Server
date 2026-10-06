@@ -50,8 +50,13 @@ server/data/sessions.json
 server/data/devices.json
 server/data/remember.json
 server/data/leaderboards.json
+# 后台管理页（/__admin）的管理员账号与登录票据：口令哈希 + 盐，绝不入库
+server/data/admin.json
 # 筹码余额与局内票（运行期状态，重启要留住但绝不入库）
 server/data/pvp_state.json
+# 玩家等级（客户端在 targeting 上报里自己报的 xp；只用来填「云端进度摘要」
+# 的 player_level。不落盘的话服务器一重启，云端摘要就显示等级 1）
+server/data/player_levels.json
 # 客户端绑定表（按客户端 IP / 设备 id 记住最近登录的账号；含设备地址，不入库）
 server/data/bindings.json
 # 玩家存档（真实进度，含金币 / 赛道纪录 / identifier）
