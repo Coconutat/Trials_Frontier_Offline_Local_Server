@@ -1172,20 +1172,39 @@ def restore_save(profile_id, ts):
 
 
 # ------------------------------------------------------- 后台下发物品（WebUI）
-# WebUI 允许下发的**存档**物品白名单。只放**语义已经被证实**、且在 items2 里就是
-# 「一个 id 对一个计数器」的东西：
-#   1 金币 Coins
-#   2 钻石/宝石 Gems
-# 见 work/trials-frontier/notes/item-ids.md（物品 id 的权威表）。
-# ⚠ 零件(5-54)/喷漆(0-107)/服装(205-847)/赛道(1108-1438) 都**不在这里**：
-#   它们的 items2 布局（是否成组、组内顺序）还没有真机验证过，瞎写会毁档。
-# ⚠ **135（PVP 金票）曾经在这里，已经被移出去。** 真机实测（m00702）：
+# 可下发的**存档**物品清单来自 tools/build_item_catalog.py 生成的
+# server/admin/items.json（401 条，物品名直接取自游戏自己的本地化表）。
+# 为什么敢放开到整个目录而不是只留金币/钻石：下发**每次都会先埋快照**，
+# 界面上「可撤销」是主要防线；而按 id 白名单硬拦，反而让「钱能发、服装不能发」
+# 这种半截能力看起来像坏了（见 m02236 的要求）。
+# 目录里每条带 verified，未验证的类（涂装 / 赛道）界面会显式挂警告。
+# ⚠ **135（PVP 金票）不在目录里，这是有意的。** 真机实测（m00702）：
 #   玩家在游戏里看到 13 张金票，服务器的 pvp_state.json 里
 #   `players.<pid>.golden_ticket == 13`，而 items2 里**根本没有 id 135**
 #   —— 两者是两套东西。客户端 PVP 界面读的是设备卡发来的
 #   `parseRankingData` 响应，不是存档。所以金票改走 tf_server.pvp_grant()，
 #   见 WebUI「竞技场」卡。往 items2 写 135 只会写进没人读的地方。
-GRANTABLE_ITEMS = {1: "coins", 2: "gems"}
+_ITEM_CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin", "items.json")
+GRANTABLE_FALLBACK = {1: "coins", 2: "gems"}
+
+
+def grantable_items():
+    """{item_id: 审计用的物品名}。读的是后台那份目录，读不到就退回最小白名单
+    （宁可少发，也不能因为目录丢了就把下发全放开）。"""
+    try:
+        with open(_ITEM_CATALOG_PATH, encoding="utf-8") as fh:
+            items = json.load(fh)["items"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return dict(GRANTABLE_FALLBACK)
+    out = {}
+    for k, it in items.items():
+        try:
+            iid = int(k)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(it, dict):
+            out[iid] = it.get("en") or it.get("cn") or ("item %d" % iid)
+    return out or dict(GRANTABLE_FALLBACK)
 
 
 def load_progress_items(profile_id):
@@ -1243,6 +1262,7 @@ def grant_items(profile_id, grants):
     #   直接改 content["items2"] 会把改动带进快照，"下发前"那份就不干净了。
     new_pairs = list(pairs)
     before, applied = {}, []
+    allowed = grantable_items()
     for g in grants:
         if not isinstance(g, dict):
             return None, "bad-grant"
@@ -1251,7 +1271,7 @@ def grant_items(profile_id, grants):
             amount = int(g.get("amount"))
         except (TypeError, ValueError):
             return None, "bad-grant"
-        if iid not in GRANTABLE_ITEMS:
+        if iid not in allowed:
             return None, "not-grantable:%d" % iid
         idx, cur = None, 0
         for i in range(0, len(new_pairs) - 1, 2):
@@ -1270,7 +1290,7 @@ def grant_items(profile_id, grants):
             new_pairs.extend([iid, val])
         else:
             new_pairs[idx + 1] = val
-        applied.append({"item_id": iid, "name": GRANTABLE_ITEMS[iid],
+        applied.append({"item_id": iid, "name": allowed.get(iid) or ("item %d" % iid),
                         "before": before[iid], "after": val})
 
     now = int(time.time())

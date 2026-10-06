@@ -367,7 +367,7 @@ class Grant(Base):
         res, err = acct.grant_items(PID, [{"item_id": 1, "amount": 1000}])
         self.assertIsNone(err)
         self.assertEqual(res["applied"][0],
-                         {"item_id": 1, "name": "coins", "before": 100, "after": 1100})
+                         {"item_id": 1, "name": "Coins", "before": 100, "after": 1100})
         self.assertEqual(acct.load_progress_items(PID)[1], 1100)
         # ★ version 必须 +1，否则 remote==local，客户端用本地档覆盖服务器，下发当场失效。
         self.assertEqual(acct.load_progress(PID)["version"], 8)
@@ -403,8 +403,21 @@ class Grant(Base):
         self.assertEqual(acct.load_progress_items(PID)[2], 3)
         self.assertEqual(res["applied"][0]["before"], 0)
 
+    def test_catalog_items_beyond_currency_are_grantable(self):
+        """目录里的东西（远不止金币钻石）要真能写进去，否则清单是个骗人的壳。"""
+        allowed = acct.grantable_items()
+        self.assertGreater(len(allowed), 100, "可下发目录太小，是不是没读到 items.json？")
+        iid = 150 if 150 in allowed else sorted(i for i in allowed if i not in (1, 2))[0]
+        self.write_save()
+        res, err = acct.grant_items(PID, [{"item_id": iid, "amount": 4, "mode": "set"}])
+        self.assertIsNone(err, "目录里的 %d 居然不能下发：%s" % (iid, err))
+        self.assertEqual(acct.load_progress_items(PID)[iid], 4)
+        self.assertEqual(res["applied"][0]["name"], allowed[iid])
+
     def test_rejects_item_outside_whitelist(self):
         self.write_save()
+        # 1152 是 items2 里真实存在的计数器，但它不在物品目录里（目录只收游戏自己
+        # 奖励/商店表出现过的 id），所以必须仍然发不出去。
         res, err = acct.grant_items(PID, [{"item_id": 1152, "amount": 1}])
         self.assertIsNone(res)
         self.assertEqual(err, "not-grantable:1152")
@@ -525,7 +538,7 @@ class Pvp(Base):
     """PVP 金票/筹码走服务端 pvp_state.json —— 真机实测 m00702 才搞清这不是存档物品。
 
     这一组用例存在的意义就是把「金票真源是服务端状态」这件事钉住：谁要再把
-    金票塞回 GRANTABLE_ITEMS，test_golden_ticket_is_not_a_save_item 会响。
+    金票塞回可下发目录（items.json），test_golden_ticket_is_not_a_save_item 会响。
     """
 
     def setUp(self):
@@ -548,7 +561,7 @@ class Pvp(Base):
 
     def test_golden_ticket_is_not_a_save_item(self):
         """金票不在存档白名单里 —— 它是 pvp_state.json 的计数器，不是 items2。"""
-        self.assertNotIn(135, acct.GRANTABLE_ITEMS)
+        self.assertNotIn(135, acct.grantable_items())
         self.write_save()
         res, err = acct.grant_items(PID, [{"item_id": 135, "amount": 3}])
         self.assertIsNone(res)
@@ -798,7 +811,7 @@ class StaticFiles(Base):
     def test_files_served_without_login(self):
         """登录表单自己必须能加载，否则谁也进不去。"""
         for path in ("/__admin", "/__admin/", "/__admin/app.css", "/__admin/app.js",
-                     "/__admin/i18n.json"):
+                     "/__admin/i18n.json", "/__admin/items.json"):
             handled, r = request(path)
             self.assertTrue(handled, path)
             self.assertEqual(r.status, 200, path)
@@ -821,6 +834,68 @@ class StaticFiles(Base):
             self.assertTrue(handled)
             self.assertEqual(r.status, 404)
             self.assertEqual(r.json()["error"], "admin-ui-missing")
+
+
+# ---------------------------------------------------------------- 物品目录
+class ItemCatalog(Base):
+    """`server/admin/items.json` 是 tools/build_item_catalog.py 的产物。
+
+    它决定「下发物品」屏能勾到什么，所以形状错了必须在这里响，而不是等玩家点下去。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cat = json.loads((ADMIN_DIR / "items.json").read_text(encoding="utf-8"))
+        cls.js = (ADMIN_DIR / "app.js").read_text(encoding="utf-8")
+
+    def test_shape_and_count_agree(self):
+        c = self.cat
+        self.assertEqual(sorted(c), ["categories", "items", "source"])
+        self.assertEqual(c["source"]["items"], len(c["items"]),
+                         "source.items 与实际条数不一致（重新跑 tools/build_item_catalog.py）")
+        self.assertTrue(c["source"]["en"] and c["source"]["cn"], "没记本地化表来源")
+        self.assertGreater(len(c["items"]), 300)
+
+    def test_every_item_points_at_a_declared_category(self):
+        keys = {x["key"] for x in self.cat["categories"]}
+        self.assertEqual(len(keys), len(self.cat["categories"]), "分类键重复")
+        nameless = []
+        for k, it in self.cat["items"].items():
+            self.assertEqual(str(it["id"]), k, "键与 id 不一致：" + k)
+            self.assertIn(it["cat"], keys, "%s 的分类 %s 没在 categories 里" % (k, it["cat"]))
+            if not it["en"]:
+                nameless.append(k)
+        # 有十几个 id 只出现在奖励表里、没有 NameId（例：111/185/237/560）。界面用 #id 兜底，
+        # 但这类必须一直是少数 —— 数量暴涨说明抽取器坏了或者本地化表没读上。
+        self.assertLess(len(nameless), 25, "没名字的物品太多：%s" % nameless)
+        for k in nameless:
+            self.assertNotEqual(self.cat["items"][k]["cat"], "currency", "货币必须有名字：" + k)
+
+    def test_categories_are_bilingual(self):
+        for x in self.cat["categories"]:
+            self.assertTrue(x["en"].strip(), x["key"])
+            self.assertTrue(x["cn"].strip(), x["key"])
+            self.assertNotEqual(x["en"], x["key"], "英文名就是键名，等于没翻译：" + x["key"])
+
+    def test_flag_categories_are_real_and_counted_as_flags(self):
+        """app.js 里 FLAG_CATS 的类在存档里是 0/1 标志，只能解锁；写错类会被当成计数器。"""
+        m = re.search(r"FLAG_CATS\s*=\s*\{([^}]*)\}", self.js)
+        self.assertTrue(m, "app.js 里找不到 FLAG_CATS")
+        flags = set(re.findall(r"(\w+)\s*:", m.group(1)))
+        keys = {x["key"] for x in self.cat["categories"]}
+        self.assertTrue(flags <= keys, "FLAG_CATS 里有不存在的分类：" + str(flags - keys))
+        self.assertIn("outfit", flags)          # 真机看过：服装部件 0/1
+        self.assertNotIn("parts", flags)        # 零件是计数器，不能被当成标志
+        self.assertNotIn("currency", flags)
+
+    def test_currency_is_present_and_tickets_are_not(self):
+        by_cat = {}
+        for k, it in self.cat["items"].items():
+            by_cat.setdefault(it["cat"], []).append(int(k))
+        self.assertEqual(sorted(by_cat["currency"]), [1, 2], "货币只该有金币与钻石")
+        # 金票(135)走 pvp_state.json，不进存档 items2 —— 出现在这里会被误当成存档物品下发。
+        self.assertNotIn(135, (int(k) for k in self.cat["items"]),
+                         "金票不该出现在存档物品目录里")
 
 
 # ---------------------------------------------------------------- 文案
@@ -861,14 +936,15 @@ class I18n(Base):
         dyn = set(re.findall(r"\bt\(\s*'([^']+)'\s*\+", self.js))
         missing = sorted(k for k in lit - dyn if k not in self.blob["cn"])
         self.assertEqual(missing, [], "app.js 用了不存在的键")
-        # t('前缀' + 变量) 形式的键在这里逐一展开核对
-        for prefix, concretes in {"grant.item": ["grant.item1", "grant.item2"]}.items():
-            self.assertIn(prefix, dyn, "不再有动态键 " + prefix + "？更新这条断言")
-            for k in concretes:
-                self.assertIn(k, self.blob["cn"], k)
-        # PVP_LABEL 这类「键名放在表里、t() 收的是变量」的也要单独核一遍，
+        # 折叠清单里的物品名来自 items.json、不走 i18n，所以「t('前缀' + 变量)」这种动态键
+        # 现在一条都没有了。断言它消失，是为了别让这条检查悄悄变成空断言。
+        self.assertEqual(dyn, set(), "又有动态键了？这里需要逐条展开核对：" + str(sorted(dyn)))
+        # 键名放在表里、t() 收的是变量（或由 JS 直接拼）的，必须单独核一遍，
         # 否则删掉一个 i18n 键测试不会响。
-        for k in ("grant.pvpGolden", "grant.pvpChips"):
+        for k in ("grant.pvpGolden", "grant.pvpChips",
+                  "grant.list.search", "grant.list.selected", "grant.list.unlock",
+                  "grant.list.unverified", "grant.list.empty", "grant.modeHint",
+                  "saves.coins", "saves.gems"):
             self.assertIn(k, self.blob["cn"], k)
             self.assertIn(k, self.blob["en"], k)
 

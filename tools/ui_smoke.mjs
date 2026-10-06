@@ -158,8 +158,9 @@ const SCREENS = [
   },
   {
     hash: '#/grant', title: '下发物品',
-    must: ['竞技场', '金票', '筹码', '存档物品', '金币', '钻石', '云端'],
-    // 默认选中的是列表第一个（<anonymous>）。切到 ccb 那个真档上，确认竞技场卡
+    must: ['竞技场', '金票', '筹码', '存档物品', '云端',
+           '货币', '消耗品', '摩托车零件', '骑手服装', '摩托蓝图', '已选 0 项'],
+    // 默认选中是列表第一个（<anonymous>）。切到 ccb 那个真档上，确认竞技场卡
     // 读到的是服务端 pvp_state.json 里的真值。★ 别写死余额：那是随时可改的线上
     // 数值（改过一次就把断言变成假失败），所以只钉「段位 24」这种结构性的东西。
     act: `(() => {
@@ -168,6 +169,9 @@ const SCREENS = [
             s.dispatchEvent(new Event('change'));
           })()`,
     mustAfter: ['竞技场', '当前', '段位 24', '下发到竞技场'],
+    // 再点开第一个分类（货币），确认折叠清单真的展开出物品行（未展开时 innerText 里没有这些）。
+    act2: `document.querySelector('#pane .acchead').click()`,
+    mustAfter2: ['金币', '钻石', '已选 0 项'],
   },
 ];
 
@@ -203,6 +207,16 @@ for (const s of SCREENS) {
       if (!after.includes(m)) die(`${s.title}屏点开之后缺少「${m}」：\n` + after.slice(0, 800));
     }
     await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + '-展开');
+  }
+  if (s.act2) {
+    const r2 = await evalJs(`(()=>{try{${s.act2};return 'ok'}catch(e){return 'FAIL: '+e}})()`);
+    if (r2 !== 'ok') die(`${s.title}屏的第二步操作没点成：${r2}`);
+    await sleep(900);
+    const after2 = await evalJs(`document.getElementById('pane').innerText`);
+    for (const m of s.mustAfter2 || []) {
+      if (!after2.includes(m)) die(`${s.title}屏第二步之后缺少「${m}」：\n` + after2.slice(0, 900));
+    }
+    await shot(s.title.replace(/[\\/:*?"<>| ]/g, '_') + '-清单');
   }
   ok(`${s.title}屏：${cards} 张卡 / ${rows} 行表格数据`);
 }
