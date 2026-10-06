@@ -7,37 +7,41 @@
 没有任何第三方依赖 —— 只要 Python 3.8+（用的 `http.server` / `threading` / `json`）。
 
 ```
-python server/tf_server.py --host 0.0.0.0 --port 8000
+python server/tf_server.py --host 0.0.0.0 --port 8123
 ```
 
 改 APK 让它指向本机地址的是 `../tools/` 里的补丁工具（见 `../tools/README.md`）。
+想「零依赖发给别人玩」不用装 Python：`pwsh tools\build_exe.ps1` 出一个单文件 exe（见 §10）。
 
 ---
 
 ## 1. 快速开始
 
 ```bash
-# 启动（默认就是 0.0.0.0:8000）
+# 启动（默认就是 0.0.0.0:8123）
 python server/tf_server.py
 
 # 换个端口 / 只监听本机
 python server/tf_server.py --host 127.0.0.1 --port 8080
 
+# 端口也可以写成文件：<程序目录>/port.txt 里一行数字（命令行 --port 优先）
+# 冻结成 exe 时启动会自动打开管理页，不想开就加 --no-browser
+
 # 语法自检（改完先跑这个再重启）
 python -m py_compile server/tf_server.py
 ```
 
-打开 <http://127.0.0.1:8000/__ui> 是内嵌的账号管理页（注册 / 改密 / 删号 / 看存档 /
-看排行榜 / 看幽灵 / 看运行时配置）。`http://127.0.0.1:8000/__help` 列出全部本地端点。
+打开 <http://127.0.0.1:8123/__ui> 是内嵌的账号管理页（注册 / 改密 / 删号 / 看存档 /
+看排行榜 / 看幽灵 / 看运行时配置）。`http://127.0.0.1:8123/__help` 列出全部本地端点。
 
 **改完要重启**：`rules.json` 与 `data/tf_config.json` 都热加载（每次请求重新读 / 按 mtime），
 但 `tf_server.py` 与 `tflocal_accounts.py` 的修改必须重启进程。
 
 ```powershell
-# Windows 上重启（杀掉占着 8000 的那个进程再拉起）
-Stop-Process -Id (Get-NetTCPConnection -LocalPort 8000 -State Listen).OwningProcess -Force
+# Windows 上重启（杀掉占着 8123 的那个进程再拉起）
+Stop-Process -Id (Get-NetTCPConnection -LocalPort 8123 -State Listen).OwningProcess -Force
 Start-Process C:\Python314\python.exe `
-  -ArgumentList "-u","server\tf_server.py","--host","0.0.0.0","--port","8000" `
+  -ArgumentList "-u","server\tf_server.py","--host","0.0.0.0","--port","8123" `
   -WorkingDirectory <仓库根> -WindowStyle Hidden `
   -RedirectStandardOutput server\data\server.log -RedirectStandardError server\data\server.err.log
 ```
@@ -61,6 +65,7 @@ Get-Content server\data\server.log -Tail 50
 
 > ⚠ `ts` 是 ISO 时间字符串，比较请用 `[datetime]::Parse(...)`，不要用 `.Substring()`；
 > `query` 有些端点是**对象**不是字符串；`resp_body` 可能是 bytes。
+> 打包成 exe 后请求日志在 `<exe 目录>\logs\requests.jsonl`（现场 `print` 走控制台，见 §10）。
 
 ---
 
@@ -598,3 +603,42 @@ python -m unittest discover -s tests -v
   目前只回 `{"data": []}`，够用但没做真的语义。
 
 真正还没闭环的以 `../ROADMAP.md` 和 `../ROADMAP_STATUS.md` 为准。
+
+---
+
+## 10. 打包成 exe（零依赖分发）
+
+```powershell
+pwsh tools\build_exe.ps1                  # PyInstaller onefile（默认，约 10 秒）→ dist\TrialsFrontierServer.exe
+pwsh tools\build_exe.ps1 -Packer nuitka    # Nuitka 真编译（几分钟，自动找 MSVC）→ dist\TrialsFrontierServer-nuitka.exe
+pwsh tools\exe_smoke.ps1 -Exe dist\TrialsFrontierServer.exe   # 丢进空目录冒烟
+```
+
+* 产物 `dist\TrialsFrontierServer.exe`（约 10.2 MB）／`dist\TrialsFrontierServer-nuitka.exe`（约 7.7 MB）
+  ＋ `dist\SHA256SUMS.txt`（体积与 sha256 每次编译都会变，别照抄文档里的数）。用法：拷到任意目录
+  （别放 `C:\Program Files`，那里不可写）双击运行，它会在**自己旁边**建 `data\`（存档、`tf_config.json`、
+  幽灵库）和 `logs\requests.jsonl`，控制台打印局域网地址与首次随机口令。
+* 打包白名单本身就是安全边界（`tools/build_exe.ps1` 第 2 步硬性检查）：真机存档 `data\save\`、
+  `admin.json`、`accounts.json`、`sessions.json`、`pvp_state.json`、审计与日志**一律不进包**；
+  幽灵只拷 `git ls-files server/data/ghosts` 里已入库的那 46 个（开发机上还混着真机上传的，整目录拷会漏发）。
+* 路径规则（`tf_server.py` 头部）：**只读资源**（`admin/`、`rules.json`、`items.json`、静态幽灵）从包内
+  `HERE` 读；**运行期数据**写 `<exe 目录>/data`。冻结判据 = `sys.frozen` 或 Nuitka 的 `__compiled__`；
+  exe 目录用 `_frozen_exe_dir()` 取 —— ★ **Nuitka onefile 的 `sys.executable` 是临时解包的 `python.exe`**
+  （真目录在 `NUITKA_ONEFILE_DIRECTORY`），照 `sys.executable` 算会把存档写进 `%TEMP%\onefile_…`。
+* 首次运行 `seed_data_dir()` 只补缺（`tf_config.json` 写**内置默认值**、拷 `wts_rewards.json` 与 `ghosts/`），
+  **从不覆盖**已有数据 ⇒ 换新版 exe 直接替换文件即可，玩家的存档与手调配置都在。
+* 端口：`--port` > `<exe 目录>\port.txt` 第一行 > 8123；冻结时启动会自动打开
+  `http://127.0.0.1:<端口>/__admin`（不想开加 `--no-browser`）。走**系统默认浏览器**
+  （`_open_admin_page()`，Windows 上就是 `os.startfile`）：没有桌面会话时它开不出来，
+  这时只在控制台说一句「自己开 …」，**绝不让服务起不来**（`tests/test_packaging.py` 的
+  `AdminPageOpen` 用假 `webbrowser` 守着这两条）。
+* 编译器：Nuitka 4.2.2 **在 Python ≥3.13 上不许用 MinGW**（原文 `FATAL: Error, cannot use '--mingw64'
+  on Python version 3.13 or higher.`），默认走 MSVC（本机 = Visual Studio 生成工具 2026 / MSVC 14.51.36231）；
+  `-MinGW` 只在 Python ≤3.12 有意义，脚本在更高版本上会忽略它并警告。
+* ★ **别用 `--include-data-dir` 喂 Nuitka**：它按 Nuitka 自己的 `default_ignored_suffixes` 过滤，那张表里有
+  `.bin` —— 幽灵库全是 `ghost_*.bin`，会被静默丢掉（症状：冒烟「幽灵数量 = 入库的 46 个 实际 2」）。
+  脚本用 `--include-raw-dir`（不过滤），并在编译后拿日志里的 `Included data file '…'` 行数与暂存清单比对。
+* 反逆向是「抬高成本」不是安全边界（`../PUBLISHING.md`）：PyInstaller 能解出字节码，Nuitka 编成机器码。
+  真正能防「别人塞木马二次分发」的只有**正规 Authenticode 代码签名**（设 `$env:TF_SIGN_PFX` /
+  `$env:TF_SIGN_PASSWORD`，脚本自己找 `signtool.exe`），自签名不算解法。
+

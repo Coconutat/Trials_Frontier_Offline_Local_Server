@@ -31,12 +31,28 @@ import binascii
 import hashlib
 import json
 import os
+import sys
 import threading
 import time
 import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DATA = os.path.join(HERE, "data")
+# ★ 与 tf_server.py 同一套规则：打包成 exe 后运行期数据放 exe 目录下的 data/，
+#   源码运行时放 server/data（打包前后布局一致）。只读资源仍从包内 HERE 读。
+_FROZEN = bool(getattr(sys, "frozen", False)) or globals().get("__compiled__") is not None
+
+
+def _frozen_exe_dir():
+    """冻结后 exe 所在目录。Nuitka onefile 的 `sys.executable` 是临时解包的 python.exe，
+    真目录在 `NUITKA_ONEFILE_DIRECTORY`（与 tf_server.py 里同一段逻辑，别改成 import）。"""
+    cand = os.environ.get("NUITKA_ONEFILE_DIRECTORY")
+    if cand and os.path.isdir(cand):
+        return cand
+    return os.path.dirname(os.path.abspath(sys.executable))
+
+
+BASE = _frozen_exe_dir() if _FROZEN else HERE
+DATA = os.path.join(BASE, "data")
 ACCOUNTS = os.path.join(DATA, "accounts.json")
 SESSIONS = os.path.join(DATA, "sessions.json")
 DEVICES = os.path.join(DATA, "devices.json")

@@ -489,6 +489,8 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 | `pyelftools` | `patch_urls.py`、`tools/re/syms.py` | `pip install pyelftools` |
 | `capstone` | `tools/re/disasm.py`、`tools/re/xref_adrp.py` | `pip install capstone` |
 | Android SDK build-tools | `tfpatcher.py` 最后一步 | zipalign + apksigner；没有就用 `--no-sign` |
+| PyInstaller ≥6.22 | `build_exe.ps1`（默认分支） | `pip install pyinstaller`（本机已装 6.22.3） |
+| Nuitka ≥4.2 + MSVC | `build_exe.ps1 -Packer nuitka` | `pip install nuitka`；编译器用 Visual Studio 生成工具（**Python ≥3.13 不许用 MinGW**） |
 
 ---
 
@@ -506,7 +508,56 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 
 ---
 
-## 8. 相关文档
+## 8. 打包服务器 exe（零依赖分发）
+
+```powershell
+pwsh tools\build_exe.ps1                   # PyInstaller onefile → dist\TrialsFrontierServer.exe
+pwsh tools\build_exe.ps1 -Packer nuitka     # Nuitka 真编译 → dist\TrialsFrontierServer-nuitka.exe
+pwsh tools\build_exe.ps1 -Packer both       # 两个都出，方便比体积 / 启动时间
+pwsh tools\build_exe.ps1 -SkipTests         # 跳过打包前的全库回归
+pwsh tools\exe_smoke.ps1 -Exe dist\TrialsFrontierServer.exe [-Port 8199]
+```
+
+`build_exe.ps1` 四步：① 按白名单暂存到 `tmp\exe\stage`（`admin/` 前端、`rules.json`、
+`wts_rewards.json`，幽灵用 `git ls-files server/data/ghosts` 挑**已入库的 46 个**）；
+② **硬性安全检查**（`admin.json` / `accounts.json` / `sessions.json` / `pvp_state.json` / `save` / 日志
+等命中就 `throw`）；③ 打包（默认 PyInstaller；Nuitka 自动找 MSVC，`--lto=yes --python-flag=-OO
+--windows-console-mode=force`）；④ 写 `dist\SHA256SUMS.txt`，设了 `$env:TF_SIGN_PFX` 就顺手
+Authenticode 签名（找不到 `signtool.exe` 只警告）。
+
+`exe_smoke.ps1` 把 exe 拷进 `tmp\exe\smoke` 空目录，当「玩家第一次拿到」跑一遍：零依赖启动、
+`port.txt` 生效、在 exe 旁建 `data\` 与 `logs\requests.jsonl`、只播种白名单、随机管理员口令能登录、
+`/__admin` 与 `app.js` 的字节数与源码一致、退出后无残余进程。
+
+★ 踩过的坑（脚本里已处理，改的时候别拆掉）：
+
+* **端口必须先确认是空的**：Windows 的 `allow_reuse_address` 会让两个进程都绑同一个端口，
+  请求却落到那个「上次没杀干净」的旧进程上 —— 现象是登录永远 401 `invalid-credentials`（拿别人的服务器验口令）。
+* **杀进程要 `taskkill /PID <pid> /T /F`**：PyInstaller onefile 会 fork 子进程干活，`Stop-Process` 只杀外壳。
+* 口令是**逐行写进 stdout 的**，读之前要等横幅写完（末行「忘了口令就重跑」），否则只拿到半截口令。
+* PowerShell 里不要给 `$home` 赋值（`$HOME` 是只读自动变量，变量名不区分大小写）。
+* **Nuitka 的 `--include-data-dir` 会按后缀静默丢文件**：它套用 Nuitka 自己的
+  `default_ignored_suffixes`，那张表里有 `.bin`（`...dll dylib exe bin`）—— 幽灵库全是
+  `ghost_*.bin`，一用就整批没了（冒烟表现为「幽灵数量 = 入库的 46 个 实际 2」）。
+  所以 Nuitka 分支用 **`--include-raw-dir`**（`raw=True`，不做任何过滤），并在编译后拿日志里的
+  `Included data file '…'` 行数跟暂存清单比对，少了就 `throw`。
+* **Nuitka onefile 的 `sys.executable` 是临时解包的 `python.exe`**：照它算 exe 目录会把存档写进
+  `%TEMP%\onefile_…`（退出即丢）、`port.txt` 也被忽略。真目录在 `NUITKA_ONEFILE_DIRECTORY`，
+  由 `tf_server.py` 的 `_frozen_exe_dir()` 取（`tests/test_packaging.py` 有回归）。
+* **自动开浏览器别拿假浏览器去验**：`BROWSER='cmd /c fake_browser.cmd'` 这种探头不起作用 ——
+  CPython 的 `webbrowser` 把**不认识的** `BROWSER` 命令追加到 `_tryorder` 末尾，
+  Windows 的 `os.startfile` 排在前头，假 `.cmd` 永远轮不到（实测 `webbrowser.open()` 返回 True
+  却没留痕迹）。代码那半边（地址对不对、开不出来会不会拦服务）由
+  `tests/test_packaging.py` 的 `AdminPageOpen` 守着；「真会弹窗」只能双击一次用眼睛验。
+
+编译器两条硬事实：**Nuitka 4.2.2 在 Python ≥3.13 上不允许 `--mingw64`**
+（原文 `FATAL: Error, cannot use '--mingw64' on Python version 3.13 or higher.`，官方 3.13+ 是 MSVC ABI），
+所以默认走 MSVC（本机 = `C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools`，MSVC 14.51.36231）；
+`-MinGW` 只在 Python ≤3.12 有意义，脚本在更高版本上会忽略它并警告。
+
+---
+
+## 9. 相关文档
 
 * `../ROADMAP.md` —— 要做什么（唯一的目标清单）
 * `../ROADMAP_STATUS.md` —— 做到哪一步了；§3.x 记的是每个真实 bug 的完整逆向链路

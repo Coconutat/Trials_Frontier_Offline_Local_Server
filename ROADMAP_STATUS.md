@@ -14,7 +14,7 @@
 | 2b | VIP 下发（买了 VIP 就激活 VIP 事件） | ✅ **已实机验证（m16）** | 100% |
 | 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **部分实现；本轮补齐碉堡奖励/结赛及基础货币链，21项隔离回归通过，待真机到账验证** | 不再沿用旧95%估计 |
 | 4 | WebUI 管理界面 | 🟡 **五屏已交付（`/__admin`：登录／账号／存档／下发＋午夜杯运营屏＋碉堡运营屏，CN+EN，160 项后台回归 + headless 冒烟）；概览等两屏待做** | 65% |
-| 5 | 一键开服打包成 exe | ⚪ 未开始 | 0% |
+| 5 | 一键开服打包成 exe | ✅ **零依赖单文件已交付（PyInstaller 10.2 MB + Nuitka 真编译 7.7 MB；空目录冒烟全绿，数据落在 exe 旁）** | 100% |
 | 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
 
 ---
@@ -708,7 +708,7 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
   编号 `(车号 + 72) * 5 + 4`、需求量来自 `/conf/upgrades.txt` 的 `BP`。
   `rollback_save()` 埋 `pre_restore_` 快照（回滚本身不可逆）；两者都能一键撤销。
   带前缀的快照名在 `sorted()` 里排在纯数字时间戳之后，所以不会被 `SAVE_HISTORY_MAX` 的裁剪丢掉。
-- **回归**：`tests/test_admin_webui.py`（160 项，全库 229 项）+ `tools/ui_smoke.mjs`（headless Edge + CDP
+- **回归**：`tests/test_admin_webui.py`（160 项，全库 246 项）+ `tools/ui_smoke.mjs`（headless Edge + CDP
   逐屏断言，对 `Runtime.exceptionThrown` / console error 零容忍；每屏可带 `suffixes` 给分段截图改后缀）。
   ⚠ 教训：只调 `_introspect` 的门禁测试会给**假绿灯** —— `_handle` 里在它之前的内联近路
   就是绕过访问控制的洞（`/__log` 曾经这么裸奔过），所以门禁必须用真路由 `request_handle()` 测。
@@ -907,14 +907,40 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
 
 ---
 
-## 5. 一键开服打包成 exe —— 未开始
+## 5. 一键开服打包成 exe —— ✅ 已交付（PyInstaller 单文件 + Nuitka 真编译）
 
-### 建议实现路径
-1. `server/launch.py`：选端口、生成默认 `tf_server.txt` 内容、起服务器、打印局域网 IP 与配置说明。
-2. `pyinstaller --onefile --add-data "rules.json;." --add-data "data;data" server/launch.py`。
-3. 首次运行自动创建 `server/data/`，并提示把 IP 填进手机的
-   `/sdcard/Android/data/com.ubisoft.redlynx.trialsfrontier.ggp/files/tf_server.txt`。
-4. 注意：局域网部署要求手机能直连 PC（见 §1，Windows 防火墙需放行 Python 入站，已验证有放行规则）。
+> 用户要求（2026-10-06，m09238 / m09240）：**「exe可以在不需要装任何依赖的Windows上运行。然后exe是独立打包的AIO，
+> 而且要安全加密，防止逆向。」「最后，data文件在exe目录下，data就是玩家存档等。至于json配置文件需要加密么？」**
+
+实际落地的做法（比当初设想的 `server/launch.py` 更省：不新增入口文件）：
+
+1. `server/tf_server.py` 自己就是入口。冻结后 `BASE = <exe 目录>`：运行期数据（存档、`tf_config.json`、
+   对局状态、`logs/`）写 `<exe 目录>/data`；只读资源（`admin/`、`rules.json`、`items.json`、静态幽灵）仍从包内
+   `HERE` 读。冻结判据 = `sys.frozen` 或 Nuitka 的 `__compiled__`（Nuitka 不设前者）。
+2. 首次运行 `seed_data_dir()` 只补缺：`tf_config.json` 写**内置默认值**、拷 `wts_rewards.json` 与已入库的 46 个幽灵，
+   **从不覆盖**玩家已有数据 ⇒ 换新版 exe 直接替换文件即可。
+3. 端口优先级 `--port` > `<exe 目录>\port.txt` 第一行 > 8123；冻结时启动自动打开 `/__admin`
+   （`--no-browser` 关掉）；首次运行随机生成管理员口令打到控制台（`--reset-admin` 重来）。
+4. `tools/build_exe.ps1`：白名单暂存（幽灵用 `git ls-files` 挑，避免把真机上传的一起发出去）+ 私有数据**硬性检查**
+   + PyInstaller / Nuitka 两支 + `SHA256SUMS.txt` + 可选 Authenticode 签名（`$env:TF_SIGN_PFX`）。
+5. `tools/exe_smoke.ps1`：把 exe 拷进一个空目录，当「玩家第一次拿到」跑一遍。
+
+验证（2026-10-06）：PyInstaller 版约 **10.2 MB**、Nuitka 版约 **7.7 MB**（体积与 sha256 每次编译都会变，
+以产物旁边的 `dist\SHA256SUMS.txt` 为准），空目录冒烟**全绿**：零依赖启动 / `port.txt` 生效 / 在 exe 旁建 `data\` 与 `logs\requests.jsonl` /
+只播种 46 个已入库幽灵 / 随机口令能登录 / `/__admin` 与 `app.js` 字节数与源码一致 / 退出无残余进程；
+全程没碰开发机的 `server\data\admin.json`。新增 `tests/test_packaging.py` 17 项回归（全库 229 → 246 项），
+其中 `AdminPageOpen` 用假 `webbrowser` 守住「启动自动开管理页」的地址与「开不出来也不拦服务」
+（假 `BROWSER=…` 探头在 Windows 上验不了这条：CPython 把不认识的 `BROWSER` 命令排在 `os.startfile` 之后）。
+
+★ **Nuitka onefile 的坑（真机踩到并修）**：它的 `sys.executable` 指向**临时解包出来的 `python.exe`**，
+照它算 exe 目录 ⇒ 存档/配置/日志全落 `%TEMP%\onefile_…`（退出即丢）、`port.txt` 也被忽略（读的是临时目录里那份）。
+真目录由 bootstrap 放在环境变量 `NUITKA_ONEFILE_DIRECTORY` 里，`_frozen_exe_dir()` 优先用它。
+另一个坑：Nuitka 的 `--include-data-dir` 按自带 `default_ignored_suffixes` 过滤，其中含 `.bin`，
+把 44 个 `ghost_*.bin` 全丢了（冒烟「幽灵数量 = 入库的 46 个 实际 2」）⇒ 改用 `--include-raw-dir`，
+并在编译后比对日志里的 `Included data file '…'` 行数与暂存清单，少了就中止。
+
+**「json 要不要加密」的结论：不要。** 运行期数据必须明文（能备份 / 能迁移是特性，且密钥随 exe 发出＝白给）；
+反逆向只能抬高成本，真正防「别人塞木马二次分发」靠正规代码签名 —— 见 `PUBLISHING.md`。
 
 ---
 
@@ -1043,7 +1069,7 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 
 | # | 事项 | 说明 |
 | --- | --- | --- |
-| 9 | 打包 exe | 未开始。 |
+| 9 | 打包 exe | ✅ 已交付（2026-10-06）：`tools/build_exe.ps1` + `tools/exe_smoke.ps1`，数据落 exe 旁 `data\`，见 §5。 |
 
 ### P4 · 悬而未决 / 需要用户输入
 

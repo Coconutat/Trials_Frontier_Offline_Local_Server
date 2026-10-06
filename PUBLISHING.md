@@ -9,6 +9,8 @@
 - ✅ **管理员口令不硬编码**：走 `server/data/admin.json`（口令哈希 + 盐，已 ignore），`--reset-admin` 时由 `acct.admin_new_password()` 随机生成。别为了省事把它写回代码或文档。
 - ✅ **远端没有 APK / 大二进制**：`origin/main` 只有 `LICENSE` + `.gitattributes`；`origin/DEMO` 最大的文件是 `server/tf_server.py`（349 KB）。本地 `.git` 里的原版 APK 副本已清（§6）。
 - ⚠️ 库里有一批**游戏版权物**（§1）与**个人信息残留**（§3）：私有仓库无碍，公开前必须处理。
+- ⚠️ **打包成 exe 发人**：exe 里不含口令 / 存档（打包白名单硬性检查），但 GPL-3.0 的源码义务与「禁止逆向」的
+  诉求会打架 —— 见 §8。
 
 ## 1. 已跟踪的游戏版权物（公开前必须摘掉）
 
@@ -58,6 +60,8 @@ server/data/ghosts/
 | `server/data/tf_config.json` | **线上手调参数**（已改成不入库，见 §7） |
 | `server/data/server.log` / `server.err.log` | 8123 的 stdout/stderr（`-u` + `-Redirect*` 落的现场：`[pvp] open/close …`、`[save] …`、`[admin] …`；含真人 id） |
 | `work/trials-frontier/notes/server-log.jsonl` | 每请求一条 JSONL（**含请求头**），19 MB 量级且在长，不入库只当证据 |
+| `<exe 目录>\data\*` | **打包成 exe 后**上面那些运行期数据全落这儿（存档、`admin.json`、`pvp_state.json`、`tf_config.json`…）—— 发给别人时要发**干净目录**里的 exe，别连自己的 `data\` 一起打包 |
+| `<exe 目录>\logs\requests.jsonl` | 冻结后的请求日志（与源码模式的 `server-log.jsonl` 同格式，同样含请求头） |
 | `APKS/` / `tmp/` / `dist/*`（除 `dist/README.md`）/ `pvp_docs/` | 原版 APK 备份与手机截图 / 构建中间产物 / 交付包 / 超范围设计稿 |
 
 `.gitignore` 末尾用 `server/data/*.json` 兜底，**例外放行** `!server/data/wts_rewards.json`（游戏奖励表，WebUI 要用，必须入库）；`server/data/*.log` 单独一行兜住 8123 的 stdout/stderr。
@@ -117,3 +121,18 @@ git gc --prune=now
 - **别把 `server/data/tf_config.json` 提交回去**：那是线上手调值（含局域网地址），已从版本库摘掉并加进 `.gitignore`；以后改动只会出现在 `git status` 里。
 - 别把管理员口令、真实 profile id、设备序列号写进文档 / 脚本 / 测试夹具（夹具用假值）。
 - 交付/开源之前，先跑一遍 §4 的三行自检。
+
+## 8. 把 exe 发给别人时（2026-10-06 起）
+
+- exe 里**没有**你的口令 / 存档 / 对局状态：打包白名单 + 硬性检查（`tools/build_exe.ps1` 第 2 步）会拒绝
+  `admin.json`、`accounts.json`、`pvp_state.json`、`save/`、日志等。校验方法：`tools/exe_smoke.ps1` 会在空目录跑一遍，
+  断言「没有开发机的存档 / 审计 / 对局状态」。
+- 发之前**别把自己的 `data\` 目录一起打包**（那里面有你的管理员口令与存档）；发的是 `dist\<名字>.exe` +
+  `SHA256SUMS.txt`，让对方双击、由 exe 自己建干净的 `data\`。
+- ⚠️ **许可**：本仓库是 **GPL-3.0**（`LICENSE`）。只自己用 / 送朋友不触发源码义务；一旦**公开分发**，
+  §3/§6 要求提供对应源码，§7 也不允许再加「禁止逆向」这类额外限制。用户本人是版权人 ⇒ 可以自己换许可或双许可，
+  这是商业决定，不是技术问题。
+- 反逆向的正确预期：PyInstaller 只是压缩（能解出字节码），Nuitka 编成机器码（更难），**都不是安全边界**。
+  真正能防「别人往你的 exe 里塞木马再转发」的是**正规 Authenticode 代码签名**（自签只会更吓人，不算解法），
+  脚本留了 `$env:TF_SIGN_PFX` / `$env:TF_SIGN_PASSWORD` 接口。运行期「授权 / 防拷」只有联网校验能做，
+  否则密钥必然随 exe 发出 —— 而 `data/` 里的 JSON 不该加密（用户要能备份、能手改）。

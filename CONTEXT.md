@@ -200,6 +200,17 @@
   运营参数一律用图形控件编辑（数字框、分段控件、下拉、可增删的表格行），**不提供 JSON 文本框**。
   目标用户是不懂 JSON 的人；JSON 只作为内部存储与导出格式存在。
 
+- **冻结（frozen）与两类目录：只读资源 / 运行期数据**
+  「冻结」= 代码被打成 exe 跑（PyInstaller 看 `sys.frozen`，Nuitka 看 `__compiled__`）。冻结后路径分两类：
+  **只读资源**（`admin/` 前端、`rules.json`、`items.json`、已入库的静态幽灵）从包内 `HERE` 读；
+  **运行期数据**（存档、`tf_config.json`、对局状态、`logs/`）写到 `<exe 目录>/data`。
+  源码运行时两者都在 `server/` 下、布局与打包前一致。
+
+- **播种（seed）与打包白名单**
+  首次运行把缺的文件补上（`tf_config.json` 用**内置默认值**、拷 `wts_rewards.json` 与 46 个已入库幽灵），
+  **只补缺、从不覆盖** ⇒ 换新版 exe 直接替换文件。打包白名单（`tools/build_exe.ps1`）是安全边界：
+  真机存档、`admin.json`、`accounts.json`、`pvp_state.json`、审计与日志一律不进包，脚本带硬性检查。
+
 ## 已废弃的提法
 
 - **劫持层（VPN/DNS 重定向叠加层）**：曾被设想为独立 App，供无 root 用户填入 IP/端口/域名。
