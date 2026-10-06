@@ -424,6 +424,10 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
   的映射（1..4 是金币、5 是钻石、100 = 占位问号、20000..20049 是零件）。
   后台「赛季奖励」的特殊奖励下拉用它（`item_id 145` 的 `amount` 装的是这里面那个 **RewardID**）；
   金币/钻石（`item_id 1/2`）从下拉里排除。输出 `rewards = {"<RewardID>": {...}}`，304 条。
+  ⚠ **但客户端只认 `PVPMatchSpecialRewards` 那 7 组 43 个编号**（`202/203/220` + 零件 4 档）：
+  别的编号 `PVPManager::getSpecialRewardById` 会就地插一个空奖励 ⇒ 真机上显示同一个占位物
+  （毛驴轮胎）。所以服务端 `_PVP_SPECIAL_GROUPS` 只用这 43 个当白名单，`rewards` 段里其余的
+  条目仍然保留（做名字/交叉核对用），但不进下拉、也不允许填写。
 * `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
   所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试（最多 16 次，
   `0010_1854657d.bin` 需要 12 次）。**还有 3 个文件解析不了**，如实记进 `source.skipped_files`：

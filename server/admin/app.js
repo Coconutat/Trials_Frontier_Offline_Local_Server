@@ -1589,11 +1589,21 @@ function rewardsEditor(rows, cat, onChange) {
     }
     onChange(out);
   };
+  const nm = c => (LANG === 'cn' ? c.name_cn : c.name) || c.name || '';
   const names = {};
-  cat.forEach(c => { names[String(c.id)] = (LANG === 'cn' ? c.name_cn : c.name) || c.name || ''; });
-  const dl = el('datalist', { id: 'tfRewardIds' }, cat.map(c => el('option', {
-    value: String(c.id),
-    text: '#' + c.id + ' ' + ((LANG === 'cn' ? c.name_cn : c.name) || c.name || '') })));
+  cat.forEach(c => { names[String(c.id)] = nm(c); });
+  // 原表的赛季特殊奖励只有 43 个编号、分 7 组（零件 4 档 / 两款涂装 / 毛驴图纸），
+  // 用 <optgroup> 分组给下拉；不在这张表里的编号客户端只会发一个占位物。
+  const groups = [];
+  cat.forEach(c => {
+    const label = (LANG === 'cn' ? c.group_cn : c.group_en) || c.group_cn || '';
+    let g = groups[groups.length - 1];
+    if (!g || g.label !== label) groups.push(g = { label: label, rows: [] });
+    g.rows.push(c);
+  });
+  const dl = el('datalist', { id: 'tfRewardIds' }, groups.map(g =>
+    el('optgroup', { label: g.label }, g.rows.map(c => el('option', {
+      value: String(c.id), text: '#' + c.id + ' ' + nm(c) })))));
   const head = el('div', { class: 'rwrow rwhead' },
     el('div', { class: 'rwrank', text: t('bunker.rewards.rank') }),
     el('div', { text: t('bunker.rewards.coin') }),
@@ -1616,13 +1626,18 @@ function rewardsEditor(rows, cat, onChange) {
     const sp = el('input', { type: 'text', class: 'rwsp', list: 'tfRewardIds', inputmode: 'numeric',
                              placeholder: t('bunker.rewards.manual') });
     const spName = el('span', { class: 'hint' });
+    const mark = v => {
+      const seen = !!v && !!names[String(v)];
+      spName.textContent = v ? (seen ? names[String(v)] : t('bunker.rewards.unknown')) : '';
+      spName.classList.toggle('bad', !!v && !seen);
+      sp.classList.toggle('bad', !!v && !seen);
+    };
     if (by[r][145]) sp.value = String(by[r][145]);
-    spName.textContent = by[r][145]
-      ? (names[String(by[r][145])] || t('bunker.rewards.unknown')) : '';
+    mark(by[r][145]);
     sp.addEventListener('input', () => {
       const v = parseInt(sp.value.replace(/[^0-9]/g, ''), 10) || 0;
       by[r][145] = v;
-      spName.textContent = v ? (names[String(v)] || t('bunker.rewards.unknown')) : '';
+      mark(v);
       dirty();
       emit();
     });
@@ -1677,7 +1692,7 @@ function productsEditor(rows, onChange) {
 async function screenBunker() {
   const data = await api('/__api/admin/bunker');
   const st = data.status || {}, fields = data.fields || [], values = data.values || {};
-  const ctx = { tracks: data.tracks || [], rewards: data.rewards || [] };
+  const ctx = { tracks: data.tracks || [], rewards: data.specials || [] };
   const byKey = {};
   fields.forEach(f => { byKey[f.key] = f; });
   const draft = Object.assign({}, values);

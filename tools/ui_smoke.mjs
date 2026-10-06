@@ -251,7 +251,7 @@ const SCREENS = [
              inp.value = '999';
              inp.dispatchEvent(new Event('input'));
            })()`,
-    mustAfter2: ['原表里没有这个编号'],
+    mustAfter2: ['毛驴轮胎'],
     suffixes: ['-选路', '-奖励'],
   },
 ];

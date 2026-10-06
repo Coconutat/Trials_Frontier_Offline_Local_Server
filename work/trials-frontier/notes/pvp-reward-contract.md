@@ -73,6 +73,24 @@ POST /public/pvp_matches/v1/close
 - [match原表:3671–3697](../../../tmp/pvp_match_rewards.txt#L3671-L3697)：MissingRewardFallbackRewards按rank1..25配置；兜底候选不是金币/宝石无条件加发。
 - 旧报告的 `pow(t,x)*y` 若x=0得到恒定**总量**，不是恒定速率；欲线性累计应x=1、y=每秒速率。此处修正数学解释，不改旧报告或线上配置。
 
+## 5b. ★ 赛季特殊奖只有 43 个编号可用（2026-10-06 追加，用户实测 bug）
+- **症状**：运营在赛季奖励里填了几款**喷漆/衣服**的编号（205/257/258/259），真机上整张奖励轨道全部显示 **毛驴轮胎**。
+- **机制**：`tr::PVPManager::getSpecialRewardById(int) @0x5e231c`（324 B）查 `this+0x288` 的 `std::map<int, tr::ItemManager::WheelReward>`（键=节点 `+0x20`、值=节点 `+0x24`），**未命中时不返回 null，而是就地插入一个默认构造的空 WheelReward**：`0x5e2410` 的 `std::piecewise_construct`（字面量 `@0xb8f859`）+ `0x5e242c bl ..._Rb_tree..._M_emplace_hint_unique...`，返回 `x8+0x24` ⇒ 调用点 `MenuzStatePVPPostSeason::setupRewards` 的 `0x735584 cbz x23,#0x7359f8` 是死代码。
+- **唯一填充者**：`tr::PVPDataParser::parseMatchSpecialRewards(json_value*, std::map<int,WheelReward>&) @0x5db0b4`（它同时也往 `std::vector<PVPSpecialWheelRewardLevel>` 里 emplace，该 `_M_emplace_back_aux @0x5ddaf0` 的唯一调用者就是它）；对照 `PVPDataParser::parseMatchRewardTypes @0x5daf5c` 只调 `ItemManager::parseWheelReward @0x59dd8c`（1712 B）、**函数签名里没有 map** ⇒ 那张 309 条的轮盘表（喷漆/衣服/赛道都在里面）**不会**填这张表。
+- **原表真源**：`/conf/pvp_match_rewards.txt`（= `tmp/packout/all/0024_a7ebc782.bin`，125010 B）的 `PVPMatchSpecialRewards` 是 **list[7]**（`PVPMatchRewardTypes` list[309]、`MissingRewardFallbackRewards` dict[25]、`PVPMatchRewards` dict[4] 另计）：
+  | Comment | SpecialRewardLevel | ids |
+  |---|---|---|
+  | Crafting Item Tier 2 | 0.0 | 20003,20008,20013,20018,20023,20028,20033,20038,20043,20048 |
+  | Crafting Item Tier 3 | 1.0 | 20002,20007,20012,20017,20022,20027,20032,20037,20042,20047 |
+  | Soylent Bike Skin | 2.0 | 202 |
+  | Donkey Blueprint | **100.0** | 220 |
+  | Luchador Bikeskin | 3.9 | 203 |
+  | Crafting Item Tier 4 | 4.0 | 20001,20006,20011,20016,20021,20026,20031,20036,20041,20046 |
+  | Crafting Item lvl 5 | 6.0 | 20000,20005,20010,20015,20020,20025,20030,20035,20040,20045 |
+- ⇒ **去重后 43 个编号**（`202, 203, 220` + 40 个零件）。第 5 档轮盘编号 `20004/20009/…/20049` 只在 309 条那张表里，**不是**特殊奖。
+- 其它约束：`getCombinedSeasonRewards @0x5e7364` 只收 `cmp w8,#0x91`（item_id==145）的 pair，别的 item_id 在 `0x5e7430-0x5e7480` 被 `b.ne` 跳过；`isRewardSpecial(const WheelReward&) @0x5e22e0` = `ldrb [x1,#4]` 非零为真，否则 `ldrsh [x1,#0x10]` 走 `/10-1 >= 10`。
+- **服务端落地（`server/tf_server.py`）**：`_PVP_SPECIAL_GROUPS`（7 组，同一张表）+ `_PVP_SPECIAL_IDS`（frozenset，43）；`_bunker_rewards_check()` 对 `item_id 145` 的 amount 不在集合里就 `bad-special:<id>`；`_bunker_catalogs()` 改成吐 `specials`（43 条，带 `group_en/group_cn`，按组连续，供 `<optgroup>`），`bunker_payload()` 的键从 `rewards` 改成 `specials`。
+
 ## 6. 最小回归清单
 - 同一match双方查询池一致；两次不同increase累加、同一已识别重试不再累加；进程重启仍保留池和reward_data。
 - close按(pid,match)一次bank；过早close不bank；重复close/重启不多入筹码、不重复暴露本地领奖入口。
