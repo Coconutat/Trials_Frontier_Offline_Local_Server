@@ -162,6 +162,13 @@ input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible
   box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 32%, transparent);
 }
 input[type=number] { font-variant-numeric: tabular-nums; }
+/* 上面那条 input 是给整行表单输入框用的（100% 宽）。勾选框必须自己收回去：
+   否则它在一行里吃掉整行宽度，后面的名字被挤成「看…」而且整行看着像右对齐。 */
+input[type=checkbox], input[type=radio] {
+  width: 16px; height: 16px; padding: 0; flex: 0 0 auto;
+  accent-color: var(--accent); border-radius: 4px;
+}
+input[type=checkbox]:focus-visible, input[type=radio]:focus-visible { outline: none; box-shadow: 0 0 0 3.5px color-mix(in srgb, var(--accent) 32%, transparent); }
 
 .alert {
   padding: 9px 11px; border-radius: var(--r-sm);
@@ -335,7 +342,7 @@ table.list.compact td { padding: 7px 14px; }
 .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 14px; }
 .kv > div { display: grid; gap: 3px; }
 .kv .k { font-size: 11px; letter-spacing: .055em; text-transform: uppercase; color: var(--text-3); }
-.kv .v { font-size: 19px; font-weight: 600; letter-spacing: -.015em; font-variant-numeric: tabular-nums; }
+.kv .v { font-size: 19px; font-weight: 600; letter-spacing: -.015em; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 
 .empty, .loading { padding: 34px 18px; text-align: center; color: var(--text-3); font-size: 13px; }
 
@@ -511,6 +518,10 @@ table.list.compact td { padding: 7px 14px; }
 .frow .fc { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .frow .fc > input[type=number], .frow .fc > input[type=text] { width: 100%; max-width: 220px; }
 .frow .fc > .fl { flex: 1 1 auto; }
+/* 宽控件行（赛道清单 / 25 格星章表）：标签在上、控件铺满整张卡。挤在 320px 的控件列里
+   时，382 条赛道名只能显示三个字，星章表也把左半边留成空白。 */
+.frow.wide { grid-template-columns: 1fr; gap: 8px; align-items: start; }
+.frow.wide .fc { align-items: flex-start; }
 @media (max-width: 700px) { .frow { grid-template-columns: 1fr; } }
 
 /* 卡内小节：现状数字 + 明细表的组合，标题要能从卡片里单独认出来。 */
@@ -543,3 +554,51 @@ table.list.compact td { padding: 7px 14px; }
 .tplrow:last-child { border-bottom: 0; }
 .tplrow .grow { flex: 1 1 180px; }
 .tplrow .tname { font-size: 13.5px; font-weight: 600; }
+
+/* ─────────────────────────────────────────────────────────── 碉堡：多选与表格编辑器 */
+
+/* 赛道多选：搜索框 + 可滚动的勾选清单（382 条用原生 select multiple 没法搜）。
+   选中的行整行加底色，滚到哪都能看出选了什么。 */
+.pick { display: grid; gap: 8px; width: 100%; }
+.pickhead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pickhead .filter { flex: 1 1 200px; }
+.picklist {
+  max-height: 260px; overflow: auto; border: 1px solid var(--stroke);
+  border-radius: 10px; background: var(--field); padding: 4px;
+}
+.prow { display: flex; align-items: center; gap: 9px; padding: 5px 8px; border-radius: 7px; cursor: pointer; }
+.prow .grow { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prow.on { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+.prow:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+
+/* 25 格星章表：一格 = 名次 + 上限。 */
+.stargrid { display: flex; flex-wrap: wrap; gap: 6px; }
+.starcell { display: grid; gap: 2px; justify-items: center; }
+.starcell input { width: 54px; text-align: center; font-variant-numeric: tabular-nums; }
+
+/* 赛季奖励表：名次 | 金币 | 钻石 | 特殊奖励。 */
+.rwtable { display: grid; gap: 6px; }
+.rwbody { display: grid; gap: 4px; max-height: 520px; overflow: auto; padding-right: 4px; }
+.rwrow {
+  display: grid; grid-template-columns: 84px 90px 90px minmax(150px, 1fr);
+  gap: 8px; align-items: center; padding: 4px 6px; border-radius: 8px;
+}
+.rwrow.on { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.rwhead { color: var(--text-3); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+.rwrank { font-size: 12.5px; font-weight: 500; }
+.rwnum { width: 100%; text-align: right; font-variant-numeric: tabular-nums; }
+.rwspwrap { display: flex; align-items: center; gap: 8px; }
+.rwsp { flex: 1 1 auto; min-width: 88px; }
+@media (max-width: 700px) {
+  .rwrow { grid-template-columns: 72px 1fr 1fr; }
+  .rwspwrap { grid-column: 1 / -1; }
+}
+
+/* 礼包表：product_id + 数量 + 删除。 */
+.pwrap { display: grid; gap: 8px; }
+.plist { display: grid; gap: 6px; }
+.pitem { display: grid; grid-template-columns: minmax(150px, 1fr) 90px auto; gap: 8px; }
+
+/* 横幅预览：换图必须换路径（客户端按 URL hash 判缓存），所以这里给个即时预览。 */
+.bannerprev { max-height: 64px; border-radius: 8px; border: 1px solid var(--stroke); }
+

@@ -348,6 +348,7 @@ const SCREENS = {
   saves: { titleKey: 'nav.saves', load: screenSaves },
   grant: { titleKey: 'nav.grant', load: screenGrant },
   weekly: { titleKey: 'nav.weekly', load: screenWeekly },
+  bunker: { titleKey: 'nav.bunker', load: screenBunker },
 };
 
 function route() {
@@ -1194,13 +1195,17 @@ function kvItem(k, v) {
 }
 
 // 表单行：左边标签+说明，右边控件。窄屏自动变单列（见 app.css 的 .frow）。
-function fRow(labelKey, control, hint) {
-  return el('div', { class: 'frow' },
+// `fRowRaw` 收现成文案 —— 碉堡页的标签来自服务端的字段表（中英双语写在表里），
+// 不经过 i18n.json。`wide` = 控件铺满整张卡（赛道清单 / 星章表这种宽控件）。
+function fRowRaw(label, control, hint, wide) {
+  return el('div', { class: 'frow' + (wide ? ' wide' : '') },
     el('div', { class: 'fl' },
-      el('div', { class: 'fk', text: t(labelKey) }),
+      el('div', { class: 'fk', text: label }),
       hint ? el('div', { class: 'hint', text: hint }) : null),
     el('div', { class: 'fc' }, ...(Array.isArray(control) ? control : [control])));
 }
+
+function fRow(labelKey, control, hint) { return fRowRaw(t(labelKey), control, hint); }
 
 // 数字框：空 ⇒ null（= 删掉这个键、回到代码默认值），否则 Number。整数校验在服务端。
 function numBox(value, onchange, o) {
@@ -1220,13 +1225,15 @@ function cardFoot(...btns) {
   return el('div', { class: 'frow' }, el('div', { class: 'fl' }), el('div', { class: 'fc' }, ...btns));
 }
 
-function wCard(titleKey, hint, ...body) {
+function wCardRaw(label, hint, ...body) {
   return el('section', { class: 'card' },
     el('div', { class: 'card-head' },
-      el('h2', { class: 'grow', text: t(titleKey) }),
+      el('h2', { class: 'grow', text: label }),
       hint ? el('span', { class: 'hint', text: hint }) : null),
     el('div', { class: 'card-body' }, ...body));
 }
+
+function wCard(titleKey, hint, ...body) { return wCardRaw(t(titleKey), hint, ...body); }
 
 function wSub(labelKey, ...body) {
   return el('div', { class: 'grp' }, el('div', { class: 'sub', text: t(labelKey) }), ...body);
@@ -1533,6 +1540,499 @@ async function screenWeekly() {
           }) })], t('weekly.templates.saveHint'))),
     wSub('weekly.templates.listTitle',
       tplRows.length ? el('div', null, ...tplRows) : el('div', { class: 'empty', text: t('weekly.templates.none') }))));
+
+  return nodes;
+}
+
+// ─────────────────────────────────────────────── 屏 · 碉堡（PVP 运营）
+
+// 字段表在服务端（`_BUNKER_FIELDS`，标签中英双语写在表里）：加一个可配参数只要在服务端
+// 表里写一行，这一屏不用跟着改。管的是 season / matchmaking / chips 三段，保存即生效
+// （配置按 mtime 热加载，不重启服务）。
+// ★ 玩家档案（段位/星章/金票）在现状卡里**只读**：直接编辑 pvp_state.json 会被服务器
+//   下次写盘覆盖，要改就走这一页的参数或「竞技场」卡。
+
+function bText(f) { return (LANG === 'cn' ? f.cn : f.en) || f.key; }
+function bHint(f) { return (LANG === 'cn' ? f.hint_cn : f.hint_en) || ''; }
+
+// 一个值 → 人能读的一行。现状卡、改动记录、模板卡三处共用。
+function bunkerVal(f, v) {
+  const kind = (f && f.kind) || '';
+  if (kind === 'bool') return v ? t('bunker.on') : t('bunker.off');
+  if (kind === 'text' || kind === 'banner') return v ? String(v) : '—';
+  if (kind === 'stars') return t('bunker.stars.sum',
+    { n: fmtNum((v || []).reduce((a, b) => a + (Number(b) || 0), 0)) });
+  if (kind === 'ids') return t('bunker.track.count', { n: fmtNum((v || []).length) });
+  if (kind === 'rewards') return t('bunker.rewards.count', { n: fmtNum((v || []).length) });
+  if (kind === 'products') return t('bunker.products.count', { n: fmtNum((v || []).length) });
+  if (v === null || v === undefined || v === '') return '—';
+  return fmtNum(v);
+}
+
+// 赛季奖励表：名次 0..25 一行，金币/钻石各一个数量框，特殊奖励一个「下拉 + 可手填」的
+// 输入框（原表 RewardID → 名字，见 item-ids.md §8c）。
+// ★ 数量是**每档增量**：客户端会把名次 R 及以上的档位累加起来发。
+function rewardsEditor(rows, cat, onChange) {
+  const by = {};
+  for (let r = 0; r <= 25; r++) by[r] = { 1: 0, 2: 0, 145: 0 };
+  (rows || []).forEach(x => {
+    const r = Number(x.rank), it = Number(x.item_id);
+    if (!(r in by) || (it !== 1 && it !== 2 && it !== 145)) return;
+    by[r][it] = Number(x.amount) || 0;
+  });
+  const emit = () => {
+    const out = [];
+    for (let r = 0; r <= 25; r++) {
+      if (by[r][1]) out.push({ rank: r, item_id: 1, amount: by[r][1] });
+      if (by[r][2]) out.push({ rank: r, item_id: 2, amount: by[r][2] });
+      if (by[r][145]) out.push({ rank: r, item_id: 145, amount: by[r][145] });
+    }
+    onChange(out);
+  };
+  const names = {};
+  cat.forEach(c => { names[String(c.id)] = (LANG === 'cn' ? c.name_cn : c.name) || c.name || ''; });
+  const dl = el('datalist', { id: 'tfRewardIds' }, cat.map(c => el('option', {
+    value: String(c.id),
+    text: '#' + c.id + ' ' + ((LANG === 'cn' ? c.name_cn : c.name) || c.name || '') })));
+  const head = el('div', { class: 'rwrow rwhead' },
+    el('div', { class: 'rwrank', text: t('bunker.rewards.rank') }),
+    el('div', { text: t('bunker.rewards.coin') }),
+    el('div', { text: t('bunker.rewards.gem') }),
+    el('div', { text: t('bunker.rewards.special') }));
+  const body = el('div', { class: 'rwbody' });
+  for (let r = 0; r <= 25; r++) {
+    const row = el('div', { class: 'rwrow' + (by[r][1] || by[r][2] || by[r][145] ? ' on' : '') });
+    const dirty = () => row.classList.toggle('on', !!(by[r][1] || by[r][2] || by[r][145]));
+    const num = item => {
+      const inp = el('input', { type: 'number', min: '0', step: '1', class: 'rwnum',
+                                value: by[r][item] ? String(by[r][item]) : '' });
+      inp.addEventListener('input', () => {
+        by[r][item] = Number(inp.value) || 0;
+        dirty();
+        emit();
+      });
+      return inp;
+    };
+    const sp = el('input', { type: 'text', class: 'rwsp', list: 'tfRewardIds', inputmode: 'numeric',
+                             placeholder: t('bunker.rewards.manual') });
+    const spName = el('span', { class: 'hint' });
+    if (by[r][145]) sp.value = String(by[r][145]);
+    spName.textContent = by[r][145]
+      ? (names[String(by[r][145])] || t('bunker.rewards.unknown')) : '';
+    sp.addEventListener('input', () => {
+      const v = parseInt(sp.value.replace(/[^0-9]/g, ''), 10) || 0;
+      by[r][145] = v;
+      spName.textContent = v ? (names[String(v)] || t('bunker.rewards.unknown')) : '';
+      dirty();
+      emit();
+    });
+    row.append(el('div', { class: 'rwrank',
+      text: r === 0 ? t('bunker.rank.legend') : t('bunker.rank.n', { n: r }) }),
+      num(1), num(2), el('div', { class: 'rwspwrap' }, sp, spName));
+    body.append(row);
+  }
+  return el('div', { class: 'rwtable' },
+    dl,
+    el('p', { class: 'hint', text: t('bunker.rewards.subtitle') }),
+    head, body);
+}
+
+// 礼包表（`season.product_list`）：product_id 是商城商品 id，客户端认不出就静默忽略。
+function productsEditor(rows, onChange) {
+  const items = (rows || []).map(x => ({ product_id: String(x.product_id || ''),
+                                        amount: Number(x.amount) || 0 }));
+  const list = el('div', { class: 'plist' });
+  const emit = () => onChange(items.filter(x => x.product_id)
+    .map(x => ({ product_id: x.product_id, amount: x.amount })));
+  const dl = el('datalist', { id: 'tfProductIds' },
+    el('option', { value: 'chip_shop.goldentickets' }));
+  function row(it) {
+    const idIn = el('input', { type: 'text', list: 'tfProductIds', value: it.product_id,
+                               placeholder: t('bunker.products.item') });
+    const amtIn = el('input', { type: 'number', min: '0', step: '1', class: 'rwnum',
+                                value: String(it.amount || 0) });
+    idIn.addEventListener('input', () => { it.product_id = idIn.value.trim(); emit(); });
+    amtIn.addEventListener('input', () => { it.amount = Number(amtIn.value) || 0; emit(); });
+    const node = el('div', { class: 'prow pitem' }, idIn, amtIn,
+      el('button', { class: 'btn tiny danger', type: 'button', text: t('bunker.products.remove'),
+        onclick: () => {
+          const i = items.indexOf(it);
+          if (i >= 0) items.splice(i, 1);
+          node.remove();
+          emit();
+        } }));
+    return node;
+  }
+  items.forEach(it => list.append(row(it)));
+  return el('div', { class: 'pwrap' }, dl, list,
+    el('button', { class: 'btn tiny', type: 'button', text: t('bunker.products.add'),
+      onclick: () => {
+        const it = { product_id: '', amount: 1 };
+        items.push(it);
+        list.append(row(it));
+        emit();
+      } }));
+}
+
+async function screenBunker() {
+  const data = await api('/__api/admin/bunker');
+  const st = data.status || {}, fields = data.fields || [], values = data.values || {};
+  const ctx = { tracks: data.tracks || [], rewards: data.rewards || [] };
+  const byKey = {};
+  fields.forEach(f => { byKey[f.key] = f; });
+  const draft = Object.assign({}, values);
+  const nodes = [el('p', { class: 'lead', text: t('bunker.lead') })];
+  const set = (k, v) => { draft[k] = v; };
+
+  function diffFields(keys) {
+    const out = {};
+    for (const k of keys) {
+      const a = draft[k] === undefined ? null : draft[k];
+      const b = values[k] === undefined ? null : values[k];
+      if (JSON.stringify(a) !== JSON.stringify(b)) out[k] = a;
+    }
+    return out;
+  }
+
+  async function saveFields(keys, okKey) {
+    return guarded(async () => {
+      const fs = diffFields(keys);
+      if (!Object.keys(fs).length) { toast(t('weekly.noChange'), { kind: 'warn', timeout: 2600 }); return; }
+      const r = await post('/__api/admin/bunker', { fields: fs });
+      const applied = r.applied || [];
+      const sum = applied.map(a => bText(byKey[a.key] || { key: a.key }) + ' ' +
+                                    bunkerVal(byKey[a.key], a.after)).join('　');
+      const ids = applied.map(a => a.audit).filter(Boolean);
+      const opts = { kind: 'good' };
+      if (ids.length) opts.action = { label: t('weekly.undo'), run: () => guarded(async () => {
+        for (const id of ids) await post('/__api/admin/undo', { id });
+        show('bunker');
+      }) };
+      toast(t(okKey) + (sum ? ' · ' + sum : ''), opts);
+      show('bunker');
+    });
+  }
+  const saveBtn = keys => el('button', { class: 'btn primary', type: 'button',
+    text: t('weekly.save'), onclick: () => saveFields(keys, 'weekly.saved') });
+
+  // 一个字段 → 控件。清空数字框 = 删掉这个键（回到代码默认值），服务端支持。
+  function bControl(f) {
+    const k = f.key, kind = f.kind;
+    const cur = el('span', { class: 'hint', text: t('bunker.nowIs', { v: bunkerVal(f, f.now) }) });
+    if (kind === 'int' || kind === 'float') {
+      const box = numBox(draft[k], v => set(k, v), { min: f.min, max: f.max });
+      if (k === 'matchmaking.match_duration_seconds') {
+        const presets = [[300, t('app.span.m', { m: 5 })], [3600, t('weekly.rules.p1h')],
+                         [21600, t('bunker.reset6h')]];
+        return presets.map(p => el('button', { class: 'btn tiny', type: 'button', text: p[1],
+          onclick: () => { draft[k] = p[0]; box.value = String(p[0]); } })).concat([box, cur]);
+      }
+      return [box, cur];
+    }
+    if (kind === 'bool') {
+      const on = el('button', { class: 'chip', type: 'button', text: t('bunker.on') });
+      const off = el('button', { class: 'chip', type: 'button', text: t('bunker.off') });
+      const sync = v => {
+        on.setAttribute('aria-pressed', String(v === true));
+        off.setAttribute('aria-pressed', String(v === false));
+      };
+      on.onclick = () => { set(k, true); sync(true); };
+      off.onclick = () => { set(k, false); sync(false); };
+      sync(draft[k] === true);
+      return [on, off, cur];
+    }
+    if (kind === 'text') {
+      const inp = el('input', { type: 'text', maxlength: String(f.max || 60),
+                                value: draft[k] == null ? '' : String(draft[k]) });
+      const bad = el('span', { class: 'hint p-warn', hidden: true, text: t('bunker.pipeWarn') });
+      const sync = () => { bad.hidden = inp.value.indexOf('|') < 0; };
+      inp.addEventListener('input', () => { set(k, inp.value); sync(); });
+      sync();
+      return [inp, bad];
+    }
+    if (kind === 'banner') {
+      const inp = el('input', { type: 'text', maxlength: String(f.max || 80),
+                                value: draft[k] == null ? '' : String(draft[k]) });
+      const img = el('img', { class: 'bannerprev', alt: '', src: draft[k] || '', hidden: !draft[k] });
+      inp.addEventListener('input', () => { set(k, inp.value); img.hidden = !inp.value; img.src = inp.value; });
+      return [inp, el('span', { class: 'hint', text: t('bunker.banner.preview') }), img];
+    }
+    if (kind === 'stars') {
+      const arr = (draft[k] || []).map(Number);
+      const grid = el('div', { class: 'stargrid' });
+      for (let i = 0; i < 25; i++) {
+        grid.append(el('label', { class: 'starcell', title: t('bunker.stars.cell', { n: i + 1 }) },
+          el('span', { class: 'hint', text: String(i + 1) }),
+          el('input', { type: 'number', min: '0', max: '100',
+            value: String(arr[i] == null ? 0 : arr[i]),
+            oninput: e => { arr[i] = Number(e.target.value) || 0; set(k, arr.slice()); } })));
+      }
+      return [grid, el('span', { class: 'hint', text: t('bunker.stars.hint') })];
+    }
+    if (kind === 'ids') {
+      const list = (draft[k] || []).map(Number);
+      if (!ctx.tracks.length) {
+        const inp = el('input', { type: 'text', value: list.join(', '), placeholder: '1041, 1042' });
+        inp.addEventListener('input', () => set(k,
+          inp.value.split(/[^0-9]+/).filter(Boolean).map(Number)));
+        return [inp, el('span', { class: 'hint', text: t('bunker.track.empty') })];
+      }
+      const limit = k === 'matchmaking.track_ids' ? 3 : 999;
+      const count = el('span', { class: 'hint' });
+      const search = el('input', { type: 'search', class: 'filter',
+                                   placeholder: t('bunker.track.search') });
+      const box = el('div', { class: 'picklist' });
+      const rows = [];
+      const sync = () => {
+        const own = new Set(list);
+        rows.forEach(r => { r.box.checked = own.has(r.id); r.row.classList.toggle('on', own.has(r.id)); });
+        count.textContent = t('bunker.track.chosen', { n: fmtNum(list.length) });
+      };
+      const toggle = id => {
+        const i = list.indexOf(id);
+        if (i >= 0) list.splice(i, 1);
+        else if (list.length >= limit) {
+          toast(t('bunker.track.max', { n: limit }), { kind: 'warn', timeout: 2600 });
+          return;
+        } else list.push(id);
+        set(k, list.slice());
+        sync();
+      };
+      for (const tr of ctx.tracks) {
+        const tick = el('input', { type: 'checkbox', class: 'tick' });
+        const nm = (LANG === 'cn' ? tr.name_cn : tr.name) || tr.name || '';
+        const row = el('label', { class: 'prow', dataset: { q: (nm + ' ' + tr.id).toLowerCase() } },
+          tick, el('span', { class: 'grow', text: nm || ('#' + tr.id) }),
+          el('span', { class: 'hint mono', text: '#' + tr.id }));
+        tick.onchange = () => toggle(Number(tr.id));
+        rows.push({ id: Number(tr.id), box: tick, row });
+        box.append(row);
+      }
+      search.addEventListener('input', () => {
+        const q = search.value.trim().toLowerCase();
+        rows.forEach(r => { r.row.hidden = !!q && r.row.dataset.q.indexOf(q) < 0; });
+      });
+      sync();
+      return [el('div', { class: 'pick' },
+        el('div', { class: 'pickhead' }, search, count), box)];
+    }
+    return [];   // rewards / products 由卡片自己画
+  }
+
+  // ── ① 现状：全只读。数字都由服务端实时算，界面不自己推。
+  const nowCard = card => {
+    const kv = el('div', { class: 'kv' },
+      kvItem(t('bunker.now.season'), '#' + st.season),
+      kvItem(t('bunker.now.display'), '#' + st.display_id),
+      kvItem(t('bunker.now.duration'), t('app.days', { n: fmtNum(st.duration_days) })),
+      kvItem(t('bunker.now.window'), fmtTime(st.start) + ' → ' + fmtTime(st.end)),
+      kvItem(t('bunker.now.left'), spanText(st.end - st.now)),
+      kvItem(t('bunker.now.players'), fmtNum((st.players || []).length)),
+      kvItem(t('bunker.now.matches'), fmtNum(st.matches_total)),
+      kvItem(t('bunker.now.queue'), fmtNum((st.queue || []).length)),
+      kvItem(t('bunker.now.active'), fmtNum((st.active || []).length)),
+      kvItem(t('bunker.now.tickets'), fmtNum(st.tickets_pool)),
+      kvItem(t('bunker.now.chips'), fmtNum(st.chips_pool)));
+    const pcols = [
+      { label: t('weekly.col.profile'), render: r => idCell(r.profile) },
+      { label: t('grant.pvpRank'), cls: 'r num', k: 'rank' },
+      { label: t('grant.pvpStar'), cls: 'r num', k: 'star' },
+      { label: t('grant.pvpSeason'), cls: 'r num', k: 'season' },
+      { label: t('weekly.col.week'), render: r => el('span',
+          { class: 'badge' + (r.this_season ? ' ok' : ''),
+            text: r.this_season ? t('weekly.col.thisWeek') : t('weekly.col.oldWeek') }) },
+      { label: t('grant.pvpGolden'), cls: 'r num', render: r => fmtNum(r.golden_ticket) },
+      { label: t('grant.pvpStreak'), cls: 'r num', k: 'win_streak' },
+      { label: t('grant.pvpChips'), cls: 'r num', render: r => fmtNum(r.chips) },
+    ];
+    const mcols = [
+      { label: t('bunker.col.match'), render: r => el('span', { class: 'mono', text: String(r.id) }) },
+      { label: t('bunker.col.players'), render: r => (r.players || []).join(', ') || '—' },
+      { label: t('bunker.col.track'), cls: 'r num', render: r => '#' + r.track },
+      { label: t('bunker.col.bot'), render: r => (r.bot ? t('app.yes') : t('app.no')) },
+      { label: t('bunker.col.age'), cls: 'r', render: r => spanText(r.age) },
+    ];
+    const qrows = st.queue || [];
+    const arows = st.active || [];
+    const acols = [
+      { label: t('weekly.col.profile'), render: r => idCell(r.profile) },
+      { label: t('bunker.col.waited'), cls: 'r', render: r => spanText(r.waited) },
+    ];
+    const bcols = [
+      { label: t('weekly.col.profile'), render: r => idCell(r.profile) },
+      { label: t('bunker.col.seen'), cls: 'r', render: r => spanText(r.seen_ago) },
+    ];
+    const audit = data.audit || [];
+    const acols2 = [
+      { label: t('weekly.col.time'), k: 'at', render: r => fmtTime(r.at) },
+      { label: t('weekly.col.param'), render: r => {
+          const k = (r.path || []).slice(-1)[0];
+          return (byKey[k] ? bText(byKey[k]) : String(k)) +
+                 (r.kind === 'undo' ? ' · ' + t('weekly.kindUndo') : '');
+        } },
+      { label: t('weekly.col.change'), render: r => {
+          const k = (r.path || []).slice(-1)[0];
+          return (r.existed === false ? '—' : bunkerVal(byKey[k], r.before)) + ' → ' +
+                 bunkerVal(byKey[k], r.after);
+        } },
+      { label: '', cls: 'act', render: r => el('button', { class: 'btn tiny', type: 'button',
+          text: t('weekly.undoBtn'), onclick: () => guarded(async () => {
+            await post('/__api/admin/undo', { id: r.id });
+            toast(t('weekly.undone'), { kind: 'good', timeout: 2600 });
+            show('bunker');
+          }) }) },
+    ];
+    return wCardRaw(bText(card), null,
+      el('div', { class: 'card-body' },
+        kv,
+        ...(st.warnings || []).map(w => el('p', { class: 'lead p-warn',
+          text: (LANG === 'cn' ? w.cn : w.en) || w.cn || '' })),
+        wSub('bunker.now.playersTitle',
+          (st.players || []).length ? table(pcols, st.players)
+            : el('div', { class: 'empty', text: t('bunker.now.noPlayers') })),
+        wSub('bunker.now.matchesTitle',
+          (st.matches || []).length ? table(mcols, st.matches)
+            : el('div', { class: 'empty', text: t('bunker.now.noMatches') })),
+        wSub('bunker.now.queueTitle',
+          qrows.length ? table(acols, qrows) : el('div', { class: 'empty', text: t('bunker.now.noQueue') }),
+          arows.length ? table(bcols, arows) : null),
+        wSub('weekly.now.auditTitle',
+          audit.length ? table(acols2, audit)
+            : el('div', { class: 'empty', text: t('weekly.now.noAudit') }))));
+  };
+
+  // ── ⑦ 赛季奖励：名次表 + 礼包表（两张表分开保存，改动记录按张计）。
+  const rewardsCard = card => {
+    const rf = byKey['season.rewards'] || { key: 'season.rewards' };
+    const pf = byKey['season.product_list'] || { key: 'season.product_list' };
+    return wCardRaw(bText(card), null,
+      el('p', { class: 'hint', text: bHint(rf) }),
+      rewardsEditor(draft['season.rewards'], ctx.rewards, list => set('season.rewards', list)),
+      cardFoot(saveBtn(['season.rewards'])),
+      wSub('bunker.products.title',
+        el('p', { class: 'hint', text: bHint(pf) }),
+        productsEditor(draft['season.product_list'], list => set('season.product_list', list))),
+      cardFoot(saveBtn(['season.product_list'])));
+  };
+
+  // ── ⑧ 模板：整页参数快照，跟午夜杯共用同一套端点（page=bunker）。
+  const templatesCard = card => {
+    const curKv = el('div', { class: 'kv' },
+      fields.map(f => kvItem(bText(f), bunkerVal(f, values[f.key]))));
+    const tplName = el('input', { type: 'text', maxlength: '40', value: '',
+                                  placeholder: t('weekly.templates.nameHint') });
+    async function tplPost(body, okKey) {
+      return guarded(async () => {
+        await post('/__api/admin/templates', body);
+        toast(t(okKey), { kind: 'good', timeout: 2600 });
+        show('bunker');
+      });
+    }
+    const rows = (data.templates || []).map(tp => el('div', { class: 'tplrow' },
+      el('div', { class: 'grow' },
+        el('div', { class: 'tname', text: tp.name }),
+        el('div', { class: 'hint', text: fmtTime(tp.saved_at) })),
+      el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.applyAll'),
+        onclick: () => guarded(async () => {
+          const r = await post('/__api/admin/templates',
+            { page: 'bunker', action: 'apply', name: tp.name, parts: 'all' });
+          const applied = r.applied || [];
+          const sum = applied.map(a => bText(byKey[a.key] || { key: a.key }) + ' → ' +
+                                          bunkerVal(byKey[a.key], a.after)).join('　');
+          const ids = applied.map(a => a.audit).filter(Boolean);
+          const opts = { kind: 'good' };
+          if (ids.length) opts.action = { label: t('weekly.undo'), run: () => guarded(async () => {
+            for (const id of ids) await post('/__api/admin/undo', { id });
+            show('bunker');
+          }) };
+          toast(t('weekly.templates.applied', { name: tp.name }) + (sum ? ' · ' + sum : ''), opts);
+          show('bunker');
+        }) }),
+      el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.applyRewards'),
+        onclick: () => guarded(async () => {
+          const r = await post('/__api/admin/templates',
+            { page: 'bunker', action: 'apply', name: tp.name, parts: 'rewards' });
+          const v = (r.config || r.values || {});
+          toast(t('weekly.templates.applied', { name: tp.name }) + ' · ' +
+                bunkerVal(byKey['season.rewards'], v['season.rewards']),
+                { kind: 'good', timeout: 4000 });
+          show('bunker');
+        }) }),
+      el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.rename'),
+        onclick: () => guarded(async () => {
+          const to = await confirmDialog({ title: t('weekly.templates.rename'),
+            okLabel: t('weekly.templates.rename'),
+            input: { label: t('weekly.templates.name'), value: tp.name } });
+          if (!to || String(to).trim() === tp.name) return;
+          await tplPost({ page: 'bunker', action: 'rename', name: tp.name, new_name: String(to).trim() },
+                        'weekly.templates.renamed');
+        }) }),
+      el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.copy'),
+        onclick: () => guarded(async () => {
+          const to = await confirmDialog({ title: t('weekly.templates.copy'),
+            okLabel: t('weekly.templates.copy'),
+            input: { label: t('weekly.templates.name'),
+                     value: tp.name + t('weekly.templates.copySuffix') } });
+          if (!to || !String(to).trim()) return;
+          await tplPost({ page: 'bunker', action: 'copy', name: tp.name, new_name: String(to).trim() },
+                        'weekly.templates.copied');
+        }) }),
+      el('button', { class: 'btn tiny danger', type: 'button', text: t('weekly.templates.delete'),
+        onclick: () => guarded(async () => {
+          const yes = await confirmDialog({ title: t('weekly.templates.delete'),
+            okLabel: t('weekly.templates.delete'),
+            body: t('weekly.templates.deleteBody', { name: tp.name }) });
+          if (!yes) return;
+          await tplPost({ page: 'bunker', action: 'delete', name: tp.name }, 'weekly.templates.deleted');
+        }) })));
+    return wCardRaw(bText(card), null,
+      wSub('weekly.templates.currentTitle',
+        curKv,
+        el('p', { class: 'hint', text: t('weekly.templates.currentHint') })),
+      wSub('weekly.templates.saveTitle',
+        fRow('weekly.templates.name', [tplName,
+          el('button', { class: 'btn primary', type: 'button', text: t('weekly.templates.save'),
+            onclick: () => guarded(async () => {
+              const name = String(tplName.value || '').trim();
+              if (!name) { toast(t('weekly.templates.needName'), { kind: 'warn', timeout: 2600 }); return; }
+              await tplPost({ page: 'bunker', action: 'save', name }, 'weekly.templates.saved');
+            }) })], t('weekly.templates.saveHint'))),
+      wSub('weekly.templates.listTitle',
+        rows.length ? el('div', null, ...rows)
+                    : el('div', { class: 'empty', text: t('weekly.templates.none') })));
+  };
+
+  // 推进到下一赛季：advance +1 = 本届窗口整体往前挪一轮（不是多届历史，见服务端注释）。
+  const advanceBtn = el('button', { class: 'btn danger', type: 'button', text: t('bunker.advance'),
+    onclick: () => guarded(async () => {
+      const yes = await confirmDialog({ title: t('bunker.advance'), body: t('bunker.advanceBody'),
+                                        okLabel: t('bunker.advance') });
+      if (!yes) return;
+      const next = (Number(values['season.advance']) || 0) + 1;
+      const r = await post('/__api/admin/bunker', { fields: { 'season.advance': next } });
+      const id = ((r.applied || [])[0] || {}).audit;
+      const opts = { kind: 'good' };
+      if (id) opts.action = { label: t('weekly.undo'), run: () => guarded(async () => {
+        await post('/__api/admin/undo', { id });
+        show('bunker');
+      }) };
+      toast(t('bunker.advanceDone', { n: fmtNum((r.values || {})['season.advance'] || next) }), opts);
+      show('bunker');
+    }) });
+
+  // ── 其余卡片：按服务端字段表生成（加参数只改服务端）。
+  for (const card of (data.cards || [])) {
+    if (card.id === 'now') { nodes.push(nowCard(card)); continue; }
+    if (card.id === 'rewards') { nodes.push(rewardsCard(card)); continue; }
+    if (card.id === 'templates') { nodes.push(templatesCard(card)); continue; }
+    const fs = fields.filter(f => f.card === card.id);
+    if (!fs.length) continue;
+    const body = fs.map(f => fRowRaw(bText(f), bControl(f), bHint(f),
+                                     f.kind === 'ids' || f.kind === 'stars'));
+    if (card.id === 'season') body.push(fRowRaw(t('bunker.advance'), [advanceBtn], t('bunker.advanceHint')));
+    body.push(cardFoot(saveBtn(fs.map(f => f.key))));
+    nodes.push(wCardRaw(bText(card), null, ...body));
+  }
 
   return nodes;
 }

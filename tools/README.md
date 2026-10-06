@@ -415,6 +415,15 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
   用 `IC` 装赛道 id、涂装（`IID 133/134/136`）用 `IC` 装涂装序号、零件礼包（`IID 70`）用 `IC`
   装零件号 —— 一律按公式硬算会造出 851、350 这类**不存在**的编号（试过，目录立刻多出 25 条垃圾），
   所以 `walk_itemids()` 的紧凑分支只收 `blueprint_bike(IID * 5 + IL)` 为真的节点。
+* **赛道名 ← `/conf/levels.txt`**（`Levels` + `Villages`）：`Levels[]` 每条取 `ID`（赛道号，
+  就是午夜杯 `weekly.track_id`、匹配池 `candidate_tracks` / `track_ids` 用的那个）与 `N`（LOCF 键），
+  名字走 LOCF 两份语言包 ⇒ `levels = {"<LevelID>": {key, en, cn}}`，382 条。
+  有少数条目没有本地化文本，所以前端必须能退化成显示编号。**它单独成段、不进 `items`**，
+  免得 `by_cat["track"] == 157` 这类断言被赛道表搅乱。
+* **奖励下拉 ← `/conf/pvp_match_rewards.txt`**：`PVPMatchRewardTypes` 是 `RewardID → 名字 → ItemId`
+  的映射（1..4 是金币、5 是钻石、100 = 占位问号、20000..20049 是零件）。
+  后台「赛季奖励」的特殊奖励下拉用它（`item_id 145` 的 `amount` 装的是这里面那个 **RewardID**）；
+  金币/钻石（`item_id 1/2`）从下拉里排除。输出 `rewards = {"<RewardID>": {...}}`，304 条。
 * `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
   所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试（最多 16 次，
   `0010_1854657d.bin` 需要 12 次）。**还有 3 个文件解析不了**，如实记进 `source.skipped_files`：
@@ -425,11 +434,13 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 
 **金票（135）被显式跳过**：它不在存档 `items2` 里，走 `server/data/pvp_state.json`。
 
-生成的 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图）同时被五处消费：
-后台的折叠清单、`tflocal_accounts.grantable_items()`、`tflocal_accounts.grantable_paints()`
-（可下发集合）、`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints` / `::Blueprints`
-（形状与公式自检）。
-**改了物品表 / 套装表 / 车表就重跑它。**
+生成的 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 +
+304 条奖励名）同时被这些地方消费：
+后台的折叠清单与物品选择器、`tflocal_accounts.grantable_items()`、`tflocal_accounts.grantable_paints()`
+（可下发集合）、`tf_server.track_catalog()`（午夜杯/碉堡的赛道下拉）、`tf_server._bunker_catalogs()`
+（碉堡的奖励与车辆下拉）、`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints` /
+`::Blueprints` / `::WeeklyOps` / `::Bunker`（形状与公式自检）。
+**改了物品表 / 套装表 / 车表 / 赛道表就重跑它。**
 
 ---
 
