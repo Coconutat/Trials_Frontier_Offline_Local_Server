@@ -248,6 +248,24 @@ python -m unittest discover -s tests -v
 * 机器人成绩 = 玩家成绩 × `bot_time_margin_pct` + `bot_time_margin_ms`（默认 1.018 / 400ms）。
 * 赛季星星曲线 `season.star_array` 是 25 级天梯，`chip_equation_x/y` 决定筹码结算。
 
+**发车（bike）**：原版对局的**车是随机的、但和图的级别挂钩**。客户端权威规则在
+`LevelManager::isCorrectBikeTier @0x47c170`：图的 `B` 字段（`/conf/levels.txt`，`0xff` = 不限）
+是要求的车辆级别，车的级别（`/conf/bikes.txt` 的 `Tier`）必须**相等**，且玩家的升级状态要
+`BikeUpgrade::getBikeStatus` 认账。服务端的发车规则（2026-10-06 落地）：
+
+* `matchmaking.bike_random`（默认开）= 按**每条赛道的级别**从玩家**已拥有**的车里随机抽一辆。
+  「已拥有」来自客户端 `pvp_init` 上报的 `bikes` 位图（`h_pvp_init` → `_pvp_set_bikes()`，
+  `UpgradeManager::getBikeIDbyIndex` 证明 **bit i = 车号 i+1**；位图里位为 1 还要求
+  `getBikeStatus == 0`）。机器人的车不参与筛选。
+* `matchmaking.bike_story_only`（默认开）把随机池限制在剧情车 1..9：10/11/12/19 是 255 级
+  特殊车（Stallion / BMW / Moonrover / Donkey），塞进剧情图很出戏。
+* 关掉随机 = 所有赛道都发 `matchmaking.bike_id`（默认 1）。★ 这台车必须能跑**每张**候选图，
+  级别不符时客户端 `IngameStateSelectBike` 只能退它的默认车。
+* 一个真人玩家都没有该级别的车时，那条赛道直接从本轮候选里剔掉（日志 `[pvp] 发车池筛掉 …`）。
+  发车池见车表：T0 = 1/2/3/13/15/18、T1 = 4/5/6/14、T2 = 7/8/9/16/17、255 = 10/11/12/19。
+* 抽签结果在对局记录里**固化**（`pvp_matches[mid]["bikes"][pid][track]`，种子 `"<mid>|<pid>"`）
+  ⇒ 同一局重连 / 重算不会换车，换一局才重抽。
+
 **外观（`outfit`）**：碉堡界面两侧的骑手立绘取自 `parseMatch` @0x4fd9d0 的 `player1`/`player2` 槽，
 槽里 `outfit` 是 24 位（3 个 8 位部件：头盔 / 上身 / 下身），**直接来自该玩家存档的
 `content.profile.outfit`**（`_pvp_outfit_of()`）。曾经这里硬编码 0，于是把对手也画成 0 号部件
@@ -287,7 +305,17 @@ python -m unittest discover -s tests -v
   `data/wts_rewards.json`（由 `tools/wts_reward_doc.py` 生成）。
   ★ 客户端挑「池内哪一件」用的是它**不播种的 `rand()`** —— 池子不变就永远是同一件。
 * `config/<week>` 响应里 **`challenge_settings.bike_id` 必须是一个合法车辆 id** ——
-  曾经给 0 导致「进入午夜杯场地」直接崩溃。
+  曾经给 0 导致「进入午夜杯场地」直接崩溃。现在它由 `weekly.bike_id` 决定：
+  `0`（默认）= **按本周赛道的级别自动随机**，用 `random.Random("weekly-bike|<周号>")` 播种
+  ⇒ 整周固定同一辆（原版就是「一周一条赛道一辆车」，客户端 `doesPlayerHasWeeklyBike()` 只认一辆）；
+  填 `>0` = 整届固定这辆（`bad-bike:<id>` 会挡住不存在的车号，合法范围 1..19）。
+* **租借升级**（`weekly.loan_upgrade`，默认 5，0..10）：客户端
+  `WeeklyChallengeManager::setBikeUpgradeLevel @0x636710` 在 `force_upgrade == 0` 时对四个部件取
+  **`max(玩家自己的升级, 配置值)`**（`force_upgrade != 0` 才无条件覆盖）。
+  所以服务端发 5/5/5/5 + `force_upgrade = 0` 就正好是原版那句「你没有这辆车、或者自己的升级
+  不如本周的车，就借你一辆**带固定升级**的来跑，这辆车不进你的车库」：没车的玩家拿到 5 级租借车，
+  自己车更强的玩家照样用自己的升级。**不需要**单独的「租赁」标志位。
+  代价：客户端只在进入午夜杯时读一次，改完要让玩家退出再进。
 
 ### 5.6 内购 / 礼包 / 好友（targeting）
 
@@ -387,10 +415,14 @@ python -m unittest discover -s tests -v
   只有**真机上确认过存档写法**的类（货币 / 消耗品 / 零件 / 服装 / 蓝图）不带「未验证」警告；
   赛道没有证据，会挂警告。`outfit` 在存档里是 0/1 标志（只能解锁，mode 固定 `set`），
   **蓝图和其余类一样是计数器**（这一条最初写错了，见下面那条）。
-  另外两段不参与下发、只喂下拉：`levels`（382 条赛道 → `track_catalog()`，午夜杯的
-  `weekly.track_id` 与碉堡的候选/固定赛道都用它）、`rewards`（`/conf/pvp_match_rewards.txt`
+  另外几段不参与下发、只喂下拉：`levels`（382 条赛道 → `track_catalog()`，午夜杯的
+  `weekly.track_id` 与碉堡的候选/固定赛道都用它；每行还带 `bike` = 这张图要求的车辆级别，
+  即原表 `/conf/levels.txt` 的 `B` 字段）、`rewards`（`/conf/pvp_match_rewards.txt`
   的 RewardID → 名字 → ItemId；碉堡「赛季奖励」的下拉**用全部 309 条**，其中带 `official`
-  标记的 43 个是客户端固定表 `PVPMatchSpecialRewards` 里的，见 §7.1 那条）。
+  标记的 43 个是客户端固定表 `PVPMatchSpecialRewards` 里的，见 §7.1 那条）、`bikes`
+  （19 辆，来自 `/conf/bikes.txt`：`id` / 中英名 / `tier`（= 原表 `Tier`，255 = 不限）/
+  `story`（剧情车 1..9）→ `bike_catalog()`，午夜杯与碉堡的车号下拉、按级别发车都用它；
+  ★ 中文车名是**人工补的** —— LOCF 里没有单车名，英文名只来自 `Comment` 字段）。
 * **服装按「套」列**（`outfits` 段，来自 `/conf/customization.txt`）：勾一套 = 头盔 / 上衣 /
   裤装三件一起解锁（`id = ItemType * 5 + tier`），行上带官方名 + 内部代号 +
   「已拥有 n/3」+ **套装效果文案**（`BonusPower`，集齐即账号级生效，例如 The High Roller
@@ -419,6 +451,13 @@ python -m unittest discover -s tests -v
   ★ 奖励卡**只暴露池子编号 1..15**：每池装什么在客户端的 `/conf/wts_rewards.txt` 里
   （`getRewardItemForSlot`），所以界面不预览内容；客户端**只在进入午夜杯时读一次**奖励配置，
   卡片上写明「改完让玩家退出午夜杯再进」（不用重启游戏）。
+* ★ **午夜杯的「本届车辆 / 租借升级」**（2026-10-06 修「车和地图是随机的」这个 bug）：
+  赛道与对手卡多了两行 —— `weekly.bike_id`（`0` = 按本周赛道级别自动随机，填 `>0` 固定一辆）
+  与 `weekly.loan_upgrade`（0..10，四个部件同值）。现状卡多一行「本周车辆」= 实际发出去的车号
+  + 租借等级；赛道提示里带出**这张图的车辆级别**（`track_catalog()` 的 `bike` = 原表 `B`）。
+  自动随机按周号播种 ⇒ 整周同一辆；车号必须是 1..19（`bike_catalog()` 读 `items.json` 的
+  `bikes` 段；填不存在的车号回 `bad-bike:<id>` —— 客户端拿不到那台车，加载关卡会崩）。
+  租借语义见 §5.5 那条（`max(玩家自己的升级, 配置值)`）。
 * **碉堡（PVP）运营屏**（侧栏独立入口「碉堡」）：8 张卡（现状 / 赛季 / 对局时长 / 段位与星章 /
   匹配与 AI / 筹码与曲线 / 赛季奖励 / 模板），字段表整张在服务端（`_BUNKER_CARDS` + `_bf()` +
   `_BUNKER_FIELDS`：中英标签、说明、`kind`、范围），前端只按 `kind` 造控件 ⇒ **加一个运营参数
@@ -454,6 +493,10 @@ python -m unittest discover -s tests -v
     也各有一条警告。
   - **段位名不存在**（客户端 `MenuzComponentPVPRank` 里零次本地化调用、LOCF 里也没有
     `RANK_%d` 键）⇒ 只提供星章表与起始段位，卡里只读说明。
+  - **发车**：`matchmaking.bike_random`（默认开）= 每场按赛道级别从玩家**已拥有**的车里随机；
+    `matchmaking.bike_story_only`（默认开）= 随机池只放剧情车 1..9；`matchmaking.bike_id`
+    只在关掉随机时用（★ 必须能跑每张候选图）。车号框带 `items.json` 的车表下拉（19 辆，
+    显示 `#号 名字 · T级别`），填不存在的车号回 `bad-bike:<id>`。
   - **绝不直接编辑 `data/pvp_state.json`**：金票 / 筹码 / 段位 / 星 / 连胜只走 `/__api/admin/*`
     （内部走 `_pvp_request` 事务），手改文件会被服务端下次写盘覆盖。
 
@@ -474,8 +517,8 @@ python -m unittest discover -s tests -v
 | `POST /__api/admin/grant` | 存档下发（可下发项 = `admin/items.json` 的 478 条，服装按套勾，蓝图按车勾、可填片数；`paints` 字段 = 涂装 id 数组，写 `items2[664+BikeID]` 的位掩码；每次先埋快照） |
 | `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
 | `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
-| `GET\|POST /__api/admin/weekly` | 午夜杯运营参数（GET = 配置 + 现状（含 `ghosts`/`board_rows`/`warnings` 赛道预检）+ 赛道目录 + 模板 + 最近改动；POST `{fields:{…}}` **逐键校验、全部合法才落盘**，每个键回 `{key,before,after,audit}`） |
-| `GET\|POST /__api/admin/bunker` | 碉堡运营参数（GET = 8 张卡的字段表 + 当前值 + 现状（赛季/玩家/对局/队列/在线/警告）+ 赛道与 `rewards`（全 309 条，带 `official` 标记）目录 + 模板 + 最近改动；POST 同 weekly 的 `{fields:{…}}` 契约，空值 = 删键回默认） |
+| `GET\|POST /__api/admin/weekly` | 午夜杯运营参数（GET = 配置 + 现状（含 `ghosts`/`board_rows`/`warnings` 赛道预检、`effective_bike`/`track_bike`、`bikes` 车表）+ 赛道目录 + 模板 + 最近改动；POST `{fields:{…}}` **逐键校验、全部合法才落盘**，每个键回 `{key,before,after,audit}`） |
+| `GET\|POST /__api/admin/bunker` | 碉堡运营参数（GET = 8 张卡的字段表 + 当前值 + 现状（赛季/玩家/对局/队列/在线/警告）+ 赛道与 `rewards`（全 309 条，带 `official` 标记）、`bikes`（19 辆，带级别/剧情标记）目录 + 模板 + 最近改动；POST 同 weekly 的 `{fields:{…}}` 契约，空值 = 删键回默认） |
 | `POST /__api/admin/undo` | 撤销一条参数改动（`{id}` 来自 weekly / bunker 的 `audit`；按记录里的 `existed` 决定写回还是删键） |
 | `GET\|POST /__api/admin/templates` | 参数模板（GET `?page=weekly\|bunker`；POST `{page,action:save\|apply\|copy\|rename\|delete,name,new_name,parts}`，`parts` 可 `all` / `rewards`） |
 

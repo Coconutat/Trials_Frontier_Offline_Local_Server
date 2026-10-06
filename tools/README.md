@@ -452,6 +452,14 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
   **已经拥有**该物品时改画它自带的兜底奖励（`Fallback`，237 行里有 215 行是 `221` Doughnut）。
   所以现在后台下拉给**全部 309 条**（按类别分组、43 个官方编号标 ★），服务端只拒
   「物品表里查不到」的编号。详见 `work/trials-frontier/notes/pvp-reward-contract.md` §5d。
+* **车表 ← `/conf/bikes.txt` 的 `BikeData`**：19 辆，`{id, name（`Comment` 字段）, name_cn, tier, story}`。
+  `tier` 就是原表的 `Tier`（0/1/2 = 剧情车三档、**255 = 不限**，对应 `LevelManager::isCorrectBikeTier`
+  @`0x47c170` 的 `0xff` 分支）；`story = id in 1..9` 标出剧情车。
+  ★ **中文车名是人工补的**：LOCF 两份语言包里没有任何单车名（19 个英文名精确匹配全 miss），
+  英文名只能取 `Comment`，中文名在脚本里写死一张小表。
+  同时 `levels` 每条多一个 `"bike"` 字段 = 这张图要求的车辆级别（原表 `Levels[].B`，255 = 不限）
+  —— 午夜杯与碉堡的「按赛道级别发车」都读它。车表被 `tf_server.bike_catalog()` 消费
+  （两屏的车号下拉、按级别发车、发车池日志）。
 * `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
   所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试（最多 16 次，
   `0010_1854657d.bin` 需要 12 次）。**还有 3 个文件解析不了**，如实记进 `source.skipped_files`：
@@ -463,10 +471,11 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 **金票（135）被显式跳过**：它不在存档 `items2` 里，走 `server/data/pvp_state.json`。
 
 生成的 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 +
-309 条奖励名）同时被这些地方消费：
+309 条奖励名 + 19 辆车）同时被这些地方消费：
 后台的折叠清单与物品选择器、`tflocal_accounts.grantable_items()`、`tflocal_accounts.grantable_paints()`
-（可下发集合）、`tf_server.track_catalog()`（午夜杯/碉堡的赛道下拉）、`tf_server._bunker_catalogs()`
-（碉堡的奖励与车辆下拉）、`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints` /
+（可下发集合）、`tf_server.track_catalog()`（午夜杯/碉堡的赛道下拉）、`tf_server.bike_catalog()`
+（车号下拉 + 按赛道级别发车）、`tf_server._bunker_catalogs()`（碉堡的奖励下拉）、
+`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints` /
 `::Blueprints` / `::WeeklyOps` / `::Bunker`（形状与公式自检）。
 **改了物品表 / 套装表 / 车表 / 赛道表就重跑它。**
 

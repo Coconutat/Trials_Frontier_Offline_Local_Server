@@ -673,6 +673,37 @@ catalog in this build**, so those IDs are inferred from the formula only and are
 | `18` | HD EV | 摩托 / bike (BikeData key) | `content.dat entry #2 (/conf/bikes.txt) @0x009774` BikeData[18] — BikeType 1, Tier 0, GarageOrder 5 |
 | `19` | Donkey | 摩托 / bike (BikeData key) | `content.dat entry #2 (/conf/bikes.txt) @0x009774` BikeData[19] — BikeType 1, Tier 255, GarageOrder 15 |
 
+> ★ **车的级别也要用**（2026-10-06，车与地图 bug）：`BikeData[].Tier` 就是车的级别，
+> **255 = 不限**；每张图的要求在 `/conf/levels.txt` 的 `Levels[].B`（同样 **255 = 不限**）。
+> 客户端 `tr::LevelManager::isCorrectBikeTier(LevelManager*, ushort levelId, int bikeId) @0x47c170`：
+> `w21 = BikeUpgrade::getBike(bikeId)[0x3b]`（车 Tier），**`w21 == 0xff` 直接返回 1**；
+> 否则 `w8 = LevelContainer::getLevelByLevelId(levelId)[0x286]`（图的 B），
+> 返回 `(w8 == 0xff) || (w8 == w21)` ⇒ **级别必须相等**（所以「1 级车跑一级图」）。
+> 调用者：`PlayerEventManager::executeEventFinishedLevel @0x597b2c`、
+> `IngameStatePostRace::activate @0x6fca84` / `sendToOnlineLeaderboard @0x70305c`、
+> `IngameStateSelectBike::getDefaultBike @0x711cb4`（后者的 `0x711dac` / `0x711dec` 调用点
+> 就是客户端自己「替这张图挑一辆车」的逻辑）。
+>
+> **级别池**（按上表 Tier 归类）：T0 = `1,2,3,13,15,18`、T1 = `4,5,6,14`、T2 = `7,8,9,16,17`、
+> `255` = `10,11,12,19`（Stallion / BMW / Moonrover / Donkey，能跑任何图）。
+> 382 张图的 `B` 分布：`0 → 135`、`1 → 142`、`2 → 101`、`255 → 4`（`1211,1212,1233,1258`）。
+>
+> **玩家车库位图**：`tr::OnlinePVP::getBikeAndTrackLists(char*, unsigned) @0x4f96c0` 末尾
+> 逐 `index = 0..27` 调 `UpgradeManager::getBikeIDbyIndex(index)`，取 `id & 0xffff`，
+> 再要 `BikeUpgrade::getBikeStatus(id) == 0`，才 `mask |= 1 << index`，最后
+> `sprintf(..., ",\"bikes\":%d", mask)`。而 `UpgradeManager::getBikeIDbyIndex @0x62c4d8`
+> **只有 `add w0, w1, #1; ret` 两条指令**（静态符号 size = 8）⇒ **bit i = 车号 i+1**。
+> 真机（`<DEVICE_SERIAL>`）抓到的 `bikes = 521227 = 0x7F40B` ⇒ 车号 {1,2,4,11,13,14,15,16,17,18,19}，
+> 与用户存档吻合（`BikeUpgrade::getBikeStatus @0x61c310`：车不在库里 → `-2`，升级状态不匹配 → `-1`）。
+>
+> **单车名在 LOCF 里不存在**：`/gen/lang/{english,simp_chinese}_strings.bin` 两份各 7705 条里
+> 精确匹配 19 个车名**全部 miss**（只有 "Stallion Bike Blueprint Piece"、"Donkey Doughnuts"
+> 这类旁支）。所以英文名只能取 `BikeData[].Comment`，**中文名是人工补的**。
+> 设计文案倒是有：LOCF `0xd174a4d1`（「没有本周选中的车就借你一辆，这辆车不进车库，
+> **带固定升级**」）、`0xd8010a3a`（「自己车的升级**不如**本周的车时，你开租借车进场」）、
+> `0xb7430f2d`（「午夜杯一周给一条赛道一辆车」）、`0xcae83f68`（「有时允许开自己的车，
+> 有时强制所有人用同一辆」）。
+
 Blueprint counts per bike come from `content.dat entry #45 (/conf/upgrades.txt) @0x027bf4` → `Upgrades[].BP`:
 
 | bike (Upgrades ID / N) | BP | where it came from |

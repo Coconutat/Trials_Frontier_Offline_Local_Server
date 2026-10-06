@@ -107,7 +107,22 @@ _TF_CONFIG_DEFAULTS = {
         #   `ldr w9,[match+0x24]; str w9,[GameWorld+0x1efc]`，而 match+0x24 就是
         #   第 0 条轨道 +0x20（= setOwner 写的那个字段）。填 0 → getBike(0)=NULL →
         #   EffectManager::checkNeedForSpecialEffects 解引用 [x0+0x100] 崩。
+        # ⚠ `bike_random = True`（默认）时这个值只在「随机不出任何车」时兜底 ——
+        #   每场比赛的车由 `_pvp_pick_bikes()` 按**每条赛道自己的车级别**（`levels[].bike`）
+        #   现挑。`bike_random = False` 时它就是全部赛道的车（老行为）。
         "bike_id": 1,
+        # 发车方式：True（默认，原版行为）= 每条赛道按自己的车级别从玩家**已拥有**的
+        #   剧情车里随机发一台；False = 全部赛道都发上面那个 bike_id。
+        # ★ 原版规则（用户 m07949）：车和地图是随机的，**车级别跟地图级别挂钩**
+        #   （1 级车跑 1 级图…）。客户端把关的是 `LevelManager::isCorrectBikeTier
+        #   @0x47c170`：车 Tier == 图的 `B`，或车 Tier 是 255（特殊车），或图的 `B`
+        #   是 255 才放行 —— 发错级别的车 = 玩家进不去 / 跑起来是别人的车。
+        "bike_random": True,
+        # 随机发车的池子：只发**剧情默认车**（1..9，Armadillo…Phantom）。
+        #   用户 m08106：「随机最好只有游戏默认的可以在剧情里获得车…这是一个兜底的安全范围」。
+        #   `story_only = False` 时会把商店/DLC 车也放进池子（T255 的特殊车算单独一档，
+        #   见 `_pvp_pick_bikes()`）。
+        "bike_story_only": True,
         # 局内票（免费票）：满 N 张，每 interval 秒回 1 张，用完才动黄金票。
         "free_tickets_max": 3,
         "free_tickets_initial": 3,
@@ -279,6 +294,19 @@ _TF_CONFIG_DEFAULTS = {
         # 一届（=一周）的长度，天。7 = 原版；★ 非 7 天**没有真机验证过**（客户端把窗口
         # 时间戳写进存档物品 1165/1166），后台界面要如实标注「实验性」。
         "window_days": 7,
+        # ── 本届的车（用户 m07949 / m08106）──
+        # 原版规则：午夜杯**整周一台车**（游戏自带文案："you are given one track and
+        #   one bike to play"），车级别跟着赛道级别走。0 = 按赛道的车级别自动随机
+        #   （用届号当种子 ⇒ 整周不变）；>=1 = 整届固定发这台（客户端
+        #   `LevelManager::isCorrectBikeTier @0x47c170` 会卡级别，填错玩家进不去）。
+        "bike_id": 0,
+        # 租借升级：玩家没这台车、或自己那台升级更低时，客户端按这个级数给一台
+        #   「租借车」（游戏文案：loan bike，「will not go to your garage」）。
+        #   ★ 单位 = 升级级数（0..10），四个部件同值；`force_upgrade` 固定发 0
+        #   ⇒ 客户端取 `max(玩家当前, 这个值)`：玩家升级更高就用玩家自己的，
+        #   更低就用租借值 —— 「给你保底跑」（用户 m07949）。
+        #   用户 m08106：四个部件各 5 级。
+        "loan_upgrade": 5,
     },
     "appcfg": {
         # `h_app_configuration` 发给 Java/DLC 的基址：请求 Host 是回环时代替成它。
@@ -1739,6 +1767,54 @@ def _weekly_track_id():
     return cfg_int("weekly", "track_id", default=1041) or 1041
 
 
+def _weekly_loan_upgrade():
+    """午夜杯的「租借升级」：玩家没这台车（或自己那台更低）时客户端按它给保底车。
+
+    `weekly.loan_upgrade` = 升级级数（0..10），四个部件同值；`force_upgrade` 固定发 0
+    ⇒ 客户端 `WeeklyChallengeManager::setBikeUpgradeLevel @0x636710` 取
+    `max(玩家当前, 这个值)`（force≠0 才是无条件覆盖）。用户 m07949：
+    「午夜杯则是车升级不够或者没这个车给一个这个赛季临时租给你的车…给你保底跑」；
+    m08106 定成四个部件各 5 级。
+    """
+    try:
+        lvl = int(cfg_int("weekly", "loan_upgrade", default=5) or 0)
+    except (TypeError, ValueError):
+        lvl = 5
+    lvl = max(0, min(10, lvl))
+    return {"handle": lvl, "engine": lvl, "wheel": lvl, "frame": lvl}
+
+
+def _weekly_bike_id():
+    """本届午夜杯发哪台车（`weekly.bike_id`：0 = 按本周赛道的车级别自动随机）。
+
+    ★ 原版是**整周一台车**（游戏自带文案："you are given one track and one bike to
+      play"），所以自动模式用**届号**当随机种子：同一周里谁来问、问几次都是同一台，
+      翻周才换。池子 = 剧情默认车（1..9）；图的级别由 `levels[].bike` 给
+      （客户端 `LevelManager::isCorrectBikeTier @0x47c170` 卡的就是这个）。
+      挑不出来（车表读不到 / 图是 255 = 不限级别）就退回第一台剧情车，最后退 1
+      —— 车号 0 会让客户端 `getBike(0)` 返回 NULL 后解引用崩（见下面的老注释）。
+    """
+    try:
+        want = int(cfg_int("weekly", "bike_id", default=0) or 0)
+    except (TypeError, ValueError):
+        want = 0
+    cats = bike_catalog()
+    if want > 0:
+        if not cats or want in cats:
+            return want
+        print("[weekly] bike_id=%d 不在车表里，改成按级别自动挑" % want, flush=True)
+    if not cats:
+        return 1
+    tier = _track_bike_tier(_weekly_track_id())
+    pool = _pvp_bike_pool(tier, None, True)
+    if not pool:
+        pool = [b for b in sorted(cats) if cats[b].get("story")]
+    if not pool:
+        return 1
+    _, week = _week_index()
+    return random.Random("weekly-bike|%s" % week).choice(pool)
+
+
 def _weekly_leaderboard_id():
     """发给客户端的 `week_settings.week_leaderboard` —— 午夜杯排行榜的**数字 id**。
 
@@ -1954,11 +2030,12 @@ def h_liveevents_config(path, query, body, headers):
             # 于是 SIGSEGV / SEGV_MAPERR，fault addr 0xb0，崩在 GLThread。
             # （`getBikeIndexByID` @0x62a12c 就是 `sub w0,w1,#1`，佐证车号从 1 开始。
             #  `/conf/bikes.txt` 恰好 19 台，1..19 连续，无 0。）
-            "bike_id": 1,
+            "bike_id": _weekly_bike_id(),
             "bike_skin": 0,
-            "bike_upgrade": {"handle": 0, "engine": 0, "wheel": 0, "frame": 0},
-            # 0 = 不做强制改装；注意这不影响 bike_id：上面那台车永远会被
-            # setBike 拿去查表，所以 bike_id 必须合法，跟 force_upgrade 无关。
+            "bike_upgrade": _weekly_loan_upgrade(),
+            # 0 = 不做强制改装（= 保底模式：玩家升级比租借车高就用玩家自己的）。
+            # ★ 这不影响 bike_id：上面那台车永远会被 setBike 拿去查表，所以 bike_id
+            #   必须合法，跟 force_upgrade 无关。
             "force_upgrade": 0,
             # task 保持空：`parseChallengeConfiguration` @0x5058c8 只把数组元素
             # 读成 {mt::String skill; int count;} 存进 cfg+0x38/0x40，解析期不查
@@ -2259,12 +2336,17 @@ _WEEKLY_KEYS = {
     "week_offset": (-520, 520),
     "reward_slots": (1, 8),
     "window_days": (1, 30),
+    # 本届的车：0 = 按赛道级别自动随机（见 `_weekly_bike_id()`），>=1 = 整届固定这台。
+    "bike_id": (0, 64),
+    # 租借升级级数（0..10，四个部件同值；0 = 不发租借车，纯玩家自己的升级）。
+    "loan_upgrade": (0, 10),
 }
 # 键不在配置文件里时界面上显示什么（必须与 _TF_CONFIG_DEFAULTS["weekly"] 一致）。
 _WEEKLY_FALLBACK = {
     "track_id": 1041, "leaderboard_id": 0, "fake_field": 0, "fake_field_base_ms": 0,
     "fake_field_fast_pct": 3, "fake_field_slow_pct": 25, "left_retry_times": 3,
     "cooldown_seconds": 3600, "week_offset": 0, "reward_slots": 1, "window_days": 7,
+    "bike_id": 0, "loan_upgrade": 5,
 }
 # 「只套用奖励方案」套的就是这两个键。
 _WEEKLY_REWARD_KEYS = ("reward_slots", "reward_ids")
@@ -2389,6 +2471,11 @@ def admin_weekly_apply(fields):
             return None, "bad-value:%s" % key
         if not lo <= val <= hi:
             return None, "range:%s:%d-%d" % (key, lo, hi)
+        # 0 = 自动（按赛道级别随机），>0 必须是真车号：不存在的车号客户端拿不到车 → 崩。
+        if key == "bike_id" and val > 0:
+            catalog = bike_catalog()
+            if catalog and val not in catalog:
+                return None, "bad-bike:%d" % val
         ops.append((["weekly", key], val, key))
     applied = []
     for path, val, key in ops:
@@ -2429,7 +2516,10 @@ def track_catalog():
                 continue
             rows.append({"id": lid,
                          "name": node.get("en") or node.get("cn") or "",
-                         "name_cn": node.get("cn") or node.get("en") or ""})
+                         "name_cn": node.get("cn") or node.get("en") or "",
+                         # 这张图要求的车级别（`levels[].bike` = 表里的 `B`）；
+                         # 255 = 不限，None = 表里没这个字段（退化成不限）。
+                         "bike": node.get("bike")})
         rows.sort(key=lambda r: r["id"])
     except (OSError, ValueError, AttributeError):
         return []
@@ -2438,6 +2528,66 @@ def track_catalog():
     _TRACK_CACHE["mtime"] = stamp
     _TRACK_CACHE["rows"] = rows
     return rows
+
+
+_BIKE_CACHE = {"mtime": None, "rows": {}}
+
+
+def bike_catalog():
+    """车号 -> 车表一行（`server/admin/items.json` 的 `bikes` 段，源自 `/conf/bikes.txt`）。
+
+    字段：`name`/`name_cn` 车名、`tier` 车级别（0/1/2，255 = 特殊车）、`story` 是否
+    剧情默认车（1..9）。**按地图级别发车就靠这张表**（规则见客户端
+    `LevelManager::isCorrectBikeTier @0x47c170`）。表读不到就返回空 dict —— 调用方
+    必须退化成固定 `bike_id`，绝不猜车号（真机 bike_id=0 会崩，见 h_liveevents_config）。
+    """
+    try:
+        stamp = os.path.getmtime(_TRACK_CATALOG_PATH)
+    except OSError:
+        return {}
+    if _BIKE_CACHE["mtime"] == stamp:
+        return _BIKE_CACHE["rows"]
+    rows = {}
+    try:
+        with open(_TRACK_CATALOG_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        for raw_id, node in (data.get("bikes") or {}).items():
+            if not isinstance(node, dict):
+                continue
+            try:
+                bid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if bid < 1:
+                continue
+            tier = node.get("tier")
+            rows[bid] = {
+                "id": bid,
+                "name": node.get("en") or node.get("cn") or ("Bike %d" % bid),
+                "name_cn": node.get("cn") or node.get("en") or ("车 %d" % bid),
+                "tier": tier if isinstance(tier, int) else None,
+                "story": bool(node.get("story")),
+            }
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not rows:
+        return {}                              # 没建表就别缓存"空"，建完表立刻能认出来
+    _BIKE_CACHE["mtime"] = stamp
+    _BIKE_CACHE["rows"] = rows
+    return rows
+
+
+def _track_bike_tier(track):
+    """这张图要求的车级别（0/1/2；255 = 不限；None = 表里没有 = 当不限）。"""
+    try:
+        track = int(track)
+    except (TypeError, ValueError):
+        return None
+    for row in track_catalog():
+        if row["id"] == track:
+            tier = row.get("bike")
+            return tier if isinstance(tier, int) else None
+    return None
 
 
 def _weekly_track_health(track):
@@ -2525,6 +2675,12 @@ def admin_weekly_status():
         "track_id": track,
         "board": board,
         "leaderboard_id": lb,
+        # 本周实际发给所有人的车（`_weekly_bike_id()`：配置填了就用它，0 = 按赛道
+        # 级别从剧情车里挑、按周号播种整周不变）。`track_bike` = 赛道要求的车辆级别
+        # （255/None = 不限），界面拿它解释「本周为什么是这台车」。
+        "effective_bike": _weekly_bike_id(),
+        "track_bike": _track_bike_tier(track),
+        "bikes": sorted(bike_catalog().values(), key=lambda b: b["id"]),
         "ghosts": ghosts,
         "board_rows": board_rows,
         "warnings": warnings,
@@ -2763,6 +2919,9 @@ def _param_message(err):
                 "收到的是 %s" % err.split(":", 1)[1])
     if err.startswith("dup-special:"):
         return "第 %s 名的特殊奖励写了两遍（客户端会发两次，请删掉一条）" % err.split(":", 1)[1]
+    if err.startswith("bad-bike:"):
+        return ("没有 %s 号车（车号见界面下拉，1..19）。填不存在的车号客户端拿不到这台车，"
+                "加载关卡时会崩" % err.split(":", 1)[1])
     if err.startswith("bad-special:"):
         return ("奖励编号 %s 在物品表里查不到（server/admin/items.json 的 rewards），游戏解析不出来。"
                 "编号请从下拉里选" % err.split(":", 1)[1])
@@ -2896,9 +3055,25 @@ _BUNKER_FIELDS = (
         "Must be >= 1, otherwise the bot beats the player."),
     _bf("match", "matchmaking.bot_time_margin_ms", "int", -600000, 600000,
         "AI 成绩增减（毫秒）", "Bot time delta (ms)", "", ""),
+    _bf("match", "matchmaking.bike_random", "bool", 0, 1,
+        "按赛道级别随机发车", "Random bike per track tier",
+        "开（默认，原版行为）：每条赛道按自己的车辆级别（图 1 级 = 1 级车…）从**这个玩家"
+        "已拥有**的剧情车里随机发一台；玩家没有那个级别的车就换一张有车的图。"
+        "关：全部赛道都发下面那台固定车（老行为）。",
+        "On: each track gets a random bike of its own tier, picked from the player's own "
+        "story bikes; tracks whose tier the player cannot field are swapped out. Off: the "
+        "fixed bike below."),
+    _bf("match", "matchmaking.bike_story_only", "bool", 0, 1,
+        "随机池只放剧情车", "Story bikes only in the pool",
+        "开（默认）：随机池只有剧情里能拿到的 9 台（犰狳…幽灵），这是最安全的范围。"
+        "关：把 KTM、月球车、毛驴等非剧情车也放进池子（255 级特殊车算单独一档）。",
+        "On: only the 9 story bikes. Off: also shop/DLC bikes."),
     _bf("match", "matchmaking.bike_id", "int", 1, 64,
         "固定车辆", "Fixed bike",
-        "★ 不能填 0：客户端拿到空车再解引用，直接崩。", "Never 0: the client crashes."),
+        "只在「按赛道级别随机发车」关掉时用（开着时它只是随机不出车时的兜底）。"
+        "★ 不能填 0：客户端拿到空车再解引用，直接崩。"
+        "★ 关掉随机后这台车要能跑每张图（车级别 = 图的级别，或车是 255 级特殊车），"
+        "否则客户端判为不符。", "Only used when random bike assignment is off."),
     _bf("match", "matchmaking.ranked_match_slots", "int", 0, 8,
         "并行对局槽", "Parallel match slots",
         "同时能开几局。", "How many matches a player can keep open."),
@@ -3053,6 +3228,12 @@ def _bunker_check(spec, raw):
         raise _BadParam("bad-value:" + key)
     if not lo <= val <= hi:
         raise _BadParam("range:%s:%s-%s" % (key, lo, hi))
+    # 车号要真存在：`1..64` 只是形状，填 40 号客户端 `getBike(40)` 拿不到车 → 崩。
+    # 车表读不到（没建 items.json）时不拦，宁可放行也不要因为缺表全站改不动。
+    if key == "matchmaking.bike_id":
+        catalog = bike_catalog()
+        if catalog and val not in catalog:
+            raise _BadParam("bad-bike:%d" % val)
     return val
 
 
@@ -3165,7 +3346,7 @@ def admin_bunker_apply(fields):
     return {"applied": applied, "values": bunker_values()}, None
 
 
-_BUNKER_CATALOG = {"mtime": None, "specials": [], "bikes": []}
+_BUNKER_CATALOG = {"mtime": None, "specials": []}
 
 # 客户端的赛季特殊奖励表：原表 `/conf/pvp_match_rewards.txt` 的 PVPMatchSpecialRewards，
 # 7 组共 43 个编号（名字是组里那个 Comment）。★ 这 43 个是**客户端的固定表**，
@@ -3198,21 +3379,23 @@ _REWARD_CAT_ORDER = ("parts", "blueprint", "outfit", "track", "consumable", "oth
 
 
 def _bunker_catalogs():
-    """`items.json` 派生的两个下拉：**全部**奖励编号（标出官方 43 个）与车辆（`paints[].bike`）。
+    """`items.json` 派生的奖励编号下拉：**全部**编号（`official` 标出官方 43 个）。
 
     ★ 以前这里只放官方 43 个、服务端也硬拦别的编号。2026-10-06 的真机实验推翻了那条
       因果（见 `work/trials-frontier/notes/pvp-reward-contract.md` §5d）：**显示什么由
       「玩家有没有这件物品」决定** —— 没有就画真图标，已经有就画该编号自带的兜底奖励
       （大多是「毛驴轮胎」甜甜圈）。表外编号游戏解析不出来，也可能一直是兜底物，
       所以只**提示**、不再拦。
+    ★ 车辆下拉不再从这里派生（旧版拿 `paints[].bike` 凑出 17 台、还没有中文名）：
+      现在直接用 `bike_catalog()`（`/conf/bikes.txt` 的 19 台，带级别）。
     """
     try:
         stamp = os.path.getmtime(_TRACK_CATALOG_PATH)
     except OSError:
-        return [], []
+        return []
     if _BUNKER_CATALOG["mtime"] == stamp:
-        return _BUNKER_CATALOG["specials"], _BUNKER_CATALOG["bikes"]
-    rewards, bikes = [], {}
+        return _BUNKER_CATALOG["specials"]
+    rewards = []
     try:
         with open(_TRACK_CATALOG_PATH, "r", encoding="utf-8") as fp:
             data = json.load(fp)
@@ -3233,23 +3416,16 @@ def _bunker_catalogs():
         rewards.sort(key=lambda r: (_REWARD_CAT_ORDER.index(r["cat"])
                                     if r["cat"] in _REWARD_CAT_ORDER else len(_REWARD_CAT_ORDER),
                                     r["id"]))
-        for node in (data.get("paints") or {}).values():
-            if not isinstance(node, dict):
-                continue
-            bid, name = node.get("bike"), node.get("bike_en")
-            if isinstance(bid, int) and bid > 0 and name and bid not in bikes:
-                bikes[bid] = name
     except (OSError, ValueError, AttributeError):
-        return [], []
-    rows = [{"id": bid, "name": bikes[bid]} for bid in sorted(bikes)]
-    if rewards or rows:
-        _BUNKER_CATALOG.update(mtime=stamp, specials=rewards, bikes=rows)
-    return rewards, rows
+        return []
+    if rewards:
+        _BUNKER_CATALOG.update(mtime=stamp, specials=rewards)
+    return rewards
 
 
 def _known_reward_ids():
     """物品表（`items.json` 的 `rewards`）里所有奖励编号。表读不到就返回空集合 = 不拦。"""
-    return frozenset(r["id"] for r in _bunker_catalogs()[0])
+    return frozenset(r["id"] for r in _bunker_catalogs())
 
 
 def bunker_audit(limit=30):
@@ -3325,7 +3501,7 @@ def admin_bunker_status():
 
 def bunker_payload():
     """碉堡页要的全部只读数据：界面照着它画，不用自己拼默认值。"""
-    rewards, bikes = _bunker_catalogs()
+    rewards = _bunker_catalogs()
     return {"cards": [{"id": c, "cn": cn, "en": en} for c, cn, en in _BUNKER_CARDS],
             "fields": [dict(f, default=_bunker_default(f["key"]), now=_bunker_get(f["key"]))
                        for f in _BUNKER_FIELDS],
@@ -3333,7 +3509,9 @@ def bunker_payload():
             "status": admin_bunker_status(),
             "tracks": track_catalog(),
             "rewards": rewards,
-            "bikes": bikes,
+            # 车表 = `/conf/bikes.txt` 的 19 台（带级别与「剧情车」标记）：固定车辆
+            # 下拉、以及界面上解释「为什么发这台车」都用它（旧版从 paints 凑的 17 台）。
+            "bikes": sorted(bike_catalog().values(), key=lambda b: b["id"]),
             "templates": templates_for("bunker").get("bunker", []),
             "audit": bunker_audit(30)}
 
@@ -4196,11 +4374,129 @@ def _pvp_ghost_time(tid):
     return ms
 
 
-def _pvp_tracks():
+def _pvp_bike_random():
+    """发车方式：True（默认）= 按每条赛道自己的车级别随机；False = 全用 `bike_id`。"""
+    return cfg("matchmaking", "bike_random", default=True) is not False
+
+
+def _pvp_owned_bikes(pid):
+    """这个玩家拥有的车号集合（`pvp_init` 上报的 `bikes` 位图，bit i = 车号 i+1）。
+
+    ★ 位图语义是反汇编确认的：`OnlinePVP::getBikeAndTrackLists @0x4f96c0` 里
+      `w20 |= 1 << index` 而 `UpgradeManager::getBikeIDbyIndex @0x62c4d8` = `index + 1`。
+    没有记录（玩家没进过碉堡 / 老存档）就返回 None = **不筛车**（宁可用别人的车池，
+    也不要因为不知道就一台都发不出来）。
+    """
+    if not pid:
+        return None
+    try:
+        mask = (_pvp_chips_state(pid) or {}).get("bikes")
+    except Exception:
+        return None
+    if isinstance(mask, bool) or not isinstance(mask, int) or mask <= 0:
+        return None
+    return {i + 1 for i in range(32) if mask & (1 << i)}
+
+
+def _pvp_set_bikes(pid, mask):
+    """记下 `pvp_init` 上报的 `bikes` 位图（<=0 视为没上报，保留旧值）。"""
+    if not pid:
+        return
+    try:
+        mask = int(mask)
+    except (TypeError, ValueError):
+        return
+    if mask <= 0:
+        return
+    _pvp_chips_state(pid)["bikes"] = mask
+    _pvp_mark_dirty()
+    _pvp_state_save()
+
+
+def _pvp_bike_pool(tier, owned=None, story_only=True):
+    """能跑级别 `tier` 这张图的车号（升序）。
+
+    规则照客户端 `LevelManager::isCorrectBikeTier @0x47c170`：
+      车 tier == 图的 `B`、或车 tier == 255（特殊车能跑任何图）、或图的 `B` == 255 / 未知
+      （不限级别）。`owned` = 玩家拥有的车号集合（None = 不筛）；`story_only` = 只发
+      剧情默认车（1..9，用户 m08106 的「兜底安全范围」）。
+    """
+    cats = bike_catalog()
+    if not cats:
+        return []
+    free = tier is None or tier == 255          # 不限级别的图
+    out = []
+    for bid in sorted(cats):
+        b = cats[bid]
+        if b.get("tier") is None:
+            continue
+        if owned is not None and bid not in owned:
+            continue
+        if story_only and not b.get("story"):
+            continue
+        if not free and b["tier"] != tier and b["tier"] != 255:
+            continue
+        out.append(bid)
+    return out
+
+
+def _pvp_default_bike(tier):
+    """这张图的兜底车：该级别第一台剧情车；表读不到就 None（调用方再退固定 bike_id）。"""
+    pool = _pvp_bike_pool(tier, None, True)
+    return pool[0] if pool else None
+
+
+def _pvp_pick_bikes(tracks, owned=None, seed=None):
+    """给这局的每条赛道各随机挑一台车 -> {track_id: bike_id}。
+
+    用户 m08106 定下的口径：**每条赛道按自己的级别各发一台**；池子只放剧情默认车；
+    「如果玩家暂时没有其中几个车，就随机到有车的地图」⇒ 挑不出车的赛道**不进结果**，
+    由调用方换图。挑不出任何车（车表读不到 / 玩家一台都没有）时返回空 dict，调用方
+    退回固定 `matchmaking.bike_id` —— 绝不发 0（真机 bike_id=0 崩，见 h_liveevents_config）。
+    """
+    if not _pvp_bike_random() or not bike_catalog():
+        return {}
+    rnd = random.Random(seed) if seed is not None else random
+    story_only = cfg("matchmaking", "bike_story_only", default=True) is not False
+    out = {}
+    for tid in tracks or []:
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            continue
+        if tid in out:
+            continue
+        pool = _pvp_bike_pool(_track_bike_tier(tid), owned, story_only)
+        if pool:
+            out[tid] = rnd.choice(pool)
+    return out
+
+
+def _pvp_owned_for_match(players):
+    """这场对局里「真人玩家都发得出来车」的车号集合（人机不参与 = 不限）。
+
+    人机没有账号也没有车库，拿 None 当「不限」，交集时跳过它。
+    """
+    owned = None
+    for pid in players or []:
+        if not pid or pid == _pvp_bot_id():
+            continue
+        mine = _pvp_owned_bikes(pid)
+        if mine is None:
+            return None                          # 有一个玩家没上报 -> 谁都不筛，别把图挑没了
+        owned = mine if owned is None else (owned & mine)
+    return owned
+
+
+def _pvp_tracks(owned=None):
     """本局要发的赛道清单（最多 3 条，理由见 matchmaking.track_ids 的注释）。
 
     用户 m04586：PVP 一局是**随机地图、随机车辆**。所以 `track_ids` 留空时从
     `candidate_tracks` 里随机抽 3 条；填了就固定用填的。
+
+    ★ `owned` = 这场对局可用的车号集合（见 `_pvp_owned_for_match`）：发车方式为
+      `random` 时，玩家在那个级别一台车都没有的图会被**换掉**（用户 m08106：
+      「替换地图为有车的地图」）。车表读不到时不过滤（退化成老行为）。
     """
     def _ints(seq):
         out = []
@@ -4217,6 +4513,15 @@ def _pvp_tracks():
     out = _ints(cfg("matchmaking", "track_ids", default=None))
     if not out:
         cand = _ints(cfg("matchmaking", "candidate_tracks", default=None))
+        if cand and _pvp_bike_random() and bike_catalog():
+            story_only = cfg("matchmaking", "bike_story_only", default=True) is not False
+            ok = [t for t in cand
+                  if _pvp_bike_pool(_track_bike_tier(t), owned, story_only)]
+            if ok:
+                if len(ok) < len(cand):
+                    print("[pvp] 发车池筛掉 %d 条没有对应级别车的赛道 → %d 条候选"
+                          % (len(cand) - len(ok), len(ok)), flush=True)
+                cand = ok
         if cand:
             out = random.sample(cand, min(3, len(cand)))
     if not out:
@@ -4507,14 +4812,26 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
     #   `PVPMatch::getRemainingTime` @0x5ed1e4（= start_time + total_time - now）
     #   永远等于满值 —— 真机症状就是「倒计时过几秒又跳回满值」（用户 m04404）。
     start = int(_m.get("start") or 0) or now
-    bike = cfg_int("matchmaking", "bike_id", default=1)
-    if not isinstance(bike, int) or bike < 1:
-        bike = 1
+    fixed_bike = cfg_int("matchmaking", "bike_id", default=1)
+    if not isinstance(fixed_bike, int) or fixed_bike < 1:
+        fixed_bike = 1
     # 一局 3 条赛道；`track` 仍作兜底（服务器重启后补建的对局没有 tracks）。
     tlist = _m.get("tracks")
     if not isinstance(tlist, list) or not tlist:
         tlist = _pvp_tracks() if track is None else [int(track)]
     tlist = [int(t) for t in list(tlist)[:3] if int(t) > 0] or [_pvp_track()]
+    # ★ 发车表按**每个玩家**各定一份并记进对局（`_m["bikes"][pid]`）：这个函数每条
+    #   `matches` 轮询都会被调，现挑就会一局之内来回换车。挑不出来（车表读不到 / 玩家
+    #   一台车都没有 / `bike_random = False`）就退回「该级别第一台剧情车」，再退
+    #   `matchmaking.bike_id` —— **绝不发 0**（真机 bike_id=0 必崩）。
+    mine = {}
+    if _m and profile_id:
+        allb = _m.setdefault("bikes", {})
+        if profile_id not in allb:
+            allb[profile_id] = _pvp_pick_bikes(tlist, _pvp_owned_bikes(profile_id),
+                                               seed="%s|%s" % (match_id, profile_id))
+            _pvp_mark_dirty()
+        mine = allb.get(profile_id) or {}
     _rw = _m.get("rewards", [0, 0, 0])
 
     def _track_json(tid):
@@ -4555,6 +4872,13 @@ def _pvp_match_json(profile_id, match_id=1, opponent_id=None, track=None):
                 oc = int(raw or 0)
             except (TypeError, ValueError):
                 oc = 0
+        # ★ 这条赛道的车：先看这局给这个玩家定的（按图的级别从剧情车里随机），
+        #   再退该级别第一台剧情车 —— 但**只限随机发车**：关掉随机时无论级别都用
+        #   配置里的 `matchmaking.bike_id`（要按级别发就该开着随机）。
+        bike = mine.get(tid)
+        if not isinstance(bike, int) or bike < 1:
+            bike = (_pvp_default_bike(_track_bike_tier(tid))
+                    if _pvp_bike_random() else None) or fixed_bike
         out = {
             "track": tid,
             "bike": bike,
@@ -4629,7 +4953,10 @@ def _pvp_make_match(players, track=None, bot=False):
     """
     now = int(time.time())
     mid = _pvp_new_id()
-    tracks = _pvp_tracks() if track is None else [int(track)]
+    # 发车：先按「这场对局里真人都有车的级别」筛掉挑不出车的赛道（用户 m08106：
+    # 「替换地图为有车的地图」），再按每条赛道自己的级别各挑一台（见 `_pvp_pick_bikes`）。
+    owned = _pvp_owned_for_match(players)
+    tracks = _pvp_tracks(owned) if track is None else [int(track)]
     tracks = [int(t) for t in list(tracks)[:3] if int(t) > 0] or [_pvp_track()]
     dur = cfg_int("matchmaking", "match_duration_seconds", default=21600) or 21600
     _pvp_matches[mid] = {
@@ -4639,6 +4966,9 @@ def _pvp_make_match(players, track=None, bot=False):
         "dur": int(dur),
         "tracks": tracks,
         "track": tracks[0],
+        # {profile_id: {track_id: bike_id}} —— 每人一份，`_pvp_match_json` 第一次要的时候
+        # 按各自的车型/拥有情况定下来（同一局里反复取必须拿到同一台，否则一局内换车）。
+        "bikes": {},
         # {profile_id: {track_id: {"score": int, "additional_score": int,
         #                          "bike_data": int, "at": unix}}}
         "results": {},
@@ -4842,6 +5172,10 @@ def h_pvp_init(path, query, body, headers):
                 ids.append(int(part))
         if ids:
             _pvp_set_tracks(pid, ids)
+    if isinstance(b, dict) and "bikes" in b:
+        # `bikes` = 拥有的车辆位图（bit i = 车号 i+1，见 `_pvp_owned_bikes`）。
+        # 发随机车时只从玩家真有的车里挑（用户 m08106）。
+        _pvp_set_bikes(pid, b.get("bikes"))
     return 200, {"Content-Type": "application/json"}, {
         "player_info": _pvp_player_info(_pvp_chips_for(pid), pid=pid),
         "match_info": _pvp_match_info(pid, allow_create=False),

@@ -1148,12 +1148,39 @@ async function screenGrant() {
 // 键名放表里、t() 收变量。I18n 测试会单独核这些键（tests/test_admin_webui.py 的 KEYS）。
 const WEEKLY_FIELD = {
   track_id: 'weekly.f.track', leaderboard_id: 'weekly.f.board',
+  bike_id: 'weekly.f.bike', loan_upgrade: 'weekly.f.loan',
   fake_field: 'weekly.f.fake', fake_field_base_ms: 'weekly.f.base',
   fake_field_fast_pct: 'weekly.f.fast', fake_field_slow_pct: 'weekly.f.slow',
   left_retry_times: 'weekly.f.retry', cooldown_seconds: 'weekly.f.cool',
   week_offset: 'weekly.f.offset', reward_slots: 'weekly.f.slots',
   window_days: 'weekly.f.days', reward_ids: 'weekly.f.rewardIds',
 };
+
+// 车表（服务端下发：`/conf/bikes.txt` 的 19 台，带级别与「剧情车」标记）。
+// 两屏共用：午夜杯的「本届车」下拉、碉堡的「固定车辆」下拉、审计列里的车号翻译。
+let BIKES = [];
+function bikeName(id) {
+  const n = Number(id);
+  const hit = BIKES.filter(x => Number(x.id) === n)[0];
+  return hit ? ((LANG === 'cn' ? hit.name_cn : hit.name) || hit.name || '') : '';
+}
+// 车号 -> 人读的一行；0 / 空 = 自动（午夜杯专用：按赛道级别随机）。
+function bikeLabel(id) {
+  const n = Number(id);
+  if (!n) return t('weekly.bike.autoVal');
+  return '#' + n + (bikeName(n) ? ' ' + bikeName(n) : '');
+}
+
+// 车辆级别 -> 界面文字：0/1/2 = T0/T1/T2（车和图必须同级），255 / 缺 = 不限。
+// 规则来自客户端 `LevelManager::isCorrectBikeTier @0x47c170`。
+function tierText(b) {
+  return (b === 255 || b === null || b === undefined) ? t('app.tier.any') : 'T' + b;
+}
+
+function bikeTierOf(id) {
+  const hit = BIKES.filter(x => Number(x.id) === Number(id))[0];
+  return hit ? hit.tier : null;
+}
 
 const WEEKLY_TIERS = ['platinum', 'gold', 'silver', 'bronze', 'wood'];
 
@@ -1187,6 +1214,8 @@ function weeklyVal(key, v) {
   if (key === 'cooldown_seconds') return spanText(v);
   if (key === 'fake_field_base_ms') return fmtNum(v) + ' ms';
   if (key === 'track_id') return '#' + v;
+  if (key === 'bike_id') return bikeLabel(v);
+  if (key === 'loan_upgrade') return Number(v) ? t('weekly.loan.lv', { n: fmtNum(v) }) : t('weekly.loan.off');
   return fmtNum(v);
 }
 
@@ -1248,6 +1277,7 @@ function guideCard(titleKey, ...lines) {
 async function screenWeekly() {
   const data = await api('/__api/admin/weekly');
   const cfg = data.config || {}, st = data.status || {}, tracks = data.tracks || [];
+  BIKES = st.bikes || [];
   const draft = Object.assign({}, cfg);   // 只有本屏改得动的键；保存时只发真的变了的
   const nodes = [el('p', { class: 'lead', text: t('weekly.lead') })];
   // ── ⓪ 引导：午夜杯没有开关（届号是算出来的）。先说清楚，再动参数。
@@ -1292,6 +1322,9 @@ async function screenWeekly() {
   expBadge.hidden = Number(st.window_days) === WEEKLY_DAYS;
   const nowKv = el('div', { class: 'kv' },
     kvItem(t('weekly.now.track'), '#' + st.track_id + (trackName(st.track_id) ? ' ' + trackName(st.track_id) : '')),
+    // 本周发给所有人的那台车（租借升级 = 玩家升级不够时补到的等级）。只读，实时算。
+    kvItem(t('weekly.now.bike'), bikeLabel(st.effective_bike) + ' · ' +
+      (Number(cfg.loan_upgrade) ? t('weekly.loan.lv', { n: fmtNum(cfg.loan_upgrade) }) : t('weekly.loan.off'))),
     kvItem(t('weekly.now.window'), fmtTime(st.week_start) + ' → ' + fmtTime(st.week_end)),
     kvItem(t('weekly.now.left'), spanText(st.week_end - st.now)),
     kvItem(t('weekly.now.week'), '#' + st.week_index),
@@ -1410,7 +1443,9 @@ async function screenWeekly() {
   const trHint = el('span', { class: 'hint' });
   function updTrack() {
     const nm = trackName(draft.track_id);
-    trHint.textContent = nm ? '#' + draft.track_id + ' ' + nm : t('weekly.track.unknown');
+    const tb = tracks.filter(x => Number(x.id) === Number(draft.track_id))[0];
+    trHint.textContent = (nm ? '#' + draft.track_id + ' ' + nm : t('weekly.track.unknown')) +
+      (tb ? ' · ' + t('app.tier.lv') + ' ' + tierText(tb.bike) : '');
   }
   const dl = el('datalist', { id: 'tfTracks' });
   tracks.forEach(x => dl.appendChild(el('option', { value: String(x.id),
@@ -1418,8 +1453,29 @@ async function screenWeekly() {
   const trackIn = numBox(draft.track_id, v => { draft.track_id = v; updTrack(); },
                          { min: 1, max: 1000000, list: 'tfTracks' });
   updTrack();
+  // 本届的车：0 = 自动（按赛道级别从剧情车里随机，按周号播种 ⇒ 整周不变）；填车号 =
+  // 整届固定发这台（玩家没有或升级更低时客户端发租借车，不入他的车库）。
+  const bikeHit = id => BIKES.filter(x => Number(x.id) === Number(id))[0];
+  const bikeDl = el('datalist', { id: 'tfBikes' });
+  BIKES.forEach(b => bikeDl.appendChild(el('option', { value: String(b.id),
+    text: '#' + b.id + ' ' + ((LANG === 'cn' ? b.name_cn : b.name) || b.name || '') })));
+  const bikeHint = el('span', { class: 'hint' });
+  function updBike() {
+    const n = Number(draft.bike_id) || 0;
+    const hit = bikeHit(n);
+    bikeHint.textContent = n
+      ? '#' + n + ' ' + (bikeName(n) || t('weekly.bike.unknown')) +
+        (hit ? ' · ' + tierText(hit.tier) + (hit.story ? '' : ' · ' + t('weekly.bike.notStory')) : '')
+      : t('weekly.bike.autoVal') + ' → ' + bikeLabel(st.effective_bike);
+  }
+  updBike();
   nodes.push(wCard('weekly.track.title', null,
     fRow('weekly.f.track', [trackIn, dl, trHint], tracks.length ? null : t('weekly.track.noCatalog')),
+    fRow('weekly.f.bike', [numBox(draft.bike_id, v => { draft.bike_id = v; updBike(); },
+                                  { min: 0, max: 64, list: 'tfBikes' }), bikeDl, bikeHint],
+         BIKES.length ? t('weekly.bike.hint') : t('weekly.bike.noCatalog')),
+    fRow('weekly.f.loan', [numBox(draft.loan_upgrade, v => { draft.loan_upgrade = v; }, { min: 0, max: 10 }),
+                           el('span', { class: 'hint', text: t('weekly.loan.hint') })], null),
     fRow('weekly.f.board', [numBox(draft.leaderboard_id, v => { draft.leaderboard_id = v; }, { min: 0, max: 0xFFFFFF }),
                             el('span', { class: 'hint', text: t('weekly.track.boardLive') + ' ' + fmtNum(st.board) })], null),
     fRow('weekly.f.fake', [numBox(draft.fake_field, v => { draft.fake_field = v; }, { min: 0, max: 500 }),
@@ -1432,7 +1488,8 @@ async function screenWeekly() {
                            el('span', { class: 'hint', text: t('weekly.track.pctHint') })], null),
     el('p', { class: 'hint', text: t('weekly.track.note') }),
     cardFoot(el('button', { class: 'btn primary', type: 'button', text: t('weekly.save'),
-      onclick: () => saveFields(diffFields(['track_id', 'leaderboard_id', 'fake_field', 'fake_field_base_ms',
+      onclick: () => saveFields(diffFields(['track_id', 'leaderboard_id', 'bike_id', 'loan_upgrade',
+        'fake_field', 'fake_field_base_ms',
         'fake_field_fast_pct', 'fake_field_slow_pct']), 'weekly.saved') }))));
 
   // ── ⑤ 奖励池子：服务端只下发池子编号 1..15，具体给什么在客户端自己的奖励表里。
@@ -1712,6 +1769,7 @@ async function screenBunker() {
   const data = await api('/__api/admin/bunker');
   const st = data.status || {}, fields = data.fields || [], values = data.values || {};
   const ctx = { tracks: data.tracks || [], rewards: data.rewards || [] };
+  BIKES = data.bikes || [];    // 固定车辆下拉 / 车号翻译（两屏共用的一份车表）
   const byKey = {};
   fields.forEach(f => { byKey[f.key] = f; });
   const draft = Object.assign({}, values);
@@ -1758,6 +1816,19 @@ async function screenBunker() {
     const k = f.key, kind = f.kind;
     const cur = el('span', { class: 'hint', text: t('bunker.nowIs', { v: bunkerVal(f, f.now) }) });
     if (kind === 'int' || kind === 'float') {
+      // 车号给一个下拉提示（19 台车，带级别），并实时显示选中的是哪台车。
+      if (k === 'matchmaking.bike_id') {
+        const dl = el('datalist', { id: 'tfBikesBunker' });
+        BIKES.forEach(b => dl.appendChild(el('option', { value: String(b.id) })));
+        const tip = el('span', { class: 'hint' });
+        const syncTip = () => {
+          tip.textContent = bikeLabel(draft[k]) + ' · ' + t('app.tier.lv') + ' ' +
+            tierText(bikeTierOf(draft[k]));
+        };
+        syncTip();
+        return [numBox(draft[k], v => { set(k, v); syncTip(); },
+                       { min: f.min, max: f.max, list: 'tfBikesBunker' }), dl, tip, cur];
+      }
       const box = numBox(draft[k], v => set(k, v), { min: f.min, max: f.max });
       if (k === 'matchmaking.match_duration_seconds') {
         const presets = [[300, t('app.span.m', { m: 5 })], [3600, t('weekly.rules.p1h')],

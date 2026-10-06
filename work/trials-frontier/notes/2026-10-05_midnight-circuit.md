@@ -139,3 +139,27 @@ D. 周结算路径：把 `basic_info` 的 `week_start/weeK_end` 临时拨到"已
 ### 6.7 未提交 & 遗留
 本批（6.1–6.5 + 6 项测试，共 41 项全绿）**尚未 commit**。
 遗留：`match_duration_seconds` 测试期设的 300 要还原 21600；碉堡两个老问题（真人对手显示名、`match_loser_keeps_pct` 取 50 还是 100）。
+
+### 6.8 本周的车（2026-10-06，用户 m07949 的「车与地图是随机的」）
+
+原版午夜杯一周只有**一辆**车 + 一条赛道。客户端契约（`libTrialsGo.so`）：
+
+| 地址 | 符号 | 结论 |
+|---|---|---|
+| `0x5055f0` | `tr::OnlineWeeklyChallenge::parseChallengeConfiguration(json_value*, OnlineWeeklyChallengeConfigQuery*)` | `ChallengeConfig` 布局：`+0x18 track_id`、`+0x1c bike_id`、`+0x20 bike_skin`、`+0x24/0x28/0x2c/0x30` = handle/engine/wheel/frame、`+0x34 force_upgrade`（写成 `value > 0` 的布尔） |
+| `0x636710` | `tr::WeeklyChallengeManager::setBikeUpgradeLevel(tr::BikeUpgrade&)` | 管理器 `+0x34/0x38/0x3c/0x40/0x44` 五个字段，四个部件 **×100**；`force_upgrade != 0` ⇒ 覆盖，**`== 0` ⇒ `max(玩家自己的升级, 配置值)`**。唯一调用者 `BikeManager::setupBikeLevels @0x4bea3c`（调用点 `0x4bebac`） |
+| `0x63608c` / `0x6362a8` | `getWeeklyBikeId()` / `getWeeklyTrackId()` | 就是 `+0x1c` / `+0x18` |
+| `0x6364c4` | `doesPlayerHasWeeklyBike()`（44 字节） | `getWeeklyBikeId()` → `UpgradeManager::getBike(id)` → `cmp x0,#0; cset w0,ne` ⇒ **只认一辆车** |
+| `0x7b419c` | `MenuzStateWeeklyChallenge::loadIntroState` | 在 `0x7b454c` 调 `MenuzComponentWeeklyChallengeBike::setBike(int bike, int skin)`，`w1 = max(0, cfg+0x1c)`、`w2 = cfg+0x20` ⇒ 第二个参数是 **bike_skin**，不是「是否租借」标志 |
+
+⇒ **服务端落地的三条**：①`weekly.bike_id = 0` 时按本周赛道级别（`LevelManager::isCorrectBikeTier @0x47c170`）
+用 `random.Random("weekly-bike|<周号>")` 抽一辆并整周固定，`>0` 则整届固定；
+②`bike_upgrade` 发 `weekly.loan_upgrade`（默认 5）的四个部件同值 + `force_upgrade = 0`，
+靠客户端的 `max()` 实现原版「没车 / 升级不够就借你一辆带固定升级的车，车不进车库」；
+③`bike_id` 绝不能是 0（`getBike(0)` 返回 NULL，`ldr w8,[x0,#0xb0]` 直接崩，真机踩过）。
+
+设计文案（LOCF）逐字佐证：`0xd174a4d1`「…a loan version…will not go to your garage…this version of
+the bike has pre-defined upgrades attached to it」、`0xd8010a3a`「bike you own is upgraded **less than**
+the week's loan bike…you enter with the Loan Bike」、`0xb7430f2d`「**one track and one bike** to play」、
+`0xcae83f68`「may allow you to use your own upgraded bike…at other times it will force everyone to use
+an identical bike」。
