@@ -299,10 +299,22 @@ function confirmDialog(o) {
   return new Promise(resolve => {
     const m = $('#modal'), ok = $('#modalOk'), cancel = $('#modalCancel'), body = $('#modalBody');
     $('#modalTitle').textContent = o.title || t('app.confirm');
-    body.replaceChildren(o.body ? el('p', { text: o.body }) : document.createTextNode(''));
+    // o.input:{label,value,placeholder} ⇒ 弹一个输入框，确认时 resolve 输入内容（取消仍是 false）。
+    // 模板改名/复制要的就是这个：不问名字只让确认，等于逼人重存一遍。
+    const kids = [];
+    if (o.body) kids.push(el('p', { text: o.body }));
+    let inp = null;
+    if (o.input) {
+      inp = el('input', { type: 'text', maxlength: String(o.input.maxlength || 40),
+                          value: o.input.value == null ? '' : String(o.input.value) });
+      if (o.input.placeholder) inp.placeholder = String(o.input.placeholder);
+      inp.setAttribute('aria-label', o.input.label || o.title || t('app.confirm'));
+      kids.push(el('div', { class: 'field' }, o.input.label ? el('span', { text: o.input.label }) : null, inp));
+    }
+    body.replaceChildren.apply(body, kids.length ? kids : [document.createTextNode('')]);
     ok.textContent = o.okLabel || t('app.confirm');
     m.hidden = false;
-    ok.focus();
+    if (inp) { inp.focus(); inp.select(); } else ok.focus();
     function done(v) {
       m.hidden = true;
       ok.removeEventListener('click', onOk);
@@ -311,10 +323,13 @@ function confirmDialog(o) {
       document.removeEventListener('keydown', onKey);
       resolve(v);
     }
-    function onOk() { done(true); }
+    function onOk() { done(inp ? inp.value : true); }
     function onCancel() { done(false); }
     function onBg(e) { if (e.target === m) done(false); }
-    function onKey(e) { if (e.key === 'Escape') done(false); }
+    function onKey(e) {
+      if (e.key === 'Escape') done(false);
+      else if (e.key === 'Enter' && inp) { e.preventDefault(); done(inp.value); }
+    }
     ok.addEventListener('click', onOk);
     cancel.addEventListener('click', onCancel);
     m.addEventListener('click', onBg);
@@ -332,6 +347,7 @@ const SCREENS = {
   accounts: { titleKey: 'nav.accounts', load: screenAccounts },
   saves: { titleKey: 'nav.saves', load: screenSaves },
   grant: { titleKey: 'nav.grant', load: screenGrant },
+  weekly: { titleKey: 'nav.weekly', load: screenWeekly },
 };
 
 function route() {
@@ -1119,6 +1135,405 @@ async function screenGrant() {
     el('div', { class: 'card-head' }, el('span', { class: 'grow' }), submit));
 
   nodes.push(pick, pvpCard, warn, listCard);
+  return nodes;
+}
+
+// ─────────────────────────────────────────────── 屏 · 午夜杯（周赛运营）
+
+// 这一屏只改服务端 `weekly.*` 段。配置按文件 mtime 热加载 ⇒ 保存即生效：不重启服务、
+// 不动客户端契约、玩家不用做任何事。★ 例外是奖励池子 —— 客户端只在「进入午夜杯」那一刻
+// 读一次 reward_config，所以奖励改完要让玩家退出午夜杯再进（不是重启游戏）。
+
+// 键名放表里、t() 收变量。I18n 测试会单独核这些键（tests/test_admin_webui.py 的 KEYS）。
+const WEEKLY_FIELD = {
+  track_id: 'weekly.f.track', leaderboard_id: 'weekly.f.board',
+  fake_field: 'weekly.f.fake', fake_field_base_ms: 'weekly.f.base',
+  fake_field_fast_pct: 'weekly.f.fast', fake_field_slow_pct: 'weekly.f.slow',
+  left_retry_times: 'weekly.f.retry', cooldown_seconds: 'weekly.f.cool',
+  week_offset: 'weekly.f.offset', reward_slots: 'weekly.f.slots',
+  window_days: 'weekly.f.days', reward_ids: 'weekly.f.rewardIds',
+};
+
+const WEEKLY_TIERS = ['platinum', 'gold', 'silver', 'bronze', 'wood'];
+
+const TIER_LABEL = { platinum: 'weekly.tier.platinum', gold: 'weekly.tier.gold',
+                     silver: 'weekly.tier.silver', bronze: 'weekly.tier.bronze',
+                     wood: 'weekly.tier.wood' };
+
+// 服务端 _WEEK_SECONDS / 86400。只有 7 天在真机验过，别的天数界面挂「实验性」。
+const WEEKLY_DAYS = 7;
+
+// 秒 → 「x 天 y 小时」。窗口和冷却都是一周量级，纯秒数没人读得出来。
+function spanText(sec) {
+  let s = Math.max(0, Math.floor(Number(sec) || 0));
+  const d = Math.floor(s / 86400); s -= d * 86400;
+  const h = Math.floor(s / 3600); s -= h * 3600;
+  const m = Math.floor(s / 60);
+  if (d) return t('app.span.dh', { d: fmtNum(d), h: fmtNum(h) });
+  if (h) return t('app.span.hm', { h: fmtNum(h), m: fmtNum(m) });
+  return t('app.span.m', { m: fmtNum(m) });
+}
+
+// 一个运营参数 → 人能读的一行。reward_ids 是 {档位: [池子编号]}，要摊平。
+function weeklyVal(key, v) {
+  if (key === 'reward_ids') {
+    const parts = WEEKLY_TIERS.filter(ti => ((v && v[ti]) || []).length)
+                              .map(ti => t(TIER_LABEL[ti]) + ' ' + v[ti].join('/'));
+    return parts.length ? parts.join(' · ') : t('weekly.rewards.builtin');
+  }
+  if (v === null || v === undefined || v === '') return '—';
+  if (key === 'window_days') return t('app.days', { n: fmtNum(v) });
+  if (key === 'cooldown_seconds') return spanText(v);
+  if (key === 'fake_field_base_ms') return fmtNum(v) + ' ms';
+  if (key === 'track_id') return '#' + v;
+  return fmtNum(v);
+}
+
+function kvItem(k, v) {
+  return el('div', null, el('div', { class: 'k', text: k }), el('div', { class: 'v', text: v }));
+}
+
+// 表单行：左边标签+说明，右边控件。窄屏自动变单列（见 app.css 的 .frow）。
+function fRow(labelKey, control, hint) {
+  return el('div', { class: 'frow' },
+    el('div', { class: 'fl' },
+      el('div', { class: 'fk', text: t(labelKey) }),
+      hint ? el('div', { class: 'hint', text: hint }) : null),
+    el('div', { class: 'fc' }, ...(Array.isArray(control) ? control : [control])));
+}
+
+// 数字框：空 ⇒ null（= 删掉这个键、回到代码默认值），否则 Number。整数校验在服务端。
+function numBox(value, onchange, o) {
+  o = o || {};
+  const inp = el('input', { type: 'number', inputmode: 'numeric',
+                            value: value === null || value === undefined ? '' : String(value) });
+  if (o.min !== undefined) inp.min = String(o.min);
+  if (o.max !== undefined) inp.max = String(o.max);
+  if (o.list) inp.setAttribute('list', o.list);
+  inp.addEventListener('input', () => onchange(inp.value === '' ? null : Number(inp.value)));
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') inp.blur(); });
+  return inp;
+}
+
+// 卡片右下角的提交行（左列留空 ⇒ 按钮落在控件那一列）。
+function cardFoot(...btns) {
+  return el('div', { class: 'frow' }, el('div', { class: 'fl' }), el('div', { class: 'fc' }, ...btns));
+}
+
+function wCard(titleKey, hint, ...body) {
+  return el('section', { class: 'card' },
+    el('div', { class: 'card-head' },
+      el('h2', { class: 'grow', text: t(titleKey) }),
+      hint ? el('span', { class: 'hint', text: hint }) : null),
+    el('div', { class: 'card-body' }, ...body));
+}
+
+function wSub(labelKey, ...body) {
+  return el('div', { class: 'grp' }, el('div', { class: 'sub', text: t(labelKey) }), ...body);
+}
+
+async function screenWeekly() {
+  const data = await api('/__api/admin/weekly');
+  const cfg = data.config || {}, st = data.status || {}, tracks = data.tracks || [];
+  const draft = Object.assign({}, cfg);   // 只有本屏改得动的键；保存时只发真的变了的
+  const nodes = [el('p', { class: 'lead', text: t('weekly.lead') })];
+  const trackName = id => {
+    const hit = tracks.filter(x => Number(x.id) === Number(id))[0];
+    return hit ? ((LANG === 'cn' ? hit.name_cn : hit.name) || hit.name || '') : '';
+  };
+
+  // 保存：只发改动的键（服务端按键审计 ⇒ 没动就不该留记录）。成功后在 toast 里给撤销。
+  async function saveFields(fields, okKey) {
+    return guarded(async () => {
+      const keys = Object.keys(fields);
+      if (!keys.length) { toast(t('weekly.noChange'), { kind: 'warn', timeout: 2600 }); return; }
+      const r = await post('/__api/admin/weekly', { fields });
+      const applied = r.applied || [];
+      const sum = applied.map(a => (WEEKLY_FIELD[a.key] ? t(WEEKLY_FIELD[a.key]) : a.key) + ' ' + weeklyVal(a.key, a.after)).join('　');
+      const ids = applied.map(a => a.audit).filter(Boolean);
+      const opts = { kind: 'good' };
+      if (ids.length) opts.action = { label: t('weekly.undo'), run: () => guarded(async () => {
+        for (const id of ids) await post('/__api/admin/undo', { id });
+        show('weekly');
+      }) };
+      toast(t(okKey) + (sum ? ' · ' + sum : ''), opts);
+      show('weekly');
+    });
+  }
+  function diffFields(keys) {
+    const out = {};
+    for (const k of keys) {
+      const a = draft[k] === undefined ? null : draft[k];
+      const b = cfg[k] === undefined ? null : cfg[k];
+      if (JSON.stringify(a) !== JSON.stringify(b)) out[k] = (a === '' ? null : a);
+    }
+    return out;
+  }
+
+  // ── ① 现状：全只读。数字都由服务端实时算（status），界面不自己推。
+  const expBadge = el('span', { class: 'badge warn', text: t('weekly.experimental') });
+  expBadge.hidden = Number(st.window_days) === WEEKLY_DAYS;
+  const nowKv = el('div', { class: 'kv' },
+    kvItem(t('weekly.now.track'), '#' + st.track_id + (trackName(st.track_id) ? ' ' + trackName(st.track_id) : '')),
+    kvItem(t('weekly.now.window'), fmtTime(st.week_start) + ' → ' + fmtTime(st.week_end)),
+    kvItem(t('weekly.now.left'), spanText(st.week_end - st.now)),
+    kvItem(t('weekly.now.week'), '#' + st.week_index),
+    kvItem(t('weekly.now.entries'), fmtNum(st.entries) + ' · ' + t('weekly.now.fake') + ' ' + fmtNum(st.fake)),
+    kvItem(t('weekly.now.rules'), fmtNum(st.retry_limit) + ' × / ' + spanText(st.cooldown_seconds)),
+    kvItem(t('weekly.now.base'), fmtNum(st.base_ms) + ' ms'),
+    kvItem(t('weekly.now.days'), t('app.days', { n: st.window_days })));
+  nodes.push(el('section', { class: 'card' },
+    el('div', { class: 'card-head' }, el('h2', { class: 'grow', text: t('weekly.now.title') }), expBadge),
+    el('div', { class: 'card-body' },
+      nowKv,
+      el('p', { class: 'lead p-warn', text: t('weekly.now.warn') }),
+      wSub('weekly.now.playersTitle',
+        (st.players || []).length
+          ? table([
+              { label: t('weekly.col.profile'), k: 'profile', render: r => el('span', { class: 'mono', text: String(r.profile).slice(0, 12) }) },
+              { label: t('weekly.col.used'), k: 'used', cls: 'r' },
+              { label: t('weekly.col.left'), k: 'left', cls: 'r' },
+              { label: t('weekly.col.last'), k: 'last_attempt', render: r => (r.last_attempt ? fmtTime(r.last_attempt) : dash()) },
+              { label: t('weekly.col.week'), k: 'this_week', render: r => el('span', { class: 'badge' + (r.this_week ? ' ok' : ''), text: r.this_week ? t('weekly.col.thisWeek') : t('weekly.col.oldWeek') }) },
+            ], st.players)
+          : el('div', { class: 'empty', text: t('weekly.now.noPlayers') })),
+      wSub('weekly.now.auditTitle',
+        (data.audit || []).length
+          ? table([
+              { label: t('weekly.col.time'), k: 'at', render: r => fmtTime(r.at) },
+              { label: t('weekly.col.param'), k: 'path', render: r => {
+                  const k = (r.path || []).slice(-1)[0];
+                  return (WEEKLY_FIELD[k] ? t(WEEKLY_FIELD[k]) : String(k)) + (r.kind === 'undo' ? ' · ' + t('weekly.kindUndo') : '');
+                } },
+              { label: t('weekly.col.change'), k: 'after', render: r => {
+                  const k = (r.path || []).slice(-1)[0];
+                  return (r.existed === false ? '—' : weeklyVal(k, r.before)) + ' → ' + weeklyVal(k, r.after);
+                } },
+              { label: '', cls: 'act', render: r => el('button', { class: 'btn tiny', type: 'button', text: t('weekly.undoBtn'),
+                  onclick: () => guarded(async () => {
+                    await post('/__api/admin/undo', { id: r.id });
+                    toast(t('weekly.undone'), { kind: 'good', timeout: 2600 });
+                    show('weekly');
+                  }) }) },
+            ], data.audit)
+          : el('div', { class: 'empty', text: t('weekly.now.noAudit') })))));
+
+  // ── ② 时间：窗口长度 + 翻周。翻周靠 week_offset —— 服务端按周给玩家次数分桶，
+  //     所以周号一变，本周次数自然从头开始，不用去清内存里的计数。
+  const preview = el('div', { class: 'hint' });
+  function weekPreview() {
+    const span = Math.max(1, Math.min(30, Number(draft.window_days) || WEEKLY_DAYS)) * 86400;
+    const off = Number(draft.week_offset) || 0;
+    const start = Math.floor(st.now / span) * span + off * span;
+    preview.textContent = t('weekly.time.preview') + ' ' + fmtTime(start) + ' → ' + fmtTime(start + span);
+  }
+  const daysIn = numBox(draft.window_days, v => {
+    draft.window_days = v;
+    expBadge.hidden = Number(v) === WEEKLY_DAYS;
+    weekPreview();
+  }, { min: 1, max: 30 });
+  const offBtns = [-1, 0, 1].map(off => el('button', {
+    type: 'button', 'aria-pressed': String(Number(cfg.week_offset) === off),
+    text: off < 0 ? t('weekly.time.prev') : (off > 0 ? t('weekly.time.next') : t('weekly.time.this')),
+    onclick: () => {
+      draft.week_offset = off;
+      offBtns.forEach((b, i) => b.setAttribute('aria-pressed', String(i === off + 1)));
+      weekPreview();
+    },
+  }));
+  const resetBtn = el('button', { class: 'btn danger', type: 'button', text: t('weekly.time.reset'),
+    onclick: () => guarded(async () => {
+      const yes = await confirmDialog({ title: t('weekly.time.reset'), body: t('weekly.time.resetBody'),
+                                        okLabel: t('weekly.time.reset') });
+      if (!yes) return;
+      const r = await post('/__api/admin/weekly', { fields: { week_offset: Number(cfg.week_offset) + 1 } });
+      const id = ((r.applied || [])[0] || {}).audit;
+      const opts = { kind: 'good' };
+      if (id) opts.action = { label: t('weekly.undo'), run: () => guarded(async () => {
+        await post('/__api/admin/undo', { id }); show('weekly');
+      }) };
+      toast(t('weekly.time.resetDone', { n: r.config.week_offset }), opts);
+      show('weekly');
+    }) });
+  weekPreview();
+  nodes.push(wCard('weekly.time.title', t('weekly.time.hint'),
+    fRow('weekly.f.days', [daysIn, expBadge, el('span', { class: 'hint', text: t('weekly.f.daysHint') })], null),
+    fRow('weekly.f.offset', [el('div', { class: 'seg' }, offBtns), preview], t('weekly.f.offsetHint')),
+    fRow('weekly.time.reset', resetBtn, t('weekly.time.resetHint')),
+    cardFoot(el('button', { class: 'btn primary', type: 'button', text: t('weekly.save'),
+      onclick: () => saveFields(diffFields(['window_days', 'week_offset']), 'weekly.saved') }))));
+
+  // ── ③ 挑战规则：每周次数 + 冷却。冷却用秒输入 —— 分钟取整会造成玩家看不见的漂移。
+  const coolHint = el('span', { class: 'hint', text: spanText(draft.cooldown_seconds) });
+  const coolIn = numBox(draft.cooldown_seconds, v => {
+    draft.cooldown_seconds = v;
+    coolHint.textContent = spanText(v);
+  }, { min: 0, max: 30 * 24 * 3600 });
+  const coolPresets = [[60, 'weekly.rules.p1'], [600, 'weekly.rules.p10'],
+                       [3600, 'weekly.rules.p1h'], [21600, 'weekly.rules.p6h']]
+    .map(p => el('button', { class: 'btn tiny', type: 'button', text: t(p[1]), onclick: () => {
+      draft.cooldown_seconds = p[0];
+      coolIn.value = String(p[0]);
+      coolHint.textContent = spanText(p[0]);
+    } }));
+  nodes.push(wCard('weekly.rules.title', null,
+    fRow('weekly.f.retry', [numBox(draft.left_retry_times, v => { draft.left_retry_times = v; }, { min: 0, max: 99 }),
+                            el('span', { class: 'hint', text: t('weekly.rules.retryHint') })], null),
+    fRow('weekly.f.cool', [coolIn, ...coolPresets, coolHint], null),
+    el('p', { class: 'hint', text: t('weekly.rules.note') }),
+    cardFoot(el('button', { class: 'btn primary', type: 'button', text: t('weekly.save'),
+      onclick: () => saveFields(diffFields(['left_retry_times', 'cooldown_seconds']), 'weekly.saved') }))));
+
+  // ── ④ 赛道与对手：赛道下拉来自 server/admin/items.json 的 levels 段（客户端原表），
+  //     没有那段就退化成手填编号。
+  const trHint = el('span', { class: 'hint' });
+  function updTrack() {
+    const nm = trackName(draft.track_id);
+    trHint.textContent = nm ? '#' + draft.track_id + ' ' + nm : t('weekly.track.unknown');
+  }
+  const dl = el('datalist', { id: 'tfTracks' });
+  tracks.forEach(x => dl.appendChild(el('option', { value: String(x.id),
+    text: (LANG === 'cn' ? x.name_cn : x.name) || x.name || '' })));
+  const trackIn = numBox(draft.track_id, v => { draft.track_id = v; updTrack(); },
+                         { min: 1, max: 1000000, list: 'tfTracks' });
+  updTrack();
+  nodes.push(wCard('weekly.track.title', null,
+    fRow('weekly.f.track', [trackIn, dl, trHint], tracks.length ? null : t('weekly.track.noCatalog')),
+    fRow('weekly.f.board', [numBox(draft.leaderboard_id, v => { draft.leaderboard_id = v; }, { min: 0, max: 0xFFFFFF }),
+                            el('span', { class: 'hint', text: t('weekly.track.boardLive') + ' ' + fmtNum(st.board) })], null),
+    fRow('weekly.f.fake', [numBox(draft.fake_field, v => { draft.fake_field = v; }, { min: 0, max: 500 }),
+                           el('span', { class: 'hint', text: t('weekly.track.fakeHint') + ' ' + fmtNum(st.fake) })], null),
+    fRow('weekly.f.base', [numBox(draft.fake_field_base_ms, v => { draft.fake_field_base_ms = v; }, { min: 0, max: 3600000 }),
+                           el('span', { class: 'hint', text: t('weekly.track.baseLive') + ' ' + fmtNum(st.base_ms) + ' ms' })], null),
+    fRow('weekly.f.fast', [numBox(draft.fake_field_fast_pct, v => { draft.fake_field_fast_pct = v; }, { min: 0, max: 50 }),
+                           el('span', { class: 'hint', text: t('weekly.track.pctHint') })], null),
+    fRow('weekly.f.slow', [numBox(draft.fake_field_slow_pct, v => { draft.fake_field_slow_pct = v; }, { min: 0, max: 200 }),
+                           el('span', { class: 'hint', text: t('weekly.track.pctHint') })], null),
+    el('p', { class: 'hint', text: t('weekly.track.note') }),
+    cardFoot(el('button', { class: 'btn primary', type: 'button', text: t('weekly.save'),
+      onclick: () => saveFields(diffFields(['track_id', 'leaderboard_id', 'fake_field', 'fake_field_base_ms',
+        'fake_field_fast_pct', 'fake_field_slow_pct']), 'weekly.saved') }))));
+
+  // ── ⑤ 奖励池子：服务端只下发池子编号 1..15，具体给什么在客户端自己的奖励表里。
+  //     ★ 客户端只在进入午夜杯时读一次 ⇒ 改完要让玩家退出重进（不是重启游戏）。
+  const picked = {};
+  WEEKLY_TIERS.forEach(ti => { picked[ti] = new Set(((cfg.reward_ids || {})[ti]) || []); });
+  const tierRows = WEEKLY_TIERS.map(ti => {
+    const note = el('span', { class: 'hint' });
+    const setNote = () => { note.textContent = picked[ti].size ? '' : t('weekly.rewards.builtin'); };
+    const chips = [];
+    for (let n = 1; n <= 15; n++) {
+      const b = el('button', { class: 'chip', type: 'button', text: String(n),
+        'aria-pressed': String(picked[ti].has(n)),
+        onclick: () => {
+          if (picked[ti].has(n)) picked[ti].delete(n); else picked[ti].add(n);
+          b.setAttribute('aria-pressed', String(picked[ti].has(n)));
+          setNote();
+        } });
+      chips.push(b);
+    }
+    setNote();
+    return el('div', { class: 'tierrow' },
+      el('div', { class: 'tiername' },
+        el('div', { class: 'fk', text: t(TIER_LABEL[ti]) }),
+        note),
+      el('div', { class: 'chips' }, chips));
+  });
+  const rewardMap = () => {
+    const out = {};
+    WEEKLY_TIERS.forEach(ti => { if (picked[ti].size) out[ti] = Array.from(picked[ti]).sort((a, b) => a - b); });
+    return out;
+  };
+  nodes.push(wCard('weekly.rewards.title', null,
+    fRow('weekly.f.slots', [numBox(draft.reward_slots, v => { draft.reward_slots = v; }, { min: 1, max: 8 }),
+                            el('span', { class: 'hint', text: t('weekly.rewards.slotsHint') })], null),
+    el('p', { class: 'hint', text: t('weekly.rewards.how') }),
+    ...tierRows,
+    el('p', { class: 'hint', text: t('weekly.rewards.reentry') }),
+    cardFoot(el('button', { class: 'btn primary', type: 'button', text: t('weekly.save'),
+      onclick: () => {
+        const fields = diffFields(['reward_slots']);
+        if (JSON.stringify(rewardMap()) !== JSON.stringify(cfg.reward_ids || {})) fields.reward_ids = rewardMap();
+        return saveFields(fields, 'weekly.saved');
+      } }))));
+
+  // ── ⑥ 模板：整页参数快照。存/改名/复制/删除**不进审计**（没生效就不该进改动记录），
+  //     只有「套用」会按键写审计 ⇒ 套错了能一条条撤。
+  const tplName = el('input', { type: 'text', maxlength: '40', value: '',
+                                placeholder: t('weekly.templates.nameHint') });
+  const curKv = el('div', { class: 'kv' },
+    Object.keys(WEEKLY_FIELD).map(k => kvItem(t(WEEKLY_FIELD[k]), weeklyVal(k, cfg[k]))));
+  async function tplPost(body, okKey) {
+    return guarded(async () => {
+      const r = await post('/__api/admin/templates', body);
+      toast(t(okKey), { kind: 'good', timeout: 2600 });
+      show('weekly');
+      return r;
+    });
+  }
+  const tplRows = (data.templates || []).map(tp => el('div', { class: 'tplrow' },
+    el('div', { class: 'grow' },
+      el('div', { class: 'tname', text: tp.name }),
+      el('div', { class: 'hint', text: fmtTime(tp.saved_at) })),
+    el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.applyAll'),
+      onclick: () => guarded(async () => {
+        const r = await post('/__api/admin/templates', { page: 'weekly', action: 'apply', name: tp.name, parts: 'all' });
+        const sum = (r.applied || []).map(a => (WEEKLY_FIELD[a.key] ? t(WEEKLY_FIELD[a.key]) : a.key) + ' → ' + weeklyVal(a.key, a.after)).join('　');
+        const ids = (r.applied || []).map(a => a.audit).filter(Boolean);
+        const opts = { kind: 'good' };
+        if (ids.length) opts.action = { label: t('weekly.undo'), run: () => guarded(async () => {
+          for (const id of ids) await post('/__api/admin/undo', { id }); show('weekly');
+        }) };
+        toast(t('weekly.templates.applied', { name: tp.name }) + (sum ? ' · ' + sum : ''), opts);
+        show('weekly');
+      }) }),
+    el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.applyRewards'),
+      onclick: () => guarded(async () => {
+        const r = await post('/__api/admin/templates', { page: 'weekly', action: 'apply', name: tp.name, parts: 'rewards' });
+        toast(t('weekly.templates.applied', { name: tp.name }) + ' · ' +
+              weeklyVal('reward_ids', (r.config || {}).reward_ids), { kind: 'good', timeout: 4000 });
+        show('weekly');
+      }) }),
+    el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.rename'),
+      onclick: () => guarded(async () => {
+        const to = await confirmDialog({ title: t('weekly.templates.rename'), okLabel: t('weekly.templates.rename'),
+                                         input: { label: t('weekly.templates.name'), value: tp.name } });
+        if (!to || String(to).trim() === tp.name) return;
+        await tplPost({ page: 'weekly', action: 'rename', name: tp.name, new_name: String(to).trim() },
+                      'weekly.templates.renamed');
+      }) }),
+    el('button', { class: 'btn tiny', type: 'button', text: t('weekly.templates.copy'),
+      onclick: () => guarded(async () => {
+        const to = await confirmDialog({ title: t('weekly.templates.copy'), okLabel: t('weekly.templates.copy'),
+                                         input: { label: t('weekly.templates.name'),
+                                                  value: tp.name + t('weekly.templates.copySuffix') } });
+        if (!to || !String(to).trim()) return;
+        await tplPost({ page: 'weekly', action: 'copy', name: tp.name, new_name: String(to).trim() },
+                      'weekly.templates.copied');
+      }) }),
+    el('button', { class: 'btn tiny danger', type: 'button', text: t('weekly.templates.delete'),
+      onclick: () => guarded(async () => {
+        const yes = await confirmDialog({ title: t('weekly.templates.delete'), okLabel: t('weekly.templates.delete'),
+                                          body: t('weekly.templates.deleteBody', { name: tp.name }) });
+        if (!yes) return;
+        await tplPost({ page: 'weekly', action: 'delete', name: tp.name }, 'weekly.templates.deleted');
+      }) })));
+
+  nodes.push(wCard('weekly.templates.title', null,
+    wSub('weekly.templates.currentTitle',
+      curKv,
+      el('p', { class: 'hint', text: t('weekly.templates.currentHint') })),
+    wSub('weekly.templates.saveTitle',
+      fRow('weekly.templates.name', [tplName,
+        el('button', { class: 'btn primary', type: 'button', text: t('weekly.templates.save'),
+          onclick: () => guarded(async () => {
+            const name = String(tplName.value || '').trim();
+            if (!name) { toast(t('weekly.templates.needName'), { kind: 'warn', timeout: 2600 }); return; }
+            await tplPost({ page: 'weekly', action: 'save', name }, 'weekly.templates.saved');
+          }) })], t('weekly.templates.saveHint'))),
+    wSub('weekly.templates.listTitle',
+      tplRows.length ? el('div', null, ...tplRows) : el('div', { class: 'empty', text: t('weekly.templates.none') }))));
+
   return nodes;
 }
 

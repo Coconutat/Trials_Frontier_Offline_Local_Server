@@ -259,6 +259,9 @@ _TF_CONFIG_DEFAULTS = {
         # 按档位写死池子（可选）。空 = 内置规则（第 i 档 → Reward_{v*5+i+1}）。
         # 例：{"platinum": [3, 8, 13]} = 最高奖改发"整台车×2"那三套池子。
         "reward_ids": {},
+        # 一届（=一周）的长度，天。7 = 原版；★ 非 7 天**没有真机验证过**（客户端把窗口
+        # 时间戳写进存档物品 1165/1166），后台界面要如实标注「实验性」。
+        "window_days": 7,
     },
     "appcfg": {
         # `h_app_configuration` 发给 Java/DLC 的基址：请求 Host 是回环时代替成它。
@@ -326,8 +329,11 @@ def cfg_int(*path, **kw):
         return int(default)
 
 
-def cfg_set(path, value):
-    """就地改配置并落盘——留给未来的 WebUI。path 是键列表。"""
+def cfg_set(path, value, kind="config"):
+    """就地改配置并落盘——WebUI 的运营参数页就靠它。path 是键列表。
+
+    `kind` 只影响审计记录里的分类（"weekly" / "pvp" / "undo" …），界面按它筛"最近改动"。
+    """
     if not isinstance(path, (list, tuple)) or not path:
         raise ValueError("path 不能为空")
     path = [str(k) for k in path]
@@ -346,6 +352,8 @@ def cfg_set(path, value):
                 nxt = {}
                 node[key] = nxt
             node = nxt
+        existed = path[-1] in node
+        before = node.get(path[-1])
         node[path[-1]] = value
         os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
         tmp = CONFIG_PATH + ".tmp"
@@ -355,7 +363,139 @@ def cfg_set(path, value):
         os.replace(tmp, CONFIG_PATH)
         _CONFIG_CACHE["mtime"] = None      # 下次访问强制重读
         _CONFIG_CACHE["data"] = None
+    _audit_append(kind, path, before, existed, value)
     return value
+
+
+def cfg_unset(path, kind="config"):
+    """删掉一个配置键，让代码里的默认值重新生效（撤销"这个键本来是新增的"）。
+
+    -> (before, existed)；键本来就不存在时什么都不写。
+    """
+    if not isinstance(path, (list, tuple)) or not path:
+        raise ValueError("path 不能为空")
+    path = [str(k) for k in path]
+    with _CONFIG_LOCK:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            if not isinstance(raw, dict):
+                raw = {}
+        except Exception:
+            raw = {}
+        node = raw
+        for key in path[:-1]:
+            nxt = node.get(key)
+            if not isinstance(nxt, dict):
+                return None, False
+            node = nxt
+        if path[-1] not in node:
+            return None, False
+        before = node.pop(path[-1])
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(raw, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+        os.replace(tmp, CONFIG_PATH)
+        _CONFIG_CACHE["mtime"] = None
+        _CONFIG_CACHE["data"] = None
+    _audit_append(kind, path, before, True, None)
+    return before, True
+
+
+# ------------------------------------------------------------ 运营参数的审计与撤销
+# ★ 为什么需要它：运营参数是"即改即生效"的（`tf_config()` 按 mtime 热读），改错一个数
+#   立刻影响线上玩家。所以每次写入都追加一条 `server/data/config_audit.jsonl`，
+#   界面上的「最近改动」直接读它，每行一个"撤销"（= 把 before 写回去）。
+AUDIT_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "config_audit.jsonl")
+AUDIT_KEEP = 300
+
+
+def _audit_append(kind, path, before, existed, after):
+    """追加一条审计记录。**审计写不进去也绝不能让配置改动失败**（只打日志）。"""
+    rec = {
+        "id": "%d-%04x" % (int(time.time() * 1000), random.getrandbits(16)),
+        "at": int(time.time()),
+        "at_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": kind,
+        "path": [str(k) for k in path],
+        "before": before,
+        "existed": bool(existed),
+        "after": after,
+    }
+    try:
+        lines = []
+        if os.path.exists(AUDIT_PATH):
+            with open(AUDIT_PATH, "r", encoding="utf-8") as fp:
+                lines = [ln for ln in fp.read().splitlines() if ln.strip()]
+        lines = (lines + [json.dumps(rec, ensure_ascii=False)])[-AUDIT_KEEP:]
+        os.makedirs(os.path.dirname(AUDIT_PATH), exist_ok=True)
+        tmp = AUDIT_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            fp.write("\n".join(lines) + "\n")
+        os.replace(tmp, AUDIT_PATH)
+    except Exception as exc:
+        print("[cfg] 审计写不进去（忽略）：%r" % (exc,), flush=True)
+    return rec
+
+
+def audit_log(limit=20, kind=None):
+    """最近的参数改动，**新的在前**。kind 用来按页筛（"weekly" / "pvp" / "undo"）。"""
+    out = []
+    try:
+        with open(AUDIT_PATH, "r", encoding="utf-8") as fp:
+            for ln in fp:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                if kind and rec.get("kind") != kind:
+                    continue
+                out.append(rec)
+    except OSError:
+        return []
+    out.reverse()
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 20
+    return out[:max(0, limit)]
+
+
+def admin_undo(audit_id):
+    """按审计记录撤销一次参数改动 -> (结果, 错误)。
+
+    记录里带 `existed`：原来是"新增的键"就把它删掉（让代码默认值重新生效），
+    否则把 `before` 写回去。撤销本身也会记一条审计（kind="undo"），所以：
+      · 对**同一条**记录再撤一次是幂等的（还是写回同一个 before）；
+      · 想来回切就撤销那条 undo 记录（它的 before 就是被撤掉的值）。
+    """
+    if not audit_id:
+        return None, "bad-id"
+    rec = None
+    for item in audit_log(AUDIT_KEEP):
+        if item.get("id") == audit_id:
+            rec = item
+            break
+    if rec is None:
+        return None, "not-found"
+    path = rec.get("path") or []
+    if not path:
+        return None, "bad-record"
+    try:
+        if rec.get("existed"):
+            cfg_set(path, rec.get("before"), kind="undo")
+        else:
+            cfg_unset(path, kind="undo")
+    except Exception as exc:
+        return None, repr(exc)
+    return {"undo_of": audit_id, "path": path, "restored": rec.get("before"),
+            "kind": rec.get("kind")}, None
 
 
 # ★ Windows 控制台默认是 GBK，而二进制上传（幽灵 payload）被解码成含 U+FFFD 的
@@ -1536,6 +1676,16 @@ def h_match_robot(path, query, body, headers):
 _WEEK_SECONDS = 7 * 24 * 3600
 
 
+def _week_span():
+    """一届午夜杯的长度（秒）。`weekly.window_days` 可改，默认 7 天（= `_WEEK_SECONDS`）。
+
+    ★ 实验性：客户端把窗口时间戳写进存档物品 1165/1166，非 7 天的窗口**没有真机验证过**，
+      所以界面必须如实标注；改它会让周号与窗口边界一起跳变（榜按周号分桶）。
+    """
+    days = cfg_int("weekly", "window_days", default=7) or 7
+    return max(1, min(30, days)) * 24 * 3600
+
+
 def _week_index():
     """-> (week_start, week_index)。basic_info 与 config 必须给出同一个周，
     否则客户端会认为「配置不属于当前周」而拒绝开赛。
@@ -1543,9 +1693,11 @@ def _week_index():
     ★ `weekly.week_offset`（默认 0）是**模拟/测试**用的：设成 1 就等于"这一周已经结束、
       服务器翻到下一周" —— 客户端于是走 `updateStateEv` 的 `w9 != w10 && lb > 0` 分支
       → state 4 → 上一周的结算画面（敲奖杯 / 发奖）。真机验证奖励流程就靠它。
+      WebUI 上的「立刻结束本届 / 开新一届」就是把它 +1（可撤销）。
     """
-    week = int(time.time()) // _WEEK_SECONDS + cfg_int("weekly", "week_offset", default=0)
-    week_start = week * _WEEK_SECONDS
+    span = _week_span()
+    week = int(time.time()) // span + cfg_int("weekly", "week_offset", default=0)
+    week_start = week * span
     return week_start, week & 0xFFFFFF
 
 
@@ -1612,7 +1764,7 @@ def _weekly_joined(profile_id):
     if not row:
         return None
     try:
-        week = (int(row.get("updated") or 0) // _WEEK_SECONDS) & 0xFFFFFF
+        week = (int(row.get("updated") or 0) // _week_span()) & 0xFFFFFF
     except (TypeError, ValueError):
         week = 0
     return (week or _week_index()[1]), _weekly_leaderboard_id()
@@ -1695,7 +1847,7 @@ def h_liveevents_basic_info(path, query, body, headers):
     payload = {
         "week_index": week_index,
         "week_start": week_start,
-        "weeK_end": week_start + _WEEK_SECONDS,   # ★大写 K
+        "weeK_end": week_start + _week_span(),   # ★大写 K
         "last_participated_week": last,
         "last_participated_week_lb": last_lb,
         # 次数是服务端权威的（`start_race` 扣一次，见 _weekly_attempt_state）：
@@ -1704,7 +1856,7 @@ def h_liveevents_basic_info(path, query, body, headers):
         "left_retry_times": _weekly_left(pid),
         # 午夜杯 = 周赛：窗口 = 本周（week_start ~ week_end），一周内恒定。
         "midnight_circuit_start_time": week_start,
-        "midnight_circuit_end_time": week_start + _WEEK_SECONDS,
+        "midnight_circuit_end_time": week_start + _week_span(),
         "last_attempt_time": _weekly_attempt_state(pid)[3],
     }
     print("[liveevent] basic_info week_index=%s last=%d lb=%d" %
@@ -1741,14 +1893,14 @@ def h_liveevents_config(path, query, body, headers):
         req_week = 0
     if req_week > 0 and req_week != week_index:
         week_index = req_week
-        week_start = req_week * _WEEK_SECONDS
+        week_start = req_week * _week_span()
         print("[liveevent] config 要的是第 %d 周（非本周）—— 按那一周回" % req_week,
               flush=True)
     payload = {
         "week_index": week_index,
         "week_settings": {
             "week_start": week_start,
-            "week_end": week_start + _WEEK_SECONDS,
+            "week_end": week_start + _week_span(),
             # ★ 午夜杯排行榜的数字 id（客户端自己 id→榜名，见 _weekly_leaderboard_id）。
             #   发 0 等于「没有榜」：榜区空白 + TOP 1% / 周奖杯一起退化。默认 0 = 本周赛道。
             "week_leaderboard": _weekly_leaderboard_id(),
@@ -2057,6 +2209,494 @@ def _reward_pool_ids(name, tier, base, slots):
     if not ids:
         return [((base + k) % 3) * 5 + tier + 1 for k in range(slots)]
     return [ids[(base + k) % len(ids)] for k in range(slots)]
+
+
+# ============================================ 午夜杯 · 后台运营参数（/__api/admin/weekly）
+# 这一段只服务后台的「午夜杯」页：读一份"当前生效值"、按字段批量改（改一个键记一条审计、
+# 界面上一键撤销）、整页参数的模板存取。
+# ★ 客户端契约一个字都没改：动的仍然只有 `weekly.*` 那几个键，真正下发给客户端的东西在
+#   `h_liveevents_basic_info` / `h_liveevents_reward_config` 里 —— 客户端**每进一次模式**
+#   才拉一次 reward_config，所以改完要让玩家退出午夜杯再进来。
+_WEEKLY_KEYS = {
+    "track_id": (1, 10 ** 6),
+    "leaderboard_id": (0, 0xFFFFFF),
+    "fake_field": (0, 500),
+    "fake_field_base_ms": (0, 3600 * 1000),
+    "fake_field_fast_pct": (0, 50),
+    "fake_field_slow_pct": (0, 200),
+    "left_retry_times": (0, 99),
+    "cooldown_seconds": (0, 30 * 24 * 3600),
+    "week_offset": (-520, 520),
+    "reward_slots": (1, 8),
+    "window_days": (1, 30),
+}
+# 键不在配置文件里时界面上显示什么（必须与 _TF_CONFIG_DEFAULTS["weekly"] 一致）。
+_WEEKLY_FALLBACK = {
+    "track_id": 1041, "leaderboard_id": 0, "fake_field": 0, "fake_field_base_ms": 0,
+    "fake_field_fast_pct": 3, "fake_field_slow_pct": 25, "left_retry_times": 3,
+    "cooldown_seconds": 3600, "week_offset": 0, "reward_slots": 1, "window_days": 7,
+}
+# 「只套用奖励方案」套的就是这两个键。
+_WEEKLY_REWARD_KEYS = ("reward_slots", "reward_ids")
+
+_TRACK_CATALOG_PATH = os.path.join(HERE, "admin", "items.json")
+_TRACK_CACHE = {"mtime": None, "rows": []}
+
+
+def _coerce_int(key, raw):
+    """界面来的数字 -> int。**不悄悄退回默认值**：填错了必须报错，不能装作改成了。"""
+    if isinstance(raw, bool):
+        raise ValueError(key)
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        if raw != int(raw):
+            raise ValueError(key)
+        return int(raw)
+    txt = str(raw).strip()
+    if not re.fullmatch(r"[+-]?\d{1,12}", txt):
+        raise ValueError(key)
+    return int(txt, 10)
+
+
+def _weekly_reward_ids(raw):
+    """校验并规整 `weekly.reward_ids`（档位 -> 池子编号数组，编号 1..15）。-> (值, 错误码)。"""
+    out = {}
+    if raw is None or raw == {} or raw == []:
+        return {}, None
+    if not isinstance(raw, dict):
+        return None, "bad-reward-ids"
+    for name, pool in raw.items():
+        name = str(name)
+        if name not in _WEEKLY_TROPHIES:
+            return None, "bad-tier:%s" % name
+        if not isinstance(pool, list):
+            return None, "bad-pool:%s" % name
+        ids = []
+        for item in pool:
+            try:
+                val = int(item)
+            except (TypeError, ValueError):
+                return None, "bad-pool:%s" % name
+            if not 1 <= val <= 15:
+                return None, "bad-pool:%s" % name
+            ids.append(val)
+        if ids:
+            out[name] = ids[:32]
+    return out, None
+
+
+def weekly_values():
+    """午夜杯页的「当前生效值」：配置里有什么用什么，缺的补代码默认值。只读。"""
+    vals = {}
+    for key, (lo, hi) in _WEEKLY_KEYS.items():
+        raw = cfg("weekly", key, default=None)
+        if raw is None:
+            vals[key] = _WEEKLY_FALLBACK[key]
+            continue
+        try:
+            val = _coerce_int(key, raw)
+        except (TypeError, ValueError):
+            val = _WEEKLY_FALLBACK[key]
+        vals[key] = max(lo, min(hi, val))
+    ids, err = _weekly_reward_ids(cfg("weekly", "reward_ids", default=None))
+    vals["reward_ids"] = {} if err else ids
+    return vals
+
+
+def _latest_audit_id(path):
+    """刚写进去的那条审计的 id（界面靠它给「撤销」按钮）。找不到就 None。"""
+    want = [str(k) for k in path]
+    for rec in audit_log(AUDIT_KEEP):
+        if rec.get("path") == want:
+            return rec.get("id")
+    return None
+
+
+def audit_for(prefix, limit=20):
+    """某一页管着的键最近被改了些什么（按 path 前缀筛；撤销记录也算进来）。"""
+    pre = [str(k) for k in prefix]
+    out = []
+    for rec in audit_log(AUDIT_KEEP):
+        if (rec.get("path") or [])[:len(pre)] == pre:
+            out.append(rec)
+            if len(out) >= max(1, int(limit)):
+                break
+    return out
+
+
+def admin_weekly_apply(fields):
+    """午夜杯页的写入：`fields = {键: 值}`，值为 null ⇒ 删掉这个键（回到代码默认值）。
+
+    -> (结果, 错误码)。**先全部校验、再动手**：宁可一个都不改，也不要改一半留一半
+    （一次页面保存十几个字段，改一半最难解释）。
+    错误码：bad-request / unknown-key:<k> / bad-value:<k> / range:<k>:<lo>-<hi> /
+           bad-reward-ids / bad-tier:<t> / bad-pool:<t>（_param_message 翻成中文）。
+    """
+    if not isinstance(fields, dict) or len(fields) > 40:
+        return None, "bad-request"
+    ops = []
+    for raw_key, raw_val in fields.items():
+        key = str(raw_key)
+        if key == "reward_ids":
+            if raw_val is None:
+                ops.append((["weekly", key], None, key))
+                continue
+            ids, err = _weekly_reward_ids(raw_val)
+            if err:
+                return None, err
+            ops.append((["weekly", key], ids, key))
+            continue
+        if key not in _WEEKLY_KEYS:
+            return None, "unknown-key:%s" % key
+        lo, hi = _WEEKLY_KEYS[key]
+        if raw_val is None:
+            ops.append((["weekly", key], None, key))
+            continue
+        try:
+            val = _coerce_int(key, raw_val)
+        except (TypeError, ValueError):
+            return None, "bad-value:%s" % key
+        if not lo <= val <= hi:
+            return None, "range:%s:%d-%d" % (key, lo, hi)
+        ops.append((["weekly", key], val, key))
+    applied = []
+    for path, val, key in ops:
+        if val is None:
+            before, existed = cfg_unset(path, kind="weekly")
+            if not existed:               # 本来就是默认值，没什么可撤的
+                applied.append({"key": key, "before": None, "after": None, "audit": None})
+                continue
+        else:
+            before = cfg("weekly", key, default=None)
+            cfg_set(path, val, kind="weekly")
+        applied.append({"key": key, "before": before, "after": val,
+                        "audit": _latest_audit_id(path)})
+    return {"applied": applied, "values": weekly_values()}, None
+
+
+def track_catalog():
+    """赛道 id -> 名字（`server/admin/items.json` 的 `levels` 段）。
+
+    后台赛道下拉靠它；**没有 `levels` 段就返回空表**（前端退化成手填数字，绝不猜名字）。
+    """
+    try:
+        stamp = os.path.getmtime(_TRACK_CATALOG_PATH)
+    except OSError:
+        return []
+    if _TRACK_CACHE["mtime"] == stamp:
+        return _TRACK_CACHE["rows"]
+    rows = []
+    try:
+        with open(_TRACK_CATALOG_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        for raw_id, node in (data.get("levels") or {}).items():
+            if not isinstance(node, dict):
+                continue
+            try:
+                lid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            rows.append({"id": lid,
+                         "name": node.get("en") or node.get("cn") or "",
+                         "name_cn": node.get("cn") or node.get("en") or ""})
+        rows.sort(key=lambda r: r["id"])
+    except (OSError, ValueError, AttributeError):
+        return []
+    if not rows:
+        return []                          # 没建表就别缓存"空"，建完表立刻能认出来
+    _TRACK_CACHE["mtime"] = stamp
+    _TRACK_CACHE["rows"] = rows
+    return rows
+
+
+def admin_weekly_status():
+    """午夜杯「现状卡」：本周是哪一周、榜上有多少行、谁还能跑几次。全部只读。"""
+    week_start, week = _week_index()
+    span = _week_span()
+    track = _weekly_track_id()
+    board = "track%d" % track
+    _, total = _stored_entries(board, None, keep_total=True)
+    fake = _weekly_fake_field().get(board) or {}
+    limit = _weekly_retry_limit()
+    players = []
+    for pid, st in list(_WEEKLY_ATTEMPTS.items())[:500]:
+        if not isinstance(st, (list, tuple)) or len(st) < 4:
+            continue
+        this_week = st[0] == week
+        players.append({
+            "profile": str(pid),
+            "used": int(st[1]),
+            "left": max(0, limit + int(st[2]) - int(st[1])) if this_week else limit,
+            "last_attempt": int(st[3]),
+            "this_week": this_week,
+        })
+    players.sort(key=lambda p: (-p["last_attempt"], p["profile"]))
+    return {
+        "week_index": week,
+        "week_start": week_start,
+        "week_end": week_start + span,
+        "now": int(time.time()),
+        "window_days": span // 86400,
+        # 非 7 天 = 实验性（客户端把窗口写进存档物品 1165/1166，只有 7 天真机验过）。
+        "experimental": span != _WEEK_SECONDS,
+        "track_id": track,
+        "board": board,
+        "leaderboard_id": _weekly_leaderboard_id(),
+        "base_ms": (cfg_int("weekly", "fake_field_base_ms", default=0)
+                    or _weekly_fake_base_ms(track)),
+        "entries": total,
+        "fake": len(fake),
+        "players": players[:50],
+        "rotation": [{"profile": str(p), "next_base": b}
+                     for p, b in list(_REWARD_ROTATION.items())[:50]],
+        "retry_limit": limit,
+        "cooldown_seconds": _weekly_cooldown_seconds(),
+    }
+
+
+# ==================================================== 参数模板（午夜杯/碉堡共用一份文件）
+# 模板 = 整页参数的**快照**，存在服务端文件里（不落进 tf_config.json）。
+# 设计取舍：
+#   · 存 / 改名 / 删**不进审计** —— 那只是草稿，不影响线上玩家；
+#   · 只有「套用」才逐个键写配置、逐键记审计（于是套错了还能一条条撤回来）；
+#   · 一个文件存两页：`{"weekly": {名字: {…}}, "pvp": {…}}`（见 m04000 的确认）。
+TEMPLATES_PATH = os.path.join(os.path.dirname(CONFIG_PATH), "templates.json")
+_TEMPLATE_NAME_MAX = 40
+
+
+def _template_name(raw):
+    """模板名 -> (干净的名字, 错误码)。挡住控制字符：名字要进界面和日志。"""
+    if not isinstance(raw, str):
+        return None, "bad-name"
+    name = raw.replace("\r", " ").replace("\n", " ").strip()
+    if not name or len(name) > _TEMPLATE_NAME_MAX:
+        return None, "bad-name"
+    if any(ord(ch) < 32 for ch in name):
+        return None, "bad-name"
+    return name, None
+
+
+def _templates_read():
+    """-> {页: {名字: {saved_at, saved_iso, values}}}；文件坏了当成空表（不抛）。"""
+    try:
+        with open(TEMPLATES_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for page, group in data.items():
+        if not isinstance(group, dict):
+            continue
+        keep = {}
+        for name, node in group.items():
+            if isinstance(node, dict) and isinstance(node.get("values"), dict):
+                keep[str(name)] = {"saved_at": int(node.get("saved_at") or 0),
+                                   "saved_iso": str(node.get("saved_iso") or ""),
+                                   "values": node["values"]}
+        out[str(page)] = keep
+    return out
+
+
+def _templates_write(data):
+    """原子写回。-> 错误码 or None。"""
+    try:
+        os.makedirs(os.path.dirname(TEMPLATES_PATH), exist_ok=True)
+        tmp = TEMPLATES_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2, sort_keys=True)
+            fp.write("\n")
+        os.replace(tmp, TEMPLATES_PATH)
+    except OSError as exc:
+        print("[templates] 存不进去：%r" % (exc,), flush=True)
+        return "save-failed"
+    return None
+
+
+def templates_for(page=None):
+    """给界面用的模板清单（**不带 values**，只有名字和时间）。"""
+    data = _templates_read()
+    out = {}
+    for pid in _PAGE_HOOKS:
+        if page and pid != page:
+            continue
+        group = data.get(pid, {})
+        out[pid] = [{"name": name, "saved_at": node["saved_at"], "saved_iso": node["saved_iso"]}
+                    for name, node in sorted(group.items(),
+                                             key=lambda kv: (-kv[1]["saved_at"], kv[0]))]
+    return out
+
+
+def admin_templates(page=None):
+    """GET /__api/admin/templates 的载荷：有哪些页、各页有哪些模板、当前生效值。"""
+    if page and page not in _PAGE_HOOKS:
+        return None, "bad-page"
+    pages = [{"id": pid, "label": hook["label"], "keys": list(hook["keys"])}
+             for pid, hook in _PAGE_HOOKS.items() if not page or pid == page]
+    current = {pid: hook["values"]() for pid, hook in _PAGE_HOOKS.items()
+               if not page or pid == page}
+    return {"pages": pages, "templates": templates_for(page), "current": current}, None
+
+
+def admin_template_save(page, name, values=None):
+    """存模板：不给 values 就取**当前生效值**（界面上的「存为模板」）。-> (结果, 错误码)。"""
+    hook = _PAGE_HOOKS.get(page)
+    if hook is None:
+        return None, "bad-page"
+    name, err = _template_name(name)
+    if err:
+        return None, err
+    if values is None:
+        values = hook["values"]()
+    elif not isinstance(values, dict):
+        return None, "bad-request"
+    # 只留这一页管得着的键：模板里混进来的旧键直接丢掉，不当错误。
+    values = {k: values[k] for k in hook["keys"] if k in values}
+    data = _templates_read()
+    overwritten = name in data.get(page, {})
+    data.setdefault(page, {})[name] = {"saved_at": int(time.time()),
+                                       "saved_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                       "values": values}
+    err = _templates_write(data)
+    if err:
+        return None, err
+    return {"page": page, "name": name, "overwritten": overwritten, "values": values}, None
+
+
+def admin_template_delete(page, name):
+    if page not in _PAGE_HOOKS:
+        return None, "bad-page"
+    name, err = _template_name(name)
+    if err:
+        return None, err
+    data = _templates_read()
+    if name not in data.get(page, {}):
+        return None, "not-found"
+    del data[page][name]
+    err = _templates_write(data)
+    if err:
+        return None, err
+    return {"page": page, "name": name}, None
+
+
+def admin_template_copy(page, name, new_name):
+    """复制模板：把源模板的**快照值**另存一份。列模板时不下发 values（列表要轻），
+    所以「复制」只能由服务端读源份来存。-> (结果, 错误码)。"""
+    if page not in _PAGE_HOOKS:
+        return None, "bad-page"
+    name, err = _template_name(name)
+    if err:
+        return None, err
+    new_name, err = _template_name(new_name)
+    if err:
+        return None, err
+    data = _templates_read()
+    src = data.get(page, {}).get(name)
+    if src is None:
+        return None, "not-found"
+    if new_name in data[page]:
+        return None, "exists"
+    values = dict(src.get("values") or {})
+    # 副本是新快照，saved_at 记此刻；值本身照抄。
+    data[page][new_name] = {"saved_at": int(time.time()),
+                            "saved_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "values": values}
+    err = _templates_write(data)
+    if err:
+        return None, err
+    return {"page": page, "name": new_name, "was": name, "values": values}, None
+
+
+def admin_template_rename(page, name, new_name):
+    if page not in _PAGE_HOOKS:
+        return None, "bad-page"
+    name, err = _template_name(name)
+    if err:
+        return None, err
+    new_name, err = _template_name(new_name)
+    if err:
+        return None, err
+    data = _templates_read()
+    if name not in data.get(page, {}):
+        return None, "not-found"
+    if new_name in data[page]:
+        return None, "exists"
+    # 改名**不动** saved_at/saved_iso：改的是名字，快照还是那份快照。
+    data[page][new_name] = data[page].pop(name)
+    err = _templates_write(data)
+    if err:
+        return None, err
+    return {"page": page, "name": new_name, "was": name}, None
+
+
+def admin_template_apply(page, name, parts="all"):
+    """套用模板：`parts="all"` 整页、`"rewards"` 只套奖励方案。-> (结果, 错误码)。
+
+    ★ 走的是与界面手改**同一条**校验+审计路径（`hook["apply"]`），所以套模板改错了
+      照样能一条条撤销，不需要第二套回滚逻辑。
+    """
+    hook = _PAGE_HOOKS.get(page)
+    if hook is None:
+        return None, "bad-page"
+    name, err = _template_name(name)
+    if err:
+        return None, err
+    parts = str(parts or "all")
+    if parts not in ("all", "rewards"):
+        return None, "bad-parts"
+    node = _templates_read().get(page, {}).get(name)
+    if node is None:
+        return None, "not-found"
+    keys = set(hook["keys"]) if parts == "all" else set(hook["reward_keys"])
+    fields = {k: v for k, v in node["values"].items() if k in keys}
+    if not fields:
+        return None, "empty"
+    res, err = hook["apply"](fields)
+    if res is None:
+        return None, err
+    return {"page": page, "name": name, "parts": parts, **res}, None
+
+
+def _param_message(err):
+    """错误码 -> 给人看的中文（界面直接把这句话显示出来）。"""
+    err = str(err or "")
+    if err.startswith("range:"):
+        parts = err.split(":")
+        return "%s 只能填 %s" % (parts[1], parts[2] if len(parts) > 2 else "")
+    if err.startswith("bad-pool:"):
+        return "%s 的奖励池子编号只能是 1..15" % err.split(":", 1)[1]
+    if err.startswith("bad-tier:"):
+        return "没有这个档位：%s（只有 %s）" % (err.split(":", 1)[1], "/".join(_WEEKLY_TROPHIES))
+    if err.startswith("unknown-key:"):
+        return "不认识的参数：%s" % err.split(":", 1)[1]
+    if err.startswith("bad-value:"):
+        return "这个参数要填整数：%s" % err.split(":", 1)[1]
+    return {"bad-request": "请求不合法",
+            "bad-page": "没有这一页",
+            "bad-name": "模板名不能为空或带换行，最长 %d 个字" % _TEMPLATE_NAME_MAX,
+            "not-found": "找不到这个模板",
+            "exists": "已经有同名的模板了",
+            "bad-parts": "套用范围只能是 all（整页）或 rewards（只奖励）",
+            "bad-action": "不认识这个操作",
+            "bad-reward-ids": "奖励池子要写成 {档位: [池子编号]}",
+            "empty": "这个模板里没有这一页认识的参数",
+            "save-failed": "模板文件写不进去（看服务器日志）",
+            }.get(err, "改不动：" + err)
+
+
+# 页面注册表：模板 / 撤销端点靠它知道"这一页管哪些键、怎么读、怎么写"。
+# （碉堡页落地时在这里加一条 "pvp" 即可，模板与撤销端点不用改。）
+_PAGE_HOOKS = {
+    "weekly": {
+        "label": "午夜杯",
+        "keys": tuple(_WEEKLY_KEYS) + ("reward_ids",),
+        "reward_keys": _WEEKLY_REWARD_KEYS,
+        "values": weekly_values,
+        "apply": admin_weekly_apply,
+    },
+}
 
 
 def h_liveevents_accept(path, query, body, headers):
@@ -5193,6 +5833,66 @@ class Handler(BaseHTTPRequestHandler):
                                        "bad-mode": "模式只能是 add 或 set",
                                        }.get(err, "下发失败：" + str(err))}, 400)
             return js({"ok": True, **res})
+        if path == "/__api/admin/weekly":
+            # 午夜杯运营页：GET = 读（配置 + 现状 + 模板 + 最近改动），POST = 改参数。
+            # ★ 改的参数**即改即生效**（配置按 mtime 热加载），但客户端那边的
+            #   reward_config 要玩家退出午夜杯再进才刷新。
+            if self.command == "POST":
+                form = _json_body(body) or {}
+                res, err = admin_weekly_apply(form.get("fields") or {})
+                if res is None:
+                    return js({"ok": False, "error": err, "message": _param_message(err)}, 400)
+                payload = {"ok": True, **res}
+            else:
+                payload = {"ok": True}
+            payload.update({
+                "config": weekly_values(),
+                "status": admin_weekly_status(),
+                "tracks": track_catalog(),
+                "templates": templates_for("weekly").get("weekly", []),
+                "audit": audit_for(["weekly"], 20),
+            })
+            return js(payload)
+        if path == "/__api/admin/undo":
+            # 一条审计记录的撤销（两页共用；撤销本身也记审计，所以能来回切）。
+            form = _json_body(body) or {}
+            res, err = admin_undo(form.get("id") or q.get("id"))
+            if res is None:
+                return js({"ok": False, "error": err,
+                           "message": {"bad-id": "没给审计编号",
+                                       "not-found": "这条记录太旧了（只留最近 %d 条）" % AUDIT_KEEP,
+                                       "bad-record": "这条记录没法撤销",
+                                       }.get(err, "撤销失败：" + str(err))}, 400)
+            return js({"ok": True, **res, "config": weekly_values()})
+        if path == "/__api/admin/templates":
+            # 参数模板：GET 列出（可按页筛），POST 存/套用/改名/删。
+            if self.command == "POST":
+                form = _json_body(body) or {}
+                action = str(form.get("action") or "")
+                page = str(form.get("page") or "weekly")
+                name = form.get("name")
+                if action == "save":
+                    res, err = admin_template_save(page, name, form.get("values"))
+                elif action == "apply":
+                    res, err = admin_template_apply(page, name, form.get("parts") or "all")
+                elif action == "copy":
+                    res, err = admin_template_copy(page, name, form.get("new_name"))
+                elif action == "rename":
+                    res, err = admin_template_rename(page, name, form.get("new_name"))
+                elif action == "delete":
+                    res, err = admin_template_delete(page, name)
+                else:
+                    res, err = None, "bad-action"
+                if res is None:
+                    return js({"ok": False, "error": err, "message": _param_message(err)}, 400)
+                # 套用会改配置 ⇒ 顺手把刷新过的生效值一起回给界面。
+                return js({"ok": True, **res,
+                           "templates": templates_for(page).get(page, []),
+                           "config": weekly_values() if page == "weekly" else None})
+            res, err = admin_templates(q.get("page"))
+            if res is None:
+                return js({"ok": False, "error": err, "message": _param_message(err)}, 400)
+            return js({"ok": True, **res})
         if path == "/__api/admin/rollback":
             form = _json_body(body) or {}
             snap, err = acct.rollback_save(form.get("profile"), form.get("ts"))
@@ -5349,6 +6049,9 @@ class Handler(BaseHTTPRequestHandler):
                     "POST /__api/admin/password {password}",
                     "POST /__api/admin/grant {profile,items:[{item_id,amount,mode}]}（存档物品，要玩家选「用云端」）",
                     "GET|POST /__api/admin/pvp {profile,fields:{golden_ticket,chips},mode}（竞技场余额，即时生效）",
+                    "GET|POST /__api/admin/weekly（午夜杯运营：GET 配置+现状+模板+最近改动；POST {fields:{…}} 即改即生效）",
+                    "POST /__api/admin/undo {id}（撤销一条参数改动，id 来自上面的 audit）",
+                    "GET|POST /__api/admin/templates（参数模板：GET ?page=weekly；POST {page,action:save|apply|copy|rename|delete,name,new_name,parts}）",
                     "POST /__api/admin/rollback {profile,ts} -> {snapshot}",
                     "POST /__api/admin/revert {profile,snapshot}",
                     "POST /__api/admin/sessions/clear {username?}",

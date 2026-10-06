@@ -498,3 +498,48 @@ table.list.compact td { padding: 7px 14px; }
   .toolbar .title { font-size: 17px; }
   .pane { padding: 16px 16px 64px; }
 }
+
+/* ─────────────────────────────────────────────────────────── 运营屏（午夜杯 / 碉堡） */
+
+/* 表单行：左边标签+说明，右边控件。运营参数说明都长，两列比一列好扫。 */
+.frow {
+  display: grid; grid-template-columns: minmax(170px, 1fr) minmax(120px, 320px);
+  gap: 10px 18px; align-items: center;
+}
+.frow .fl { display: grid; gap: 3px; }
+.frow .fk { font-size: 13.5px; font-weight: 500; }
+.frow .fc { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.frow .fc > input[type=number], .frow .fc > input[type=text] { width: 100%; max-width: 220px; }
+.frow .fc > .fl { flex: 1 1 auto; }
+@media (max-width: 700px) { .frow { grid-template-columns: 1fr; } }
+
+/* 卡内小节：现状数字 + 明细表的组合，标题要能从卡片里单独认出来。 */
+.grp { display: grid; gap: 8px; }
+.sub {
+  font-size: 11px; letter-spacing: .055em; text-transform: uppercase; color: var(--text-3);
+  border-top: 1px solid var(--stroke); padding-top: 12px;
+}
+
+/* 奖励池子：一档一行，1..15 每个池子一个方块，点一下切换 —— 编号是池子号，
+   不是物品号（物品在客户端自己的奖励表里，见 weekly-reward-pools.md）。 */
+.tierrow { display: grid; grid-template-columns: minmax(140px, 210px) 1fr; gap: 12px; align-items: center; }
+.tiername { display: grid; gap: 3px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  min-width: 32px; padding: 5px 0; border-radius: 8px;
+  border: 1px solid var(--stroke); background: var(--field); color: var(--text-2);
+  font: inherit; font-size: 12px; font-variant-numeric: tabular-nums; cursor: pointer;
+  transition: transform var(--dur-quick) var(--spring), background var(--dur-quick) var(--spring);
+}
+.chip:active { transform: scale(.9); }
+.chip[aria-pressed="true"] { background: var(--accent); border-color: transparent; color: var(--accent-ink); font-weight: 600; }
+@media (max-width: 700px) { .tierrow { grid-template-columns: 1fr; } }
+
+/* 模板行 */
+.tplrow {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 10px 0; border-bottom: 1px solid var(--stroke);
+}
+.tplrow:last-child { border-bottom: 0; }
+.tplrow .grow { flex: 1 1 180px; }
+.tplrow .tname { font-size: 13.5px; font-weight: 600; }
