@@ -118,7 +118,7 @@ try {
             -ContentType 'application/json' -UseBasicParsing -TimeoutSec 20 -SessionVariable s
         $sess = $s
         Check '随机口令能登录' ([bool]($login.StatusCode -eq 200 -and $login.Content -match '"ok"\s*:\s*true'))
-        foreach ($api in 'bunker', 'weekly') {
+        foreach ($api in 'bunker', 'weekly', 'social') {
             $r = Invoke-WebRequest "http://127.0.0.1:$Port/__api/admin/$api" -UseBasicParsing `
                 -WebSession $sess -TimeoutSec 20
             Check "后台接口 /$api 200" ($r.StatusCode -eq 200)
@@ -126,7 +126,10 @@ try {
     }
     Check '没往 stderr 吐异常' ([bool]("$(Get-Content $err -Raw)".Trim().Length -eq 0))
     # ★ 管理后台的请求不走请求日志（那是客户端流量的账本），要验日志得打一个客户端接口。
-    foreach ($u in '/', '/public/pvp_matches/v1/matches') {
+    # ★ 专门带上 /v2/profiles/me/friends：这条已经**不是** rules.json 里的死桩了（2026-10-07
+    #   起由 pick_dynamic 动态路由按登录者查 data/friends.json），打它等于同时验证包里的
+    #   只读 rules.json 与动态路由在冻结态下都还活着 —— 坏了客户端就看不到好友列表。
+    foreach ($u in '/', '/public/pvp_matches/v1/matches', '/v2/profiles/me/friends') {
         $r = Invoke-WebRequest "http://127.0.0.1:$Port$u" -UseBasicParsing -TimeoutSec 20
         Check "客户端接口 $u 200" ($r.StatusCode -eq 200)
     }
@@ -135,6 +138,7 @@ try {
     if (Test-Path $reqlog) {
         $paths = @(Get-Content $reqlog | ForEach-Object { ($_ | ConvertFrom-Json).path })
         Check '日志里记到了客户端请求' ($paths -contains '/public/pvp_matches/v1/matches') "($($paths.Count) 行)"
+        Check '日志里记到了好友列表请求' ($paths -contains '/v2/profiles/me/friends')
     }
 }
 finally {
