@@ -1,0 +1,92 @@
+<!doctype html>
+<!--
+  Trials Frontier 后台管理页。
+  ★ 只放「骨架 + 文案键」，所有文案在 i18n.json，所有数据在 JS 里渲染。
+    改文案不用碰结构，加语言只要往 i18n.json 加一节。
+  ★ 页面本身不设门禁（登录表单得先能显示出来），它不含任何数据。
+-->
+<html lang="cn" data-lang="cn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex,nofollow">
+<title>Trials Frontier · Admin</title>
+<link rel="stylesheet" href="/__admin/app.css">
+</head>
+<body>
+
+<div id="boot" class="boot"><span class="spinner"></span></div>
+
+<!-- ─────────────────────────────────────────────── 登录 -->
+<section id="login" class="login" hidden>
+  <form id="loginForm" class="login-card" autocomplete="on">
+    <div class="login-mark" aria-hidden="true"></div>
+    <h1 data-i18n="login.title"></h1>
+    <p class="muted" data-i18n="login.hint"></p>
+    <label class="field">
+      <span data-i18n="login.user"></span>
+      <input name="username" autocomplete="username" spellcheck="false"
+             placeholder="admin" required>
+    </label>
+    <label class="field">
+      <span data-i18n="login.pass"></span>
+      <input name="password" type="password" autocomplete="current-password" required>
+    </label>
+    <button class="btn primary block" type="submit" data-i18n="login.submit"></button>
+    <p class="alert" id="loginErr" hidden></p>
+    <p class="hint" data-i18n="login.resetHint"></p>
+  </form>
+</section>
+
+<!-- ─────────────────────────────────────────────── 主框架 -->
+<div id="shell" class="shell" hidden>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span data-i18n="app.name"></span>
+    </div>
+    <nav class="nav" id="nav">
+      <span class="nav-pill" id="navPill" aria-hidden="true"></span>
+      <a href="#/accounts" data-nav="accounts"><span data-i18n="nav.accounts"></span></a>
+      <a href="#/saves" data-nav="saves"><span data-i18n="nav.saves"></span></a>
+      <a href="#/grant" data-nav="grant"><span data-i18n="nav.grant"></span></a>
+    </nav>
+    <div class="side-foot">
+      <div class="who"><span data-i18n="app.signedIn"></span>
+        <b id="whoami">—</b></div>
+      <button class="btn tiny" id="btnLogout" type="button" data-i18n="app.logout"></button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="toolbar">
+      <h1 id="pageTitle" class="title"></h1>
+      <div class="tools">
+        <span class="dot" id="statusDot" title=""></span>
+        <button class="btn tiny" id="btnRefresh" type="button" data-i18n="app.refresh"></button>
+        <div class="seg" id="langSeg" role="group">
+          <button type="button" data-lang="cn">中文</button>
+          <button type="button" data-lang="en">EN</button>
+        </div>
+      </div>
+    </header>
+    <div class="pane" id="pane"></div>
+  </main>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<div class="modal" id="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <h3 id="modalTitle"></h3>
+    <div id="modalBody" class="modal-body"></div>
+    <div class="modal-foot">
+      <button class="btn" id="modalCancel" type="button" data-i18n="app.cancel"></button>
+      <button class="btn danger" id="modalOk" type="button" data-i18n="app.confirm"></button>
+    </div>
+  </div>
+</div>
+
+<script src="/__admin/app.js" defer></script>
+</body>
+</html>

@@ -36,7 +36,12 @@ class PVPEconomyTest(unittest.TestCase):
         srv._pvp_next_id[0] = 1
         srv._pvp_dirty[0] = False
         srv._pvp_saved_at[0] = 0
+        # 存档也指向临时目录：`_pvp_outfit_of()` 要读 `content.profile.outfit`，
+        # 不隔离的话就会去读真机存档（测试会随真数据飘）。
+        self.save_dir = Path(self.tmp.name) / "saves"
+        self.save_dir.mkdir()
         for p in (patch.object(srv, "PVP_STATE_PATH", str(Path(self.tmp.name) / "pvp.json")),
+                  patch.object(srv.acct, "SAVE_DIR", str(self.save_dir)),
                   patch.object(srv, "tf_config", return_value=config),
                   patch.object(srv, "_ghost_caller", return_value=PLAYER),
                   patch.object(srv, "_pvp_real_players", return_value=set()),
@@ -45,6 +50,13 @@ class PVPEconomyTest(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.addCleanup(lambda: srv._pvp_dirty.__setitem__(0, False))
+
+    def write_save(self, pid, outfit):
+        """在临时存档目录里造一份只带 `content.profile.outfit` 的存档。"""
+        d = self.save_dir / pid
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "latest.json").write_text(
+            json.dumps({"content": {"profile": {"outfit": outfit}}}), encoding="utf-8")
 
     def call(self, method, endpoint, payload=None):
         endpoint, _, query = endpoint.partition("?")
@@ -90,6 +102,49 @@ class PVPEconomyTest(unittest.TestCase):
             self.race(mid, tid)
         self.assertFalse(srv._pvp_matches[mid].get("_banked"), "Three results are not the six-hour deadline")
         self.assertEqual(srv._pvp_chips_for(PLAYER), 0)
+
+    def test_race_records_the_clients_own_bike_and_outfit(self):
+        # 客户端在 `pvp_matches/v1/race` 里报自己的车身字节与骑手外观
+        # （模板 `{"…","outfit": %d,"bike_data": %d}` @0xb86637）；以前我们把配置里的
+        # `matchmaking.bike_id` 当车身发回去，于是对手看到的永远是那辆默认车。
+        mid = self.match()["id"]
+        tid = 1041
+        self.assertEqual(self.call("POST", "start_race", {"match_id": mid, "track": tid,
+                         "golden_ticket": "False"})[0], 200)
+        self.assertEqual(self.call("POST", "race", {"match_id": mid, "track": tid,
+                         "score": srv._pvp_score_int(30000), "bike_data": 200,
+                         "outfit": 0x121212, "timestamp": self.now})[0], 200)
+        track = [t for t in srv._pvp_match_json(PLAYER, mid)["tracks"] if t["track"] == tid][0]
+        self.assertEqual(track["result_p1"]["bike_data"], 200)
+        self.assertEqual(track["result_p1"]["outfit"], 0x121212)
+
+    def test_junk_bike_and_outfit_fall_back(self):
+        mid = self.match()["id"]
+        tid = 1062
+        self.assertEqual(self.call("POST", "start_race", {"match_id": mid, "track": tid,
+                         "golden_ticket": "False"})[0], 200)
+        self.assertEqual(self.call("POST", "race", {"match_id": mid, "track": tid,
+                         "score": srv._pvp_score_int(31000), "bike_data": "x",
+                         "outfit": -5, "timestamp": self.now})[0], 200)
+        track = [t for t in srv._pvp_match_json(PLAYER, mid)["tracks"] if t["track"] == tid][0]
+        self.assertNotIn("outfit", track["result_p1"])
+        self.assertEqual(track["result_p1"]["bike_data"],
+                         srv.cfg_int("matchmaking", "bike_id", default=1))
+
+    def test_match_slots_carry_the_owners_real_outfit(self):
+        # 碉堡界面上两侧的骑手立绘读的是 player1/player2 槽里的 `outfit`
+        # （见 `_pvp_outfit_of` 的注释）；发 0 会把对手画成默认那套。
+        self.write_save(PLAYER, 0x121212)
+        mid = self.match()["id"]
+        slots = srv._pvp_match_json(PLAYER, mid)
+        self.assertEqual(slots["player1"]["outfit"], 0x121212)
+        # 对手（人机兜底档）没有存档 -> 0 号部件，也就是客户端本来就画的那套。
+        self.assertEqual(slots["player2"]["outfit"], 0)
+
+    def test_junk_outfit_in_save_is_not_forwarded(self):
+        self.write_save(PLAYER, "x")
+        mid = self.match()["id"]
+        self.assertEqual(srv._pvp_match_json(PLAYER, mid)["player1"]["outfit"], 0)
 
     def test_reward_submission_survives_match_refresh(self):
         mid = self.match()["id"]
@@ -335,17 +390,22 @@ class PVPEconomyTest(unittest.TestCase):
                 thread.join(timeout=3)
 
 
-    def test_match_slot_shows_wallet_plus_in_match_chips(self):
-        """对局槽里的数字 = 入场时钱包余额 + 局内占赛道产的筹码。
+    def test_match_slots_start_at_zero_chips(self):
+        """对局槽里的数字从 0 起算，**不带入**局外钱包余额。
 
-        2026-10-05 用户确认的模型是「按赛道产币」（m03154）+「赢家夺走对面已有的
-        筹码」（m04835），所以槽位不是从 0 起算，钱包也不会在开局被清空。
+        用户 2026-10-06 纠正（m01903）：「局外筹码是局外筹码。局内筹码是0，
+        只有赢得一条赛道，那个赛道开始产出筹码才会增加。怎么可能是直接从玩家
+        局外筹码同步。」——客户端画的数字 = `chip_base + 局内产出的筹码`，
+        而 `chip_base` 恒为 0。
+        老实现把钱包余额灌进 `chip_base`，于是对手头像下面直接显示你的存款
+        （真机：ccb 115313 / 华为 999999）。
         """
         srv._pvp_chips_state(PLAYER)["chips"] = 114514
         srv._pvp_chips_state(srv._pvp_bot_id())["chips"] = 500
         match = self.match()
         self.assertEqual((match["player1"]["chips"], match["player2"]["chips"]),
-                         (114514, 500))
+                         (0, 0))
+        # 局外钱包一分不动，`pvp_matches/v1/player/<pid>` 仍报真余额。
         self.assertEqual(self.call("GET", "player/" + PLAYER)[2]["chips"], 114514)
         self.assertEqual(match["player1"]["tickets"], 3)
 
@@ -360,7 +420,7 @@ class PVPEconomyTest(unittest.TestCase):
             self.assertEqual(match["player1"]["tickets"], 3 - count)
             self.assertEqual(self.call("GET", "player/" + PLAYER)[2]["chips"], 114514)
         self.assertEqual(match["player1"]["chips"],
-                         114514 + sum(srv._chips_at(t) for t in (60, 40, 20)))
+                         sum(srv._chips_at(t) for t in (60, 40, 20)))
         self.assertEqual(match["player2"]["chips"], 0)
         srv._pvp_state_save(force=True)
         srv._pvp_matches.clear()
@@ -961,6 +1021,237 @@ class PVPEconomyTest(unittest.TestCase):
         """
         self.call("POST", "pvp_init", {"tracks": "1041,1041,1,2,4,1062,1097,1097"})
         self.assertEqual(srv._pvp_chips_state(PLAYER)["tracks"], [1041, 1062, 1097])
+
+
+class PlayerLevelAndNameTest(unittest.TestCase):
+    """云端进度摘要里的 player_level，以及「榜上别人看到你叫什么」。
+
+    两件事都是真机上暴露出来的（m01054 等级变成 1、m01172 榜单把 ccb@ccb.com
+    显示成 Player53eb），而且都很容易在重构时悄悄退化，所以钉住契约。
+    """
+
+    PID = "53ebbd18-818e-5c2c-a865-773262f736e5"
+    ANON = "11111111-1111-1111-1111-111111111111"
+    BOT = "44444444-4444-4444-4444-444444444444"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.accounts = root / "accounts.json"
+        self.accounts.write_text(json.dumps({"users": {
+            self.PID: {"username": "ccb@ccb.com", "nameOnPlatform": "ccb@ccb.com",
+                       "profileId": self.PID, "created": 1, "logins": 1},
+        }}), encoding="utf-8")
+        self.devices = root / "devices.json"
+        self.devices.write_text(json.dumps({}), encoding="utf-8")
+        self.xp = root / "player_levels.json"
+        for p in (patch.object(srv.acct, "ACCOUNTS", str(self.accounts)),
+                  patch.object(srv.acct, "DEVICES", str(self.devices)),
+                  patch.object(srv.acct, "REMEMBER", str(root / "remember.json")),
+                  patch.object(srv, "_PLAYER_XP_PATH", str(self.xp)),
+                  patch.dict(srv._player_xp, {}, clear=True)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    # ---------------------------------------------------------------- 名字
+    def test_real_account_name_wins_over_pid_fallback(self):
+        """★ 回归：`Player` + pid[:4] 这个兜底必须排在真人后面。"""
+        self.assertEqual(srv.acct.name_for_profile(self.PID), "ccb@ccb.com")
+        # 兜底池里的 pid 不归账号管，返回 None 让调用方自己兜。
+        self.assertIsNone(srv.acct.name_for_profile(self.BOT))
+        self.assertIsNone(srv.acct.name_for_profile(""))
+        self.assertIsNone(srv.acct.name_for_profile(None))
+
+    def test_profiles_query_shows_real_name_and_keeps_bots(self):
+        """客户端就是靠这个端点把榜上的 pid 翻成名字的（x70+ 次/会话）。"""
+        _, _, body = srv.h_profiles_query(
+            "", "profileId=%s,%s" % (self.PID, self.BOT), b"", {})
+        got = {p["profileId"]: p["nameOnPlatform"] for p in body["profiles"]}
+        self.assertEqual(got[self.PID], "ccb@ccb.com")
+        self.assertEqual(got[self.BOT], srv.FRIEND_NAMES[self.BOT])
+        self.assertNotIn("Player" + self.PID[:4], got.values())
+
+    # ---------------------------------------------------------------- 等级
+    def test_remember_player_xp_persists_across_restart(self):
+        """★ 回归：等级必须活过服务器重启。
+
+        用户每轮都在"改完代码 → 重启服务器 → 不重开游戏"之间测试，内存版的
+        等级会变回 0，界面又显示「等级 1」—— 他会以为存档被清了（m01175）。
+        """
+        headers = {"Authorization": "Ubi_v1 t=x"}
+        with patch.object(srv.acct, "serve_progress",
+                          return_value=(self.PID, {}, "own")):
+            srv._remember_player_xp(headers, json.dumps({"xp": 14}).encode("utf-8"))
+        self.assertEqual(srv._player_xp[self.PID], 14)
+        self.assertTrue(self.xp.exists(), "等级没落盘，重启就丢")
+        # 模拟重启：清空内存再从文件读回来。
+        srv._player_xp.clear()
+        self.assertEqual(srv._player_xp_load(), {self.PID: 14})
+
+    def test_remember_player_xp_ignores_junk_and_negative(self):
+        with patch.object(srv.acct, "serve_progress",
+                          return_value=(self.PID, {}, "own")):
+            for bad in (b"", b"not json", b"{}", b'{"xp": null}',
+                        b'{"xp": -1}', b'{"xp": "abc"}'):
+                srv._remember_player_xp({"Authorization": "Ubi_v1 t=x"}, bad)
+        self.assertEqual(srv._player_xp, {})
+        self.assertFalse(self.xp.exists(), "坏数据不该建文件")
+        # 缺 xp 但 JSON 合法时不能炸，也不能写脏值。
+        with patch.object(srv.acct, "serve_progress",
+                          return_value=(self.PID, {}, "own")):
+            srv._remember_player_xp({"Authorization": "Ubi_v1 t=x"},
+                                    b'{"player_name": "ccb@ccb.com"}')
+        self.assertEqual(srv._player_xp, {})
+
+    def test_progress_status_reports_recorded_level(self):
+        pid, content = self.PID, {"items2": [1, 100, 2, 7],
+                                 "missions2": {"solved": [1, 2, 3]}}
+        with patch.object(srv.acct, "serve_progress",
+                          return_value=(pid, content, "own")):
+            srv._player_xp[self.PID] = 14
+            _, _, body = srv.h_progress_status("", "", b"", {})
+        self.assertEqual(body["coins"], 100)
+        self.assertEqual(body["diamonds"], 7)
+        self.assertEqual(body["missions_completed"], 3)
+        self.assertEqual(body["player_level"], 14)
+        self.assertIn("player_points", body)
+
+    def test_progress_status_zero_when_level_unknown(self):
+        """没上报过就回 0，不猜、不动存档（这是显示用数字，不是存档里的字段）。"""
+        with patch.object(srv.acct, "serve_progress",
+                          return_value=(self.PID, {"items2": [1, 1]}, "own")):
+            _, _, body = srv.h_progress_status("", "", b"", {})
+        self.assertEqual(body["player_level"], 0)
+
+    def test_level_file_junk_does_not_take_the_server_down(self):
+        for blob in ("not json at all", "[]", '{"p": "abc"}', "null", ""):
+            self.xp.write_text(blob, encoding="utf-8")
+            self.assertEqual(srv._player_xp_load(), {})
+        self.xp.unlink()
+        self.assertEqual(srv._player_xp_load(), {})
+
+
+class GhostAppearanceTest(unittest.TestCase):
+    """★ 幽灵/对手的 `data`/`upgrades` 是**外观位域**，不是可以随便填 0 的数字。
+
+    真机证据：61 条真成绩 + 163 条占位行里 `data` 最小值是 `0x100`，客户端从来不
+    产生 0；而客户端的 `tr::LeaderBoardData::getOutfit(int)` / `getBikeSkin()` 直接
+    解这个位域，解出来的东西再被搬进 `tr::OnlineDataContainer::m_ghostOutfit`。
+    我们以前在三处发 0（内置幽灵折成的对手行 / `match/v1/robot` / 总榜聚合把它当
+    「跑过几条赛道」的计数器），真机表现就是「幽灵服装、车身喷漆不对，骑手没有脑袋」
+    （m01329）。
+    """
+
+    PID = "53ebbd18-818e-5c2c-a865-773262f736e5"
+    BUILTIN_OWNER = "6f857655"      # 内置幽灵的 owner 是 online-id 哈希，不是 pid
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lb = Path(self.tmp.name) / "leaderboards.json"
+        p = patch.object(srv, "LEADERBOARD_PATH", str(self.lb))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def write_boards(self, boards):
+        self.lb.write_text(json.dumps(boards), encoding="utf-8")
+
+    @staticmethod
+    def parts(data):
+        """按反汇编出来的 `data` 布局解出骑手 part0/part1/part2。"""
+        return ((data >> 26) & 0x3F, (data >> 20) & 0x3F, (data >> 14) & 0x3F)
+
+    def test_layout_matches_real_rows(self):
+        """布局取自 `encodeData()`@0x625178 / `parseData()`@0x6250fc 的反汇编，
+        必须能解出真机成绩行里那几套骑手 part。"""
+        for data, want in ((0x49248100, (18, 18, 18)),   # ccb（profile.outfit 0x121212）
+                           (0x5D75C200, (23, 23, 23)),   # anon（profile.outfit 0x171717）
+                           (0xBEFBCD00, (47, 47, 47)),
+                           (0x20820100, (8, 8, 8)),
+                           (0x00000100, (0, 0, 0))):     # 占位行
+            self.assertEqual(self.parts(data), want)
+        # 反过来拼：布局的自检
+        self.assertEqual(srv._lb_data((18, 18, 18)), 0x49248100)
+
+    def test_fallback_is_a_value_the_client_produces(self):
+        """兜底值必须是客户端自己也会发的：三个 part 都非 0（0 = 没有这个部件）。"""
+        for owner in (self.BUILTIN_OWNER, "", None, "99511744", self.PID):
+            data = srv._lb_ghost_data(owner)
+            self.assertNotEqual(data, 0)
+            self.assertNotIn(0, self.parts(data), "part 为 0 → 客户端解出「没有脑袋」")
+            self.assertEqual(data, srv._lb_ghost_data(owner), "同一个 owner 要稳定")
+        # 不同幽灵不该穿同一件衣服
+        vary = {srv._lb_ghost_data(o) for o in
+                ("6f857655", "99511744", "53ebbd18-818e-5c2c-a865-773262f736e5", "0")}
+        self.assertGreater(len(vary), 1)
+
+    def test_uses_the_ghost_owners_real_row(self):
+        self.write_boards({"track1041": {self.PID: {
+            "data": 0xBEFBCD00, "upgrades": 0xAAAA0380}}})
+        self.assertEqual(srv._ghost_appearance(1041, {"owner": self.PID}),
+                         (0xBEFBCD00, 0xAAAA0380))
+
+    def test_falls_back_to_baseline_when_owner_is_a_hash_or_unknown(self):
+        self.write_boards({})
+        self.assertEqual(srv._ghost_appearance(1041, {"owner": self.BUILTIN_OWNER}),
+                         (srv._lb_ghost_data(self.BUILTIN_OWNER), 0))
+        self.assertEqual(srv._ghost_appearance(1041, {}),
+                         (srv._lb_ghost_data(""), 0))
+        self.assertEqual(srv._ghost_appearance(1041, None),
+                         (srv._lb_ghost_data(""), 0))
+        # owner 是 pid、但那条赛道没跑过 → 还是兜底，不是 0。
+        self.write_boards({"track1041": {self.PID: {"data": 0xBEFBCD00}}})
+        self.assertEqual(srv._ghost_appearance(999, {"owner": self.PID}),
+                         (srv._lb_ghost_data(self.PID), 0))
+
+    def test_builtin_ghosts_folded_into_opponents_never_get_data_zero(self):
+        records = [
+            {"track_id": tid, "drive_time": 20000 + tid, "builtin": True,
+             "owner": self.BUILTIN_OWNER, "contentId": 100 + i, "stored": True}
+            for i, tid in enumerate((1041, 1024, 4))
+        ]
+        with patch.object(srv.acct, "ghost_list", return_value=records), \
+                patch.object(srv, "_OPPONENT_CACHE", None):
+            rows, _ghosts = srv._opponent_entries()
+        self.assertTrue(rows, "内置幽灵没折成对手行")
+        bad = [(pid, b) for pid, bs in rows.items() for b, r in bs.items()
+               if int(r.get("data") or 0) == 0]
+        self.assertEqual(bad, [], "对手行的 data 发 0 = 点进去挑战的幽灵没有脑袋")
+
+    def test_match_robot_never_sends_data_zero(self):
+        self.write_boards({"track1041": {self.PID: {
+            "data": 0xBEFBCD00, "upgrades": 0xAAAA0380}}})
+        for rec, want in (({"owner": self.PID, "contentId": 1}, 0xBEFBCD00),
+                          ({"owner": self.BUILTIN_OWNER},
+                           srv._lb_ghost_data(self.BUILTIN_OWNER)),
+                          (None, srv._lb_ghost_data(""))):
+            with patch.object(srv, "_robot_opponent",
+                              return_value=("GhostRider", 25000, rec)):
+                _, _, body = srv.h_match_robot("/public/match/v1/robot",
+                                               "track_name=track1041", b"", {})
+            self.assertEqual(body["data"], want)
+            self.assertNotEqual(body["data"], 0)
+
+    def test_global_aggregate_or_merges_data_and_counts_tracks(self):
+        """★ 回归：`data` 被当成计数器时真人总榜行的外观位域只剩个位数。"""
+        boards = {
+            "track1041": {self.PID: {"drivetime": 25000, "data": 0x20820100,
+                                     "upgrades": 0x00000140, "score_value": 10}},
+            "track1024": {self.PID: {"drivetime": 30000, "data": 0x00000100,
+                                     "upgrades": 0x122000c0, "score_value": 5}},
+        }
+        with patch.object(srv, "_load_ranked_boards", return_value=boards):
+            rows = srv._aggregate_global_entries()
+        row = [r for r in rows if r["player"] == self.PID][0]
+        self.assertEqual(row["data"], 0x20820100 | 0x00000100)
+        self.assertEqual(row["tracks"], 2)
+        self.assertNotEqual(row["data"], 2)
+
+    def test_rank_entry_does_not_leak_the_tracks_counter(self):
+        entry = srv._rank_entry({"player": "p", "rank": 1, "data": 1,
+                                 "upgrades": 0, "tracks": 37})
+        self.assertNotIn("tracks", entry["stats"])
 
 
 if __name__ == "__main__":

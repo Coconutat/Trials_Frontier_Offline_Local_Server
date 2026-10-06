@@ -60,11 +60,12 @@ Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
 | 文件 | 作用 |
 |---|---|
 | `tf_server.py` | HTTP 服务器：路由 + 全部动态端点处理器 + 请求日志 + 内嵌管理页。~4000 行 |
-| `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储。纯数据层，不碰 HTTP。~1330 行 |
+| `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储 + 管理员账号 + 受控下发。纯数据层，不碰 HTTP。~1800 行 |
+| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
 | `rules.json` | 静态桩响应表（`"<METHOD> <路径前缀>"` → `{status, headers, body}`）。只服务那些「有响应就行」的端点 |
 | `data/tf_config.json` | 运营参数（匹配、赛季、周赛、奖励、筹码）。**唯一入库的 `data/` 文件** |
 | `data/ghosts/` | 幽灵仓库：`<赛道id>/*.bin`（游戏自带静态幽灵，入库）+ `store/` `index.json` `replays.json`（运行期，不入库） |
-| `data/save/` `accounts.json` `sessions.json` `devices.json` `remember.json` `leaderboards.json` | 全部是运行期私有数据，被 `.gitignore` 排除 |
+| `data/save/` `accounts.json` `sessions.json` `devices.json` `remember.json` `leaderboards.json` `admin.json` `player_levels.json` | 全部是运行期私有数据（`admin.json` 是管理员口令哈希 + 票据），被 `.gitignore` 排除 |
 
 `tf_server.py` 的分区（行号截至 2026-10，只作导航用）：
 
@@ -92,8 +93,11 @@ Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
 
 ```
 Handler.do_GET / do_POST / do_PUT / do_DELETE
-  ├─ path == "/__log"                      -> 直接回环形缓冲
   ├─ path.startswith("/__")                -> _introspect()      # 本地管理 API，不记日志
+  │     ├─ /__admin、/__admin/*            -> 后台页静态文件（_ADMIN_FILES 白名单）
+  │     ├─ /__api/admin/*                  -> 管理员登录 / 登出 / 改口令 / 下发 …
+  │     ├─ _PUBLIC = /__ping /__ui /__register /__api/register
+  │     └─ 其余 /__*  无有效 tf_admin Cookie -> 401 admin-required    ★ 唯一的墙
   ├─ pick_dynamic(method, path)            # 命中 -> (handler, which)
   │     命中：构造 hdrs，注入 X-TF-Client = 客户端 IP，调用处理器
   └─ 未命中：load_rules() -> pick_rule() -> render() -> 兜底
@@ -101,7 +105,8 @@ Handler.do_GET / do_POST / do_PUT / do_DELETE
 ```
 
 日志条目字段：`ts / method / url / path / query / req_headers / req_body / req_body_len / rule / status / resp_body / ms`。
-落到 `work/trials-frontier/notes/server-log.jsonl`（同时进内存环形缓冲 `RECENT`，`/__log` 可读）。
+落到 `work/trials-frontier/notes/server-log.jsonl`（同时进内存环形缓冲 `RECENT`，`/__log` 可读，**要管理员**）。
+`/__*` 请求本身不进这个日志（`/__admin` 的访问也不会污染游戏端点统计）。
 
 **`X-TF-Client`**：服务器在把请求交给动态处理器前，用来源 IP **覆盖**同名请求头。
 `tflocal_accounts.save_progress()` / `serve_progress()` 靠它判断「这是不是同一台设备」，
@@ -184,6 +189,20 @@ Handler.do_GET / do_POST / do_PUT / do_DELETE
 * 未知赛道要返回**完整对象**（`{"leaderboard","playerCount","httpCode","results"}`），
   不能回 `{"data":[]}`：早期回空导致客户端对 `track66633` 反复重试（一天 337 次）。
 
+**榜行里的 `data` / `upgrades` 是位域，不是计数器**（反汇编定论，见
+`work/trials-frontier/notes/online-endpoints.md`）：
+
+* `data` = 那一场**骑手外观**：bits 0–7 未用、8–13 一个 6 位字段（真机取 1/2/4/13，
+  `encodeData` 会把 ≤1 归 0）、bits 14–19 / 20–25 / 26–31 分别是 outfit 的 part2 / part1 / part0。
+  部件的**高 2 位不在 `data` 里**，合起来是 24 位 = 存档 `content.profile.outfit`。
+  客户端 `LeaderBoardData::getOutfit(int)` 就是解它。
+* `upgrades` = 车辆升级：bits 6–15 一个 10 位字段 + 四个 4 位字段（bit0–5 未用）。
+* `bikeSkin` 只从 `extradata` 来（`parseData2` @0x625134），而**这一版客户端从不发 `extradata`**。
+* **0 不是客户端会产生的外观值**：真机 172 条真成绩里 `data` 最小 `0x100`，
+  而 `outfit = 0`（没自定义过的号，如华为账号）确实就是 `0x100` ⇔ parts (0,0,0)。
+  服务端取不到真值时统一用 `_lb_ghost_data()`（`_LB_GHOST_OUTFITS` 里按 owner 稳定挑一套），
+  绝不再发 0 —— 发 0 会让客户端拿没见过的值去渲染（服装错、骑手没脑袋）。
+
 ### 5.3 幽灵 / 回放
 
 | 方法 | 路径 | 处理器 |
@@ -228,6 +247,17 @@ python -m unittest discover -s tests -v
 * 排队表有 TTL（`_PVP_QUEUE_TTL = 1800`），拿不到真人就回机器人。
 * 机器人成绩 = 玩家成绩 × `bot_time_margin_pct` + `bot_time_margin_ms`（默认 1.018 / 400ms）。
 * 赛季星星曲线 `season.star_array` 是 25 级天梯，`chip_equation_x/y` 决定筹码结算。
+
+**外观（`outfit`）**：碉堡界面两侧的骑手立绘取自 `parseMatch` @0x4fd9d0 的 `player1`/`player2` 槽，
+槽里 `outfit` 是 24 位（3 个 8 位部件：头盔 / 上身 / 下身），**直接来自该玩家存档的
+`content.profile.outfit`**（`_pvp_outfit_of()`）。曾经这里硬编码 0，于是把对手也画成 0 号部件
+（默认黄盔迷彩）⇒ 两台机器看起来"衣服没同步"。对局里客户端自己上报的 `outfit` / `bike_data`
+也存在结果行里（`_pvp_reported()` 只收合法整数，垃圾值回退）。
+
+**局内筹码与局外钱包是两笔钱**：对局槽里的数字 = `chip_base` + 局内占住赛道产出的筹码，
+而 **`chip_base` 恒为 0**（用户 m01903 纠正：局内筹码从 0 起算，只有赢下赛道才开始涨；
+以前把钱包余额灌进去，结果对手头像下面直接显示你的存款）。结算不受影响 ——
+`_pvp_bank_match_chips` 只把「本局产出 = match − base」计入钱包，掠夺输家的也只是他这一局的产出。
 
 ### 5.5 限时活动 / 午夜杯（`liveevents/v1/weekly_track_system`）
 
@@ -321,18 +351,62 @@ python -m unittest discover -s tests -v
 
 这些是**本机管理接口，不是游戏协议**，客户端永远不会请求它们，也不进请求日志。
 
+**访问控制**（`server/tf_server.py` 的 `_introspect` 里那段「唯一的墙」）：服务器绑 `0.0.0.0`，
+局域网里谁都能连，所以除下面四个公开端点外，**所有 `/__*` 都要管理员 Cookie**：
+
+| 公开端点 | 为什么公开 |
+|---|---|
+| `/__ping` | 存活探测 |
+| `/__ui`、`/__register`、`POST /__api/register` | 玩家要在游戏里自助注册账号（`_WEBUI_HTML` 内嵌页），登录页本身也得能加载 |
+
+改前裸奔、现在要管理员的一批：`POST /__config`、`/__restore`、`/__api/login`、
+`/__api/password`、`/__api/delete`。实现上用 `path.startswith("/__") and path not in _PUBLIC`
+（而不是白名单表），**新增端点默认是关的**，忘了加门禁也不会漏。
+
+### 7.1 后台管理页 `/__admin`
+
+```
+后台管理页： http://127.0.0.1:8000/__admin   （手机用 http://<局域网IP>:8000/__admin）
+```
+
+* 管理员账号**独立于玩家账号**，存在 `data/admin.json`（`_hash_pw` = sha256(salt+用户名小写+NUL+口令)，
+  与账号库同一套；不入库）。**没有网页自助创建** —— 否则第一个访问到 `/__admin` 的人
+  就能把自己设成管理员。
+* 首次启动若无管理员，`admin_bootstrap()` 生成 12 位随机口令，**只打到控制台**（66 字符宽的框）；
+  登录后发 `tf_admin` Cookie（`HttpOnly; SameSite=Strict; Max-Age=604800`，**故意不加 `Secure`**：
+  服务器只能走明文 HTTP，加了浏览器不回传，登录会静默失效）。
+* 忘了口令：`python tf_server.py --reset-admin`（无参数 = 再随机一个）。带上口令要 ≥8 位。
+  这条走命令行而不是网页，同样是为了不留无窗口期的后门。
+* 页面是静态四件套（`server/admin/`），CN/EN 双语（`i18n.json`，`localStorage.tf_lang`
+  优先、否则跟随 `navigator.language`）。前端**只用 `textContent` 渲染玩家可控字符串**
+  （账号名 / 平台名直接来自客户端上报，是信任边界）。
+
+### 7.2 端点
+
 | 端点 | 作用 |
 |---|---|
 | `/__log` | 最近 400 条请求的环形缓冲 |
-| `/__ping` | 存活探测 |
-| `/__ui`、`/__register` | 内嵌账号管理页 `_WEBUI_HTML` |
 | `/__accounts` | 账号列表（脱敏） |
-| `/__api/register` `/__api/login` `/__api/password` `/__api/delete` | 管理页用的 JSON API |
 | `/__devices` `/__sessions` | 设备槽 / 活跃会话 |
 | `/__saves` `/__save` `/__history` `/__restore` | 存档查看 / 指定槽位 / 历史 / 回滚 |
 | `/__leaderboards` `/__ghosts` | 排行榜 / 幽灵仓库内容 |
 | `/__config` | 当前生效的运行时配置 |
-| `/__help` | 端点清单 |
+| `/__help` | 端点清单（**新增端点要同步登记**，这是自发现的唯一入口） |
+| `POST /__api/admin/login` `logout` `me` | 管理员登录 / 登出 / 当前身份（`me` 未登录也 200） |
+| `POST /__api/admin/password` | 改口令（<8 位拒；改完**重签 Cookie**，否则把自己踢掉） |
+| `POST /__api/admin/grant` | 存档物品下发（白名单只有金币 1 / 钻石 2） |
+| `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
+| `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
+
+### 7.3 下发的两条通道（别搞混）
+
+* **竞技场（服务端权威，即时生效）**：金票 / 筹码直接写 `data/pvp_state.json`，
+  客户端无从覆盖。金票**不是存档物品**（`items2` 里 id 135 从来不存在），
+  所以它只能走这条路 —— 见 `ROADMAP_STATUS.md` 的「金票」条目。
+* **存档物品（尽力而为）**：改 `data/save/<pid>/latest.json` 的 `items2` 并 **bump `version`**。
+  bump 是必需的（否则 `remote == local`，客户端静默用本地档覆盖服务器），但 bump 后
+  客户端也**可能不弹** `MenuzStateSyncProgress` 而是直接推本地档 ⇒ 不保证送达。
+  界面上必须如实这么写，别承诺「即点即得」。
 
 ---
 

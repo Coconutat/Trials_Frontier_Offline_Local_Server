@@ -45,6 +45,9 @@ DEVICES = os.path.join(DATA, "devices.json")
 REMEMBER = os.path.join(DATA, "remember.json")
 # 客户端（IP / 设备 id）-> 账号。用途见 resolve_identity()。
 BINDINGS = os.path.join(DATA, "bindings.json")
+# 后台管理页（/__admin）的管理员账号 + 登录会话。与玩家账号**分开存**：
+# 玩家账号是给游戏客户端登录用的，管理员账号只用来进后台，互不污染。
+ADMIN = os.path.join(DATA, "admin.json")
 SAVE_DIR = os.path.join(DATA, "save")
 GHOST_DIR = os.path.join(DATA, "ghosts")
 
@@ -59,6 +62,8 @@ ANON_SESSION_ID = "33333333-3333-3333-3333-333333333333"
 ANON_TICKET = "tf-local-ticket-0001"
 
 SAVE_HISTORY_MAX = 20
+# 管理员登录票据有效期（秒）。7 天足够，重启服务器不会把人踢下线。
+ADMIN_SESSION_TTL = 7 * 24 * 3600
 _LOCK = threading.RLock()
 
 
@@ -312,6 +317,24 @@ def list_accounts_public():
             "remember_uses": rm.get("uses", 0),
         })
     return out
+
+
+def name_for_profile(profile_id):
+    """profileId -> 显示名。别的玩家在榜上看你叫什么，走的就是这里。
+
+    返回 None = 这个 pid 不归本服的账号/设备管（内置机器人与合成榜行就是这么来的），
+    调用方自己去兜底。**真人必须排在兜底池前面**，否则榜上会把真人显示成
+    「Player53eb」这种由 pid 拼出来的假名 —— 真机踩过（m01172）。
+    """
+    if not profile_id:
+        return None
+    for acc in list_accounts_public():
+        if acc.get("profileId") == profile_id:
+            return acc.get("nameOnPlatform") or acc.get("username")
+    dev = device_by_profile(profile_id)
+    if dev:
+        return dev.get("nameOnPlatform")
+    return None
 
 
 def issue_session(acc):
@@ -600,6 +623,146 @@ def resolve_identity(headers):
 def lookup_account(username):
     with _LOCK:
         return _load(ACCOUNTS, {}).get("users", {}).get((username or "").lower())
+
+
+# --------------------------------------------------------------- 管理员账号
+# ★ 后台管理页 /__admin 的入口凭据，与玩家账号完全分开。
+#
+# ★ 为什么不做「网页上自助创建第一个管理员」：
+#   那等于**任何先访问到 /__admin 的人**都能把自己设成管理员（无窗口期）。
+#   所以首启时生成随机口令并**只打到服务器控制台** —— 能看见控制台的人才是操作者。
+#   忘了口令就 `python tf_server.py --reset-admin` 重来。
+#
+# ★ 口令哈希复用玩家账号那套（_hash_pw：sha256(salt + 小写用户名 + NUL + 口令)），
+#   不另起一套，避免两处实现漂移。
+def _admin_load():
+    db = _load(ADMIN, {})
+    if not isinstance(db, dict):
+        db = {}
+    for key in ("users", "sessions"):
+        if not isinstance(db.get(key), dict):
+            db[key] = {}
+    return db
+
+
+def admin_exists():
+    return bool(_admin_load()["users"])
+
+
+def admin_new_password():
+    """生成 12 位十六进制口令（6 字节 urandom）。"""
+    return binascii.hexlify(os.urandom(6)).decode("ascii")
+
+
+def admin_create(username, password, force=False):
+    """建/改管理员。force=False 时同名已存在则拒绝。返回 (username, err)。"""
+    username = (username or "").strip().lower()
+    if not username or not password:
+        return None, "bad-request"
+    with _LOCK:
+        db = _admin_load()
+        old = db["users"].get(username)
+        if old is not None and not force:
+            return None, "exists"
+        salt = binascii.hexlify(os.urandom(8)).decode("ascii")
+        db["users"][username] = {
+            "username": username,
+            "salt": salt,
+            "pw": _hash_pw(username, password, salt),
+            "created": (old or {}).get("created") or int(time.time()),
+            "logins": (old or {}).get("logins", 0),
+        }
+        # ★ 改口令 = 踢掉这个人的全部旧会话（不然旧票据还能用，改口令就没意义）。
+        db["sessions"] = {k: v for k, v in db["sessions"].items()
+                          if v.get("user") != username}
+        _store(ADMIN, db)
+    return username, None
+
+
+def admin_bootstrap():
+    """首次启动用：一个管理员都没有就建 `admin` + 随机口令。
+
+    返回 (username, password)；已经有管理员了返回 None。
+    """
+    if admin_exists():
+        return None
+    password = admin_new_password()
+    admin_create("admin", password)
+    return "admin", password
+
+
+def admin_login(username, password):
+    """校验管理员口令并签发会话票据。返回 (token, err)。"""
+    username = (username or "").strip().lower()
+    if not username or not password:
+        return None, "bad-request"
+    with _LOCK:
+        db = _admin_load()
+        acc = db["users"].get(username)
+        if acc is None:
+            return None, "not-found"
+        if acc.get("pw") != _hash_pw(username, password, acc.get("salt") or ""):
+            return None, "invalid-credentials"
+        now = int(time.time())
+        acc["logins"] = acc.get("logins", 0) + 1
+        acc["last_login"] = now
+        # 顺手清掉过期会话，免得 admin.json 无限长大。
+        db["sessions"] = {k: v for k, v in db["sessions"].items()
+                          if now - int(v.get("created") or 0) < ADMIN_SESSION_TTL}
+        token = binascii.hexlify(os.urandom(16)).decode("ascii")
+        db["sessions"][token] = {"user": username, "created": now}
+        _store(ADMIN, db)
+    print("[admin] %s 登录后台" % username, flush=True)
+    return token, None
+
+
+def admin_by_token(token):
+    """票据 -> 管理员记录；无效/过期返回 None。"""
+    if not token:
+        return None
+    with _LOCK:
+        db = _admin_load()
+        rec = db["sessions"].get(token)
+        if not rec:
+            return None
+        if int(time.time()) - int(rec.get("created") or 0) >= ADMIN_SESSION_TTL:
+            return None
+        return db["users"].get(rec.get("user"))
+
+
+def admin_logout(token):
+    if not token:
+        return False
+    with _LOCK:
+        db = _admin_load()
+        gone = db["sessions"].pop(token, None)
+        if gone:
+            _store(ADMIN, db)
+    return bool(gone)
+
+
+def clear_sessions(username=None):
+    """清游戏会话票据（sessions.json）。username 为空 = 全清。返回清掉几条。
+
+    ★ 这是运维动作不是安全动作：sessions.json 只保留最近 200 张，而客户端每次
+      冷启动都会新签一张（实测 106 张里 100 张是同一个人），不清就一直是噪声。
+      清掉不影响长期凭据 remember.json，玩家不会被踢出登录状态。
+    """
+    key = (username or "").strip().lower() or None
+    with _LOCK:
+        db = _load(SESSIONS, {})
+        if key is None:
+            removed = len(db)
+            db = {}
+        else:
+            keep = {k: v for k, v in db.items() if v.get("user") != key}
+            removed = len(db) - len(keep)
+            db = keep
+        if removed:
+            _store(SESSIONS, db)
+    if removed:
+        print("[acct] 清理会话 %d 条（%s）" % (removed, key or "全部"), flush=True)
+    return removed
 
 
 # ------------------------------------------------------------------ 会话响应
@@ -953,19 +1116,200 @@ def list_history(profile_id):
     return out
 
 
+# 恢复点：带前缀的快照文件名。
+# ★ 前缀名在 sorted() 里排在纯数字时间戳**之后**，所以 save_progress 的历史裁剪
+#   （files[:-SAVE_HISTORY_MAX] 从前面丢）永远丢不到它们。数量由 SNAPSHOT_KEEP 自己管。
+GRANT_SNAPSHOT_TAG = "pre_grant_"
+RESTORE_SNAPSHOT_TAG = "pre_restore_"
+SNAPSHOT_KEEP = 10
+
+
+def _snapshot(profile_id, doc, tag):
+    """在 history/ 下留一个命名恢复点，返回它的名字（可直接喂给 /__restore）。"""
+    hist = os.path.join(SAVE_DIR, profile_id, "history")
+    os.makedirs(hist, exist_ok=True)
+    # 秒级时间戳会撞（同一秒连点两次下发），补三个随机字节当后缀。
+    name = "%s%d%s" % (tag, int(time.time()),
+                       binascii.hexlify(os.urandom(3)).decode("ascii"))
+    _store(os.path.join(hist, name + ".json"), doc)
+    pref = sorted(f for f in os.listdir(hist) if "_" in f and f.endswith(".json"))
+    for old in pref[:-SNAPSHOT_KEEP]:
+        try:
+            os.remove(os.path.join(hist, old))
+        except OSError:
+            pass
+    return name
+
+
+def rollback_save(profile_id, ts):
+    """把 history/<ts>.json 提回 latest.json，写之前先埋一个恢复点。
+
+    返回 (恢复点名字, err)。恢复点名字可以是 None（原档读不出来时没什么可留的）。
+    """
+    if ts in (None, "", "latest"):
+        return None, "bad-ts"
+    doc = _load(os.path.join(SAVE_DIR, profile_id, "history", "%s.json" % ts), None)
+    if not doc:
+        return None, "not-found"
+    # ★ 覆盖前先留一份现场：回滚**本身**是不可逆的（latest.json 被直接换掉），
+    #   所以按「给撤销而不是给确认框」的原则，先埋一个回到回滚前的点。
+    cur = load_progress(profile_id)
+    snap = _snapshot(profile_id, cur, RESTORE_SNAPSHOT_TAG) if cur else None
+    _store(os.path.join(SAVE_DIR, profile_id, "latest.json"), doc)
+    print("[save] 已把 %s 的 history/%s.json 提回 latest.json（items=%d, richness=%d，"
+          "恢复点 %s）" % (profile_id, ts,
+                        len((doc.get("content") or {}).get("items2") or []) // 2,
+                        _richness(doc.get("content")), snap), flush=True)
+    return snap, None
+
+
 def restore_save(profile_id, ts):
     """把某个历史快照提回 latest.json。ts 为 'latest' 或 history 文件名里的时间戳。"""
     if ts in (None, "", "latest"):
         return load_progress(profile_id)
-    src = os.path.join(SAVE_DIR, profile_id, "history", "%s.json" % ts)
-    doc = _load(src, None)
+    _, err = rollback_save(profile_id, ts)
+    return None if err else load_progress(profile_id)
+
+
+# ------------------------------------------------------- 后台下发物品（WebUI）
+# WebUI 允许下发的**存档**物品白名单。只放**语义已经被证实**、且在 items2 里就是
+# 「一个 id 对一个计数器」的东西：
+#   1 金币 Coins
+#   2 钻石/宝石 Gems
+# 见 work/trials-frontier/notes/item-ids.md（物品 id 的权威表）。
+# ⚠ 零件(5-54)/喷漆(0-107)/服装(205-847)/赛道(1108-1438) 都**不在这里**：
+#   它们的 items2 布局（是否成组、组内顺序）还没有真机验证过，瞎写会毁档。
+# ⚠ **135（PVP 金票）曾经在这里，已经被移出去。** 真机实测（m00702）：
+#   玩家在游戏里看到 13 张金票，服务器的 pvp_state.json 里
+#   `players.<pid>.golden_ticket == 13`，而 items2 里**根本没有 id 135**
+#   —— 两者是两套东西。客户端 PVP 界面读的是设备卡发来的
+#   `parseRankingData` 响应，不是存档。所以金票改走 tf_server.pvp_grant()，
+#   见 WebUI「竞技场」卡。往 items2 写 135 只会写进没人读的地方。
+GRANTABLE_ITEMS = {1: "coins", 2: "gems"}
+
+
+def load_progress_items(profile_id):
+    """读该槽的 items2 可读视图：{item_id: value}。给 WebUI 显示当前余额用。"""
+    doc = load_progress(profile_id)
     if not doc:
         return None
-    _store(os.path.join(SAVE_DIR, profile_id, "latest.json"), doc)
-    print("[save] 已把 %s 的 history/%s.json 提回 latest.json（items=%d, richness=%d）"
-          % (profile_id, ts, len((doc.get("content") or {}).get("items2") or []) // 2,
-             _richness(doc.get("content"))), flush=True)
-    return doc
+    pairs = (doc.get("content") or {}).get("items2")
+    if not isinstance(pairs, list):
+        return {}
+    out = {}
+    for i in range(0, len(pairs) - 1, 2):
+        try:
+            out[int(pairs[i])] = int(pairs[i + 1])
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def grant_items(profile_id, grants):
+    """后台下发物品：改 items2，**把 version +1**，并先留一份可回滚的快照。
+
+    grants: [{"item_id": 1, "amount": 1000, "mode": "add"|"set"}, …]
+            mode 缺省 "add"（增量）。结果不得为负。
+
+    返回 (summary, error)。
+
+    ★★ 为什么必须 bump version（这个功能能不能生效，全在这一条）：
+      客户端把上一次 sync 响应里的 `version` 记进 `Player+0x4864`（本地版本）。
+      `progress_version()` 的语义（见它自己的注释）是：
+          remote == local 或 remote == 0 -> 客户端 `syncProgress(false)`，
+                                            **用本地存档覆盖服务器**；
+          remote != local 且 remote != 0 -> 拉起进度冲突界面，玩家选云端/本地。
+      所以「只改 items2 不 bump」= remote == local = 下一次同步下发当场被抹掉。
+      bump 之后玩家在游戏里会看到进度冲突，选「用云端」才拿到物品 ——
+      **不是即点即得**，WebUI 上必须如实这么写。
+
+    ★ 不走 save_progress 的防清档护栏：那个护栏是拦**客户端上报**的半截档的，
+      这里是服务端自己受控地加数字，只会让 richness 变大。护栏不进反出会误伤。
+    """
+    pid = (profile_id or "").strip()
+    if not pid:
+        return None, "bad-profile"
+    doc = load_progress(pid)
+    if not doc or not isinstance(doc.get("content"), dict):
+        return None, "no-save"
+    content = doc["content"]
+    pairs = content.get("items2")
+    if not isinstance(pairs, list):
+        return None, "no-items2"
+    if not isinstance(grants, list) or not grants:
+        return None, "bad-grant"
+
+    # ★ 在**副本**上改：doc / content 必须保持原样，直到快照写完。
+    #   直接改 content["items2"] 会把改动带进快照，"下发前"那份就不干净了。
+    new_pairs = list(pairs)
+    before, applied = {}, []
+    for g in grants:
+        if not isinstance(g, dict):
+            return None, "bad-grant"
+        try:
+            iid = int(g.get("item_id"))
+            amount = int(g.get("amount"))
+        except (TypeError, ValueError):
+            return None, "bad-grant"
+        if iid not in GRANTABLE_ITEMS:
+            return None, "not-grantable:%d" % iid
+        idx, cur = None, 0
+        for i in range(0, len(new_pairs) - 1, 2):
+            try:
+                if int(new_pairs[i]) == iid:
+                    idx, cur = i, int(new_pairs[i + 1] or 0)
+                    break
+            except (TypeError, ValueError):
+                continue
+        if iid not in before:
+            before[iid] = cur
+        val = amount if g.get("mode") == "set" else cur + amount
+        if val < 0:
+            return None, "negative:%d" % iid
+        if idx is None:
+            new_pairs.extend([iid, val])
+        else:
+            new_pairs[idx + 1] = val
+        applied.append({"item_id": iid, "name": GRANTABLE_ITEMS[iid],
+                        "before": before[iid], "after": val})
+
+    now = int(time.time())
+    iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+    # ① 原样留一份「下发前」的档 —— WebUI 的撤销点就是它（/__restore 认这个 ts）。
+    snapshot = _snapshot(pid, doc, GRANT_SNAPSHOT_TAG)
+
+    # ② 写回：只动 items2 + version + saved_at + 审计字段，其它键一个不碰。
+    content["items2"] = new_pairs
+    newdoc = dict(doc)
+    newdoc["version"] = int(doc.get("version") or 0) + 1
+    newdoc["saved_at"] = now
+    newdoc["saved_at_iso"] = iso
+    audit = doc.get("granted")
+    audit = audit if isinstance(audit, list) else []
+    newdoc["granted"] = (audit + [{"at": now, "at_iso": iso, "items": applied}])[-20:]
+    _store(os.path.join(SAVE_DIR, pid, "latest.json"), newdoc)
+
+    print("[grant] %s <- %s（version %s -> %s，快照 %s）"
+          % (pid, ", ".join("%s %s->%s" % (a["name"], a["before"], a["after"])
+                            for a in applied),
+             doc.get("version"), newdoc["version"], snapshot), flush=True)
+    return {"profileId": pid, "applied": applied, "server_version": newdoc["version"],
+            "snapshot": snapshot, "grants": len(applied)}, None
+
+
+def restore_snapshot(profile_id, snapshot):
+    """撤销一次「下发」或「回滚」：把对应命名恢复点提回去。
+
+    ★ 只认我们自己埋的两个前缀。后台的「撤销」不该有权限把任意历史档
+      （比如玩家自己的旧进度）提上来 —— 那是存档屏「回滚」按钮的事。
+    """
+    ts = (snapshot or "").strip()
+    if not ts.startswith((GRANT_SNAPSHOT_TAG, RESTORE_SNAPSHOT_TAG)):
+        return None, "not-a-snapshot"
+    if not restore_save(profile_id, ts):
+        return None, "not-found"
+    return {"profileId": profile_id, "restored": ts, "server_version":
+            (load_progress(profile_id) or {}).get("version")}, None
 
 
 # ------------------------------------------------------------------ 幽灵
