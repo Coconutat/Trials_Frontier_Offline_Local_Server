@@ -34,23 +34,53 @@ import json
 import os
 import random
 import re
+import shutil
 import socket
 import sys
 import threading
 import time
+import webbrowser
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qsl
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-LOG_PATH = os.path.join(ROOT, "work", "trials-frontier", "notes", "server-log.jsonl")
+
+# ── 打包成 exe 之后的路径规则（用户 m09238 / m09240）───────────────────────
+# 冻结成 exe 后 `__file__` 指向临时解包目录（PyInstaller 是 `%TEMP%\_MEIxxxx`），
+# 数据若跟着它走就退出即丢、且每次运行都会重新随机生成管理员口令。所以分两类：
+#   · 只读资源（代码、admin/ 前端、rules.json、items.json、静态幽灵）→ 包内 `HERE`
+#   · 运行期数据（存档、pvp_state、tf_config、日志）                → `BASE/data`
+# 源码运行时 `BASE = server/`（与打包前的布局完全一致），打包后 `BASE = exe 所在目录`。
+FROZEN = bool(getattr(sys, "frozen", False)) or globals().get("__compiled__") is not None
+
+
+def _frozen_exe_dir():
+    """冻结后 exe 所在的目录（运行期数据就写在它旁边的 data\\）。
+
+    PyInstaller：`sys.executable` 就是那个 exe，取它的目录。
+    Nuitka onefile：`sys.executable` 指向**临时解包出来的 python.exe**（照它算，数据会落到
+    `%TEMP%\\onefile_…` 里，退出即丢 —— 真机验证过），真正的目录由 bootstrap 放在
+    `NUITKA_ONEFILE_DIRECTORY` 里（见 nuitka/build/static_src/OnefileBootstrap.c）。
+    """
+    cand = os.environ.get("NUITKA_ONEFILE_DIRECTORY")
+    if cand and os.path.isdir(cand):
+        return cand
+    return os.path.dirname(os.path.abspath(sys.executable))
+
+
+EXE_DIR = _frozen_exe_dir() if FROZEN else None
+BASE = EXE_DIR or HERE
+DATA_DIR = os.path.join(BASE, "data")
+LOG_PATH = (os.path.join(EXE_DIR, "logs", "requests.jsonl") if FROZEN
+            else os.path.join(ROOT, "work", "trials-frontier", "notes", "server-log.jsonl"))
 RULES_PATH = os.path.join(HERE, "rules.json")
 
 # ------------------------------------------------------------------ 可调参数
 # 匹配/赛季这些「运营参数」不写死在代码里，集中放 server/data/tf_config.json。
 # 按 mtime 热加载：WebUI（未来）或人手改完存盘即可生效，不用重启服务器。
-CONFIG_PATH = os.path.join(HERE, "data", "tf_config.json")
+CONFIG_PATH = os.path.join(DATA_DIR, "tf_config.json")
 
 # 内置默认值 = 发布版 tf_config.json 的内容；文件缺失/写坏时兜底，保证服务器照常起。
 _TF_CONFIG_DEFAULTS = {
@@ -1047,7 +1077,7 @@ def h_progress_version(path, query, body, headers):
 #   改完代码都会重启服务器，而他不会为了这个重开游戏 —— 于是云端摘要在
 #   「重启后、客户端下次上报前」这段空窗期里回 0，界面上又变成「等级 1」，
 #   正是他报的那个"很危险"的现象（m01175）。一个几十字节的文件换掉这类误判，值。
-_PLAYER_XP_PATH = os.path.join(HERE, "data", "player_levels.json")
+_PLAYER_XP_PATH = os.path.join(DATA_DIR, "player_levels.json")
 
 
 def _player_xp_load():
@@ -3894,7 +3924,7 @@ _pvp_tickets = {}                     # profileId -> {"tickets": n, "ts": 回票
 _pvp_chips = {}                       # profileId -> {"chips": n, "ts": 上次结算时刻, "acc": 余数, "tracks": [赛道 id]}
 _pvp_players = {}                     # profileId -> rank/star/season/win_streak
 
-PVP_STATE_PATH = os.path.join(HERE, "data", "pvp_state.json")
+PVP_STATE_PATH = os.path.join(DATA_DIR, "pvp_state.json")
 _pvp_state_lock = threading.RLock()
 _pvp_in_request = [False]
 _pvp_dirty = [False]
@@ -5889,7 +5919,7 @@ def h_friends_update(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, {"uplay": uplay}
 
 
-LEADERBOARD_PATH = os.path.join(HERE, "data", "leaderboards.json")
+LEADERBOARD_PATH = os.path.join(DATA_DIR, "leaderboards.json")
 LEADERBOARD_LOCK = threading.Lock()
 
 
@@ -7171,17 +7201,117 @@ class Handler(BaseHTTPRequestHandler):
         self._handle("OPTIONS")
 
 
+# ---------------------------------------------------------------- 打包成 exe
+# 首次运行要把「只读资源」播种到可写的 data/ 下（静态幽灵 + 奖励表 + 默认配置）。
+# ★ 白名单就是安全边界：真机存档（save/）、管理员口令哈希（admin.json）、
+#   pvp_state / leaderboards / sessions / 审计 / 日志一律**不进包也不播种**——
+#   否则发给朋友的包里就带着我自己的账号和存档。
+_SEED_FILES = ("wts_rewards.json",)
+_SEED_DIRS = ("ghosts",)
+
+
+def seed_data_dir(data_dir=None):
+    """把包内只读资源补进 data/，并补一份默认配置。只补缺，绝不覆盖已有文件。
+
+    幂等：第二次调用返回空列表。返回本次播种的条目（给启动横幅打印）。
+    """
+    target = data_dir or DATA_DIR
+    os.makedirs(target, exist_ok=True)
+    done = []
+    conf = os.path.join(target, "tf_config.json")
+    if not os.path.exists(conf):
+        with open(conf, "w", encoding="utf-8") as fp:
+            json.dump(_TF_CONFIG_DEFAULTS, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+        done.append("tf_config.json")
+    for name in _SEED_FILES + _SEED_DIRS:
+        src = os.path.join(HERE, "data", name)
+        dst = os.path.join(target, name)
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue  # 源码运行时 src 就是 dst，别自己拷自己
+        if os.path.isdir(src):
+            copied = 0
+            for root, _dirs, files in os.walk(src):
+                rel = os.path.relpath(root, src)
+                here = dst if rel == "." else os.path.join(dst, rel)
+                os.makedirs(here, exist_ok=True)
+                for fname in files:
+                    if not os.path.exists(os.path.join(here, fname)):
+                        shutil.copy2(os.path.join(root, fname), os.path.join(here, fname))
+                        copied += 1
+            if copied:
+                done.append("%s/（%d 个文件）" % (name, copied))
+        elif os.path.isfile(src) and not os.path.exists(dst):
+            shutil.copy2(src, dst)
+            done.append(name)
+    return done
+
+
+def _resolve_port(explicit=None, base=None):
+    """端口优先级：命令行 `--port` > `<程序目录>/port.txt` 第一行数字 > 8123。
+
+    port.txt 里 `#` 后面当注释。文件读不出来（写了个非数字之类）按默认起，
+    只在控制台说明，不因为一个端口号把服务器弄崩。返回 `(端口, 来源)`。
+    """
+    if explicit:
+        return int(explicit), "命令行"
+    path = os.path.join(base or BASE, "port.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    return int(line), "port.txt"
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        print("[port] %s 读不了（%r），按 8123 起。" % (path, exc), flush=True)
+    return 8123, "默认"
+
+
+def _open_admin_page(port):
+    """打包版启动后自动打开后台管理页（用户 m09240：双击就该能用，不用去抄地址）。
+
+    走系统默认浏览器（Windows 上就是 `os.startfile`），开不出来也**不拦服务**：
+    真人双击运行、有桌面会话时必成；没有桌面会话会抛异常，那样返回 False。
+    """
+    try:
+        return bool(webbrowser.open("http://127.0.0.1:%d/__admin" % port))
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=int, default=None,
+                    help="默认 8123；也可以把一行数字写进 <程序目录>/port.txt")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="启动后不自动打开浏览器（打包版默认打开后台管理页）")
     ap.add_argument("--reset-admin", nargs="?", const="", default=None, metavar="口令",
                     help="重建管理员口令并退出。不带值则随机生成一个。")
     args = ap.parse_args()
 
+    port, port_src = _resolve_port(args.port)
+    # 冻结后 sys.executable 在 Nuitka onefile 下是临时解包的 python.exe，
+    # 提示用户「怎么重跑」要用真正的入口（argv[0] 由 bootstrap 设成 exe 全路径）。
+    prog = os.path.basename(sys.argv[0] or sys.executable) if FROZEN else "python tf_server.py"
+
+    try:
+        seeded = seed_data_dir()
+    except OSError as exc:
+        print("数据目录 %s 建不了/写不了：%r" % (DATA_DIR, exc), flush=True)
+        print("把程序放到一个可写的目录再运行（别放 C:\\Program Files）。", flush=True)
+        return 1
+    if seeded:
+        print("首次运行：已在 %s 准备好 %s" % (DATA_DIR, "、".join(seeded)), flush=True)
+
     if not os.path.exists(RULES_PATH):
-        with open(RULES_PATH, "w", encoding="utf-8") as f:
-            json.dump({"*": {"status": 200, "body": {}}}, f, indent=2)
+        try:
+            with open(RULES_PATH, "w", encoding="utf-8") as f:
+                json.dump({"*": {"status": 200, "body": {}}}, f, indent=2)
+        except OSError as exc:
+            print("[rules] %s 写不了（%r），用内置路由规则。" % (RULES_PATH, exc), flush=True)
 
     # ★ 忘了管理员口令的兜底出口。不做「网页上重置」——那又变成一个无窗口期的
     #   后门，能跑这条命令的人本来就有控制台权限。
@@ -7200,13 +7330,22 @@ def main():
 
     boot = acct.admin_bootstrap()
 
-    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    try:
+        srv = ThreadingHTTPServer((args.host, port), Handler)
+    except OSError as exc:
+        print("端口 %d 起不来（%s）。" % (port, exc), flush=True)
+        print("换一个端口：把一行数字写进 %s，或用 --port 指定。" % os.path.join(BASE, "port.txt"),
+              flush=True)
+        return 1
     srv.daemon_threads = True
-    print("Trials Frontier 本地服务器已启动： http://%s:%d" % (args.host, args.port), flush=True)
+    print("Trials Frontier 本地服务器已启动： http://%s:%d" % (args.host, port), flush=True)
+    print("数据目录： %s" % DATA_DIR, flush=True)
     print("规则文件： %s" % RULES_PATH, flush=True)
     print("请求日志： %s" % LOG_PATH, flush=True)
     print("后台管理页： http://127.0.0.1:%d/__admin  （手机用 http://%s:%d/__admin）"
-          % (args.port, _lan_ip(), args.port), flush=True)
+          % (port, _lan_ip(), port), flush=True)
+    if FROZEN and port_src == "默认":
+        print("  想换端口：在 %s 旁边新建 port.txt 写一行数字（比如 9000）。" % EXE_DIR, flush=True)
     if boot:
         user, pw = boot
         print("", flush=True)
@@ -7216,10 +7355,14 @@ def main():
         print("      用户名： %s" % user, flush=True)
         print("      口  令： %s" % pw, flush=True)
         print("", flush=True)
-        print("  打开 http://127.0.0.1:%d/__admin 登录。" % args.port, flush=True)
-        print("  忘了口令就重跑： python tf_server.py --reset-admin", flush=True)
+        print("  打开 http://127.0.0.1:%d/__admin 登录。" % port, flush=True)
+        print("  忘了口令就重跑： %s --reset-admin" % prog, flush=True)
         print("=" * 66, flush=True)
         print("", flush=True)
+    if FROZEN and not args.no_browser:
+        if not _open_admin_page(port):
+            print("[ui] 没能自动打开浏览器，自己开 http://127.0.0.1:%d/__admin" % port,
+                  flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
