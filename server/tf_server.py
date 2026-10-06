@@ -2440,6 +2440,27 @@ def track_catalog():
     return rows
 
 
+def _weekly_track_health(track):
+    """赛道在服务器上有没有能用的数据 -> (能挑战的幽灵条数, 榜单真实行数)。
+
+    午夜杯的预检就靠这两个数：**没有幽灵**的赛道，玩家点「挑战」时服务端只能回
+    `replay_id = 0`，客户端会一直去要 `ghost/0/payload`（每秒几十次 404），
+    表现就是卡在「加入午夜杯」那一屏出不来。2026-10-06 用户把赛道换成 1258 就踩了这个。
+    """
+    board = "track%d" % track
+    try:
+        _, gmap = _opponent_entries()
+        ghosts = sum(1 for m in gmap.values() if m.get(board) is not None)
+    except Exception as exc:
+        print("[weekly] 幽灵库读取失败：%s" % exc, flush=True)
+        ghosts = -1
+    try:
+        rows = len(_load_leaderboards().get(board) or {})
+    except Exception:
+        rows = -1
+    return ghosts, rows
+
+
 def admin_weekly_status():
     """午夜杯「现状卡」：本周是哪一周、榜上有多少行、谁还能跑几次。全部只读。"""
     week_start, week = _week_index()
@@ -2449,6 +2470,37 @@ def admin_weekly_status():
     _, total = _stored_entries(board, None, keep_total=True)
     fake = _weekly_fake_field().get(board) or {}
     limit = _weekly_retry_limit()
+    ghosts, board_rows = _weekly_track_health(track)
+    warnings = []
+    if ghosts == 0:
+        warnings.append({
+            "cn": ("赛道 #%d 上一个幽灵都没有（内置和玩家上传的都没有）：玩家点「挑战」时服务端只能回"
+                   "幽灵编号 0，游戏会反复去要一个不存在的幽灵（每秒几十次 404），表现是卡在"
+                   "「加入午夜杯」进不去。先让玩家在这条赛道上跑一圈上传幽灵，或者把赛道换回 1041"
+                   "（它带一套内置幽灵）。" % track),
+            "en": ("Track #%d has no ghosts at all (neither built-in nor player-uploaded): the server can "
+                   "only return ghost id 0, so the client loops requesting a ghost that does not exist "
+                   "(dozens of 404s per second) and never gets past the Midnight Cup join screen. Have a "
+                   "player upload a ghost on that track first, or switch back to 1041." % track)})
+    elif board_rows == 0:
+        warnings.append({
+            "cn": ("赛道 #%d 的榜单上还没有真实成绩（只有陪跑对手）：玩家进去看到的榜是假的，"
+                   "结算前不会有真名次。" % track),
+            "en": ("Track #%d has no real leaderboard rows yet (only the fake field): the board players see "
+                   "is synthetic until someone sets a real time." % track)})
+    lb = _weekly_leaderboard_id()
+    if lb != track:
+        warnings.append({
+            "cn": ("周榜 ID 是 #%d，跟赛道号 #%d 不一样（配置里填了非 0 值）：客户端会去查 #%d 那张榜。"
+                   "那个榜上没数据的话，榜区就是空的、TOP 1%% 奖励会退化。" % (lb, track, lb)),
+            "en": ("Weekly leaderboard id is #%d while the track is #%d (a non-zero override): the client "
+                   "reads board #%d, so an empty board means a blank list and degraded top-1%% rewards."
+                   % (lb, track, lb))})
+    if span != _WEEK_SECONDS:
+        warnings.append({
+            "cn": "窗口不是 7 天（现在是 %d 天）：客户端只真机验过 7 天，其它天数是实验模式。" % (span // 86400),
+            "en": ("The window is not 7 days (currently %d): only 7 days is device-verified; other values "
+                   "are experimental." % (span // 86400))})
     players = []
     for pid, st in list(_WEEKLY_ATTEMPTS.items())[:500]:
         if not isinstance(st, (list, tuple)) or len(st) < 4:
@@ -2472,7 +2524,10 @@ def admin_weekly_status():
         "experimental": span != _WEEK_SECONDS,
         "track_id": track,
         "board": board,
-        "leaderboard_id": _weekly_leaderboard_id(),
+        "leaderboard_id": lb,
+        "ghosts": ghosts,
+        "board_rows": board_rows,
+        "warnings": warnings,
         "base_ms": (cfg_int("weekly", "fake_field_base_ms", default=0)
                     or _weekly_fake_base_ms(track)),
         "entries": total,
@@ -2709,9 +2764,8 @@ def _param_message(err):
     if err.startswith("dup-special:"):
         return "第 %s 名的特殊奖励写了两遍（客户端会发两次，请删掉一条）" % err.split(":", 1)[1]
     if err.startswith("bad-special:"):
-        return ("特殊奖励编号 %s 客户端不认识，会发成一个占位物（毛驴轮胎）。"
-                "赛季特殊奖励只能填 %d 个编号：零件 4 档、两款涂装（202 Soylent / 203 Luchador）、"
-                "毛驴图纸（220）" % (err.split(":", 1)[1], len(_PVP_SPECIAL_IDS)))
+        return ("奖励编号 %s 在物品表里查不到（server/admin/items.json 的 rewards），游戏解析不出来。"
+                "编号请从下拉里选" % err.split(":", 1)[1])
     return {"bad-request": "请求不合法",
             "bad-page": "没有这一页",
             "bad-name": "模板名不能为空或带换行，最长 %d 个字" % _TEMPLATE_NAME_MAX,
@@ -3024,10 +3078,12 @@ def _bunker_rewards_check(raw):
             raise _BadParam("range:season.rewards(名次):0-25")
         if item not in (1, 2, 145):
             raise _BadParam("bad-reward-item:%d" % item)
-        if item == 145 and amt not in _PVP_SPECIAL_IDS:
-            # 见 _PVP_SPECIAL_GROUPS：客户端的赛季特殊奖励只认这 43 个编号，
-            # 别的编号会塌成一个占位物（实测「毛驴轮胎」）。
-            raise _BadParam("bad-special:%d" % amt)
+        if item == 145:
+            known = _known_reward_ids()
+            if known and amt not in known:
+                # 只挡「物品表里根本没有的编号」—— 那种编号游戏一定解析不出来。
+                # 表外的编号（不在官方 43 个里）**放行**：显示什么由玩家有没有该物品决定。
+                raise _BadParam("bad-special:%d" % amt)
         if not 0 <= amt <= 1000000000:
             raise _BadParam("range:season.rewards(数量):0-1000000000")
         if (rank, item) in acc:
@@ -3112,13 +3168,12 @@ def admin_bunker_apply(fields):
 _BUNKER_CATALOG = {"mtime": None, "specials": [], "bikes": []}
 
 # 客户端的赛季特殊奖励表：原表 `/conf/pvp_match_rewards.txt` 的 PVPMatchSpecialRewards，
-# 7 组共 43 个编号（名字是组里那个 Comment）。
-# ★ 赛季奖励的 `item_id: 145` **只能填这里面的编号**：
-#   `PVPManager::getSpecialRewardById @0x5e231c` 对未知编号会**就地插一个空的 WheelReward**
-#   （get-or-create，永不返回 null），而唯一往这张表里塞真数据的是
-#   `PVPDataParser::parseMatchSpecialRewards @0x5db0b4`（只读 PVPMatchSpecialRewards）；
-#   于是列表里所有不认识的编号塌成同一行占位物（实测「毛驴轮胎」）。
-#   喷漆/衣服/赛道**不在**这张表里，赛季奖励发不了它们——要发请用「下发物品」页。
+# 7 组共 43 个编号（名字是组里那个 Comment）。★ 这 43 个是**客户端的固定表**，
+# 服务端改不了；但「填了别的编号就变毛驴轮胎」这条因果 2026-10-06 被真机实验推翻
+# （真因是「玩家已经拥有该物品 ⇒ 显示它自带的兜底奖励」，见
+# `work/trials-frontier/notes/pvp-reward-contract.md` §5d）。所以现在：
+#   · 奖励编号**都能填**（只挡物品表里查不到的编号）；
+#   · 界面把官方 43 个标出来，用了表外编号时给一条提示，不再拒收。
 _PVP_SPECIAL_GROUPS = (
     ("Crafting Item Tier 2", "零件 · 档位 2",
      (20003, 20008, 20013, 20018, 20023, 20028, 20033, 20038, 20043, 20048)),
@@ -3134,32 +3189,50 @@ _PVP_SPECIAL_GROUPS = (
 )
 _PVP_SPECIAL_IDS = frozenset(i for _, _, ids in _PVP_SPECIAL_GROUPS for i in ids)
 
+# 奖励编号（`items.json` 的 `rewards`）按类别分组给下拉用，顺序 = 运营最常发的排前面。
+_REWARD_CAT_CN = {"parts": "零件", "blueprint": "蓝图", "outfit": "服装", "track": "赛道",
+                  "consumable": "消耗品", "other": "其它（涂装/皮肤）", "coin": "金币",
+                  "gem": "钻石", "special": "特殊"}
+_REWARD_CAT_ORDER = ("parts", "blueprint", "outfit", "track", "consumable", "other",
+                     "coin", "gem", "special")
+
 
 def _bunker_catalogs():
-    """`items.json` 派生的两个下拉：赛季特殊奖励（客户端认的 43 个）与车辆（`paints[].bike`）。"""
+    """`items.json` 派生的两个下拉：**全部**奖励编号（标出官方 43 个）与车辆（`paints[].bike`）。
+
+    ★ 以前这里只放官方 43 个、服务端也硬拦别的编号。2026-10-06 的真机实验推翻了那条
+      因果（见 `work/trials-frontier/notes/pvp-reward-contract.md` §5d）：**显示什么由
+      「玩家有没有这件物品」决定** —— 没有就画真图标，已经有就画该编号自带的兜底奖励
+      （大多是「毛驴轮胎」甜甜圈）。表外编号游戏解析不出来，也可能一直是兜底物，
+      所以只**提示**、不再拦。
+    """
     try:
         stamp = os.path.getmtime(_TRACK_CATALOG_PATH)
     except OSError:
         return [], []
     if _BUNKER_CATALOG["mtime"] == stamp:
         return _BUNKER_CATALOG["specials"], _BUNKER_CATALOG["bikes"]
-    specials, bikes = [], {}
+    rewards, bikes = [], {}
     try:
         with open(_TRACK_CATALOG_PATH, "r", encoding="utf-8") as fp:
             data = json.load(fp)
-        named = {}
         for raw_id, node in (data.get("rewards") or {}).items():
+            if not isinstance(node, dict):
+                continue
             try:
-                named[int(raw_id)] = node if isinstance(node, dict) else {}
+                rid = int(raw_id)
             except (TypeError, ValueError):
                 continue
-        for group_en, group_cn, ids in _PVP_SPECIAL_GROUPS:
-            for rid in ids:
-                node = named.get(rid) or {}
-                specials.append({"id": rid, "group_en": group_en, "group_cn": group_cn,
-                                 "name": node.get("name") or "",
-                                 "name_cn": node.get("cn") or node.get("name") or "",
-                                 "item_id": node.get("item_id")})
+            cat = str(node.get("cat") or "other")
+            rewards.append({"id": rid, "cat": cat,
+                            "cat_cn": _REWARD_CAT_CN.get(cat, cat),
+                            "name": node.get("name") or "",
+                            "name_cn": node.get("cn") or node.get("name") or "",
+                            "item_id": node.get("item_id"), "type": node.get("type"),
+                            "official": rid in _PVP_SPECIAL_IDS})
+        rewards.sort(key=lambda r: (_REWARD_CAT_ORDER.index(r["cat"])
+                                    if r["cat"] in _REWARD_CAT_ORDER else len(_REWARD_CAT_ORDER),
+                                    r["id"]))
         for node in (data.get("paints") or {}).values():
             if not isinstance(node, dict):
                 continue
@@ -3169,9 +3242,14 @@ def _bunker_catalogs():
     except (OSError, ValueError, AttributeError):
         return [], []
     rows = [{"id": bid, "name": bikes[bid]} for bid in sorted(bikes)]
-    if specials or rows:
-        _BUNKER_CATALOG.update(mtime=stamp, specials=specials, bikes=rows)
-    return specials, rows
+    if rewards or rows:
+        _BUNKER_CATALOG.update(mtime=stamp, specials=rewards, bikes=rows)
+    return rewards, rows
+
+
+def _known_reward_ids():
+    """物品表（`items.json` 的 `rewards`）里所有奖励编号。表读不到就返回空集合 = 不拦。"""
+    return frozenset(r["id"] for r in _bunker_catalogs()[0])
 
 
 def bunker_audit(limit=30):
@@ -3218,6 +3296,23 @@ def admin_bunker_status():
                          "en": "Idle chip farming is off (period 0): players only gain chips from matches."})
     warnings.append({"cn": "玩家的段位/星章/金票只走这个页面改；直接编辑 pvp_state.json 会被服务器下次写盘覆盖。",
                      "en": "Change player rank/star/tickets here only; editing pvp_state.json gets overwritten."})
+    # 奖励表里用了官方 43 个编号之外的编号：能发，但游戏很可能画成兜底物（毛驴轮胎）。
+    # 说清楚是「玩家已有该物品」优先，别让运营以为配置坏了（§5d）。
+    odd = sorted({int(r.get("amount") or 0) for r in (_bunker_rewards_read() or [])
+                  if int(r.get("item_id") or 0) == 145 and int(r.get("amount") or 0)
+                  and int(r.get("amount") or 0) not in _PVP_SPECIAL_IDS})
+    if odd:
+        warnings.append({
+            "cn": ("奖励表里有 %d 个编号不在官方的赛季特殊奖表（43 个）里：%s。"
+                   "游戏显示什么由「玩家有没有这件物品」决定 —— 没有就画真图标，已经有了就画该编号自带的"
+                   "兜底奖励（大多是「毛驴轮胎」甜甜圈）；表外编号也可能一直是兜底物。"
+                   "想让它们在赛季列表里稳定显示，用「下发物品」页发更稳。"
+                   % (len(odd), "、".join("#%d" % i for i in odd))),
+            "en": ("%d reward id(s) are outside the client's 43 official season specials: %s. "
+                   "The client draws the real icon only for items the player does NOT own; otherwise it "
+                   "draws the id's own fallback (usually the Donkey Doughnut), and ids outside the client "
+                   "table may always show the fallback. Use the Grant screen for those items."
+                   % (len(odd), ", ".join("#%d" % i for i in odd)))})
     return {"now": now, "season": sid, "display_id": _pvp_display_season(sid),
             "duration_days": max(1, cfg_int("season", "duration_days", default=30)),
             "start": start, "end": end,
@@ -3230,14 +3325,14 @@ def admin_bunker_status():
 
 def bunker_payload():
     """碉堡页要的全部只读数据：界面照着它画，不用自己拼默认值。"""
-    specials, bikes = _bunker_catalogs()
+    rewards, bikes = _bunker_catalogs()
     return {"cards": [{"id": c, "cn": cn, "en": en} for c, cn, en in _BUNKER_CARDS],
             "fields": [dict(f, default=_bunker_default(f["key"]), now=_bunker_get(f["key"]))
                        for f in _BUNKER_FIELDS],
             "values": bunker_values(),
             "status": admin_bunker_status(),
             "tracks": track_catalog(),
-            "specials": specials,
+            "rewards": rewards,
             "bikes": bikes,
             "templates": templates_for("bunker").get("bunker", []),
             "audit": bunker_audit(30)}

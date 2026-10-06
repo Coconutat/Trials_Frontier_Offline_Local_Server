@@ -73,7 +73,10 @@ POST /public/pvp_matches/v1/close
 - [match原表:3671–3697](../../../tmp/pvp_match_rewards.txt#L3671-L3697)：MissingRewardFallbackRewards按rank1..25配置；兜底候选不是金币/宝石无条件加发。
 - 旧报告的 `pow(t,x)*y` 若x=0得到恒定**总量**，不是恒定速率；欲线性累计应x=1、y=每秒速率。此处修正数学解释，不改旧报告或线上配置。
 
-## 5b. ★ 赛季特殊奖只有 43 个编号可用（2026-10-06 追加，用户实测 bug）
+## 5b. ★ 赛季特殊奖的官方清单只有 43 个编号（2026-10-06 追加，用户实测 bug）
+> ⚠ **本节结论已被 §5d 修正**：那 43 个编号是**官方赛季发过哪些**的清单，**不是**「只能填这 43 个」的限制。
+> 用户看到的「毛驴轮胎」真因是**玩家已拥有该物品 ⇒ 客户端改画该编号自己声明的兜底奖励**，
+> 与「编号认不认识」无关。下面这段的反汇编仍然成立，只是最后那句因果推断被推翻了。
 - **症状**：运营在赛季奖励里填了几款**喷漆/衣服**的编号（205/257/258/259），真机上整张奖励轨道全部显示 **毛驴轮胎**。
 - **机制**：`tr::PVPManager::getSpecialRewardById(int) @0x5e231c`（324 B）查 `this+0x288` 的 `std::map<int, tr::ItemManager::WheelReward>`（键=节点 `+0x20`、值=节点 `+0x24`），**未命中时不返回 null，而是就地插入一个默认构造的空 WheelReward**：`0x5e2410` 的 `std::piecewise_construct`（字面量 `@0xb8f859`）+ `0x5e242c bl ..._Rb_tree..._M_emplace_hint_unique...`，返回 `x8+0x24` ⇒ 调用点 `MenuzStatePVPPostSeason::setupRewards` 的 `0x735584 cbz x23,#0x7359f8` 是死代码。
 - **唯一填充者**：`tr::PVPDataParser::parseMatchSpecialRewards(json_value*, std::map<int,WheelReward>&) @0x5db0b4`（它同时也往 `std::vector<PVPSpecialWheelRewardLevel>` 里 emplace，该 `_M_emplace_back_aux @0x5ddaf0` 的唯一调用者就是它）；对照 `PVPDataParser::parseMatchRewardTypes @0x5daf5c` 只调 `ItemManager::parseWheelReward @0x59dd8c`（1712 B）、**函数签名里没有 map** ⇒ 那张 309 条的轮盘表（喷漆/衣服/赛道都在里面）**不会**填这张表。
@@ -90,6 +93,28 @@ POST /public/pvp_matches/v1/close
 - ⇒ **去重后 43 个编号**（`202, 203, 220` + 40 个零件）。第 5 档轮盘编号 `20004/20009/…/20049` 只在 309 条那张表里，**不是**特殊奖。
 - 其它约束：`getCombinedSeasonRewards @0x5e7364` 只收 `cmp w8,#0x91`（item_id==145）的 pair，别的 item_id 在 `0x5e7430-0x5e7480` 被 `b.ne` 跳过；`isRewardSpecial(const WheelReward&) @0x5e22e0` = `ldrb [x1,#4]` 非零为真，否则 `ldrsh [x1,#0x10]` 走 `/10-1 >= 10`。
 - **服务端落地（`server/tf_server.py`）**：`_PVP_SPECIAL_GROUPS`（7 组，同一张表）+ `_PVP_SPECIAL_IDS`（frozenset，43）；`_bunker_rewards_check()` 对 `item_id 145` 的 amount 不在集合里就 `bad-special:<id>`；`_bunker_catalogs()` 改成吐 `specials`（43 条，带 `group_en/group_cn`，按组连续，供 `<optgroup>`），`bunker_payload()` 的键从 `rewards` 改成 `specials`。
+  > ⚠ **这段实现已被 §5d 取代**：现在 `_bunker_catalogs()` 吐**全部 309 条** `rewards`（带 `cat` / `cat_cn` / `official`），`bunker_payload()` 的键是 `rewards`，`_bunker_rewards_check()` 只拒「物品表里查不到的」编号。
+
+## 5c. ★ 官方怎么"发衣服和蓝图"：服务端只发编号，物品表在客户端内容包里（2026-10-06 追加，回答用户提问）
+- **服务端从头到尾只发编号**（`item_id 145` + `amount = RewardID`）。编号→物品的翻译表全在客户端：`tr::PVPDataParser::loadConfig() @0x5da098` 用 `datapack::DataFilePack::searchFile(const char*, int&)`（PLT `0x34fcd0`）读 `/conf/pvp_match_rewards.txt`（串 `@0xb8f374`）与 `/conf/pvp_chip_store.txt`（串 `@0xb8f390`），再 `read(buf)`（vtable `+0x68`）→ `parseJson`；`parseJson @0x5da21c` 全库只有两个调用点（`0x5da128`、`0x5da1c4`），都在 `loadConfig` 里。
+- `std::vector<PVPSpecialWheelRewardLevel>::operator= @0x5dd0e0` **唯一调用者** = `0x5dabb8`（在 `parseJson` 内）⇒ 赛季特殊奖集合只能来自这个本地表，**任何服务端 JSON 都改不了它**。
+- 因此 7.9.4 里官方赛季轨道**用过**的"衣服/蓝图"只有 **202 / 203（两件车涂装）+ 220（Donkey 图纸）**；`205`（Stitch 喷漆）与 `257/258/259`（忍者服装）只在 309 条轮盘表里，官方渠道是**比赛结算轮盘 / 筹码店 / 礼包**，不走赛季轨道。
+  > ⚠ 但「它们当不了赛季奖励」这个**推论是错的**（§5d 已用真机实验推翻）：服务端表里照样填，客户端也照样解析，只是**玩家已拥有**这件物品时会画它自带的兜底奖励。
+- **换表机制（可覆盖，关键）**：`tr::GlobalData::initAdditionalDataPacks() @0x4cfdd0` 用 `GlobalData::findFilePacks(const char*, std::vector<std::string>&) @0x4d23a0` 找 `TrialsContentExtraDL.dat`（串 `@0xb7d429`）派生的一批文件，`std::sort` 后 `std::reverse`，逐个 `new datapack::DataFilePack(name, true)`（0x78 B；ctor `@0x843fc8`，调用点 `0x4cfef4`/`0x4cffe8`/`0x4d01b0`/`0x4d02b8`）挂进 `std::vector<DataFilePack*>`；`findFilePacks` 内部走 `mt::file::SaveFile::getFileList`（PLT `0x3603a0`，TYPE=6，过滤串 `.dat` `@0xb7ce09`，按 `.` 截断取主干）。设备上 `/data/data/<pkg>/files/` 里正好有 `TrialsContentExtraDL_*.dat`（见 `work/trials-frontier/notes/selfcontained-apk.md` 真机验证节）。
+- `datapack::DataFilePack::searchFile(const char*, int&) @0x844a78`（276 B）：**只查已挂载的 pack**（`DataFilePack::m_instances`，`mt::String::getHashCode` 哈希 + `0x28` 步长开放寻址表，掩码在 `+0x6c`），**没有任何文件系统回退**；命中后 `openFile(j)`；扫描方向是从 `m_instances` **末尾往前**（先命中先赢）。
+  ⇒ **改表不必重打 `content.dat` / 重签 APK**：写一个小覆盖包放进那个目录即可（打包器已入库：`tools/re/pack_write.py`，用法 `selftest` / `read <pack.dat> <内部路径>` / `build <out.dat> <内部路径>=<本地文件>`；容器格式见 `work/trials-frontier/notes/item-ids.md` §0：magic `dbf7dddb`，`flag==1` 时 zlib，条目名后缀 = `mt::String::getHashCode(path)`；提取侧已用 `tmp\verify_pack_recipe.py` 验过 SHA256 往返一致）。
+- **运行时下载路径**：`tr::DLContentManager`（`init/resume/downloadNextFile/parseInfo/activatePack(s)…`，符号 `0x4f020c`…`0x4f3240`）用桶文件 `dl_conf.dat` / `dl_uxm.dat`（串 `@0xb85d25` / `@0xb85d31`，引用点 `0x4f3984`/`0x4f3a40`/`0x4f3be0`）⇒ 官方靠 **DL 内容包**在发行后替换包括 `/conf` 表在内的客户端内容。
+- **已验证（2026-10-06 真机实验，设备 `bdca0e2a`）**：覆盖包确实赢过 `content.dat` —— 造 `TrialsContentExtraDL_0probe.dat` 推进 `/data/data/com.ubisoft.redlynx.trialsfrontier.ggp/files/` 后，`/proc/<pid>/fd` 里出现 **`298 -> …/files/TrialsContentExtraDL_0probe.dat`**（只读），排在 13 个原 DL 包（fd 284–297，Swamp→…→Cave 降序）之后 ⇒ 与反汇编推出的「排序 → reverse → 逐个挂载；`searchFile` 从 `vector` 末尾往前扫、先命中先赢」完全吻合，**它优先级最高**。副作用证据：包内把 3 条 LOCF 文案改成 `PACK-OK` 的探针与赛季奖励行改动都在游戏里生效。
+
+## 5d. ★★ 真因：**已拥有**该物品时客户端改画它自带的兜底奖励（2026-10-06 真机实验，推翻 §5b 的因果）
+- **起因**：用户 m07402「没错。只有这个账号没有的物品才能显示。有了就返回毛驴轮胎...」。
+- **原表自带 `Fallback`**：`PVPMatchRewardTypes`（309 行）里 **237 行**带 `Fallback` 字段，其中 **215 行 = `221`**（`Doughnut`，`ItemId 150`，贴图 `/MENUZ/ITEM/DOUGHNUT.PNG`，`NameId WSI_DOUGHNUT_NUT_TITLE` = 我们一直叫的「毛驴轮胎」），**22 行 = `-2`**（`Type:2` 的涂装类，如 202/203/205）。
+  例：`{"ID":220,"Comment":"Donkey blueprint part. **As a fallback reward, Doughnut is used.**","ItemId":459,"Fallback":221,…}`；`{"ID":257/258/259,"Comment":"The Ninja Top/Middle/Bottom","ItemId":820/821/822,"NameId":"OUTFIT_48_NAME","Fallback":221,"ShowInfoPopup":0}`。
+  工艺件（`20020/20025/20030/20035/20040/20045`…）与 `100`（`SPECIAL PVP REWARD ITEM`，`ItemId 145`）**都没有** `Fallback`。
+  ⇒ 这解释了截图里「行1（220）画甜甜圈、行2（20035）画真滚珠轴承图标」的对照。
+- **实验（覆盖包 v2；打包用已入库的 `tools/re/pack_write.py`，驱动脚本 `tmp/mk_probe2.py` 是一次性的）**：把原表里 **220 那一行**改成 `ItemId 414`（Stallion 蓝图）+ `TextureName /MENUZ/ITEM/BLUEPRINT_9.PNG` + `ItemAmount 30` + `NameId PVPS_STALLION_TITLE` + **删掉 `Fallback`**（`PVPMatchSpecialRewards` 的 100.0 组保持 220 不变）。用户实测回报：**那一档真的画出了 Stallion 图纸** ⇒ ①覆盖包生效；②`Fallback` 语义 = 「玩家已有该物品时的替代显示」；③服务端/原表填什么编号都能解析，不存在 §5b 说的「未知编号塌成占位」。
+- ⇒ **可填范围不再是 43 个**：服务端只挡「物品表里查不到的编号」（`server/admin/items.json` 的 `rewards`，309 条）；官方那 43 个（`_PVP_SPECIAL_IDS`）只在界面上标 ★。
+- **未确定**：`Fallback: -2` 的确切语义（涂装类），以及「已拥有」判定是查存档物品还是查本地库存缓存。
 
 ## 6. 最小回归清单
 - 同一match双方查询池一致；两次不同increase累加、同一已识别重试不再累加；进程重启仍保留池和reward_data。

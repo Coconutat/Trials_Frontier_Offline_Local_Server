@@ -61,7 +61,7 @@ Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
 |---|---|
 | `tf_server.py` | HTTP 服务器：路由 + 全部动态端点处理器 + 请求日志 + 内嵌管理页。~4000 行 |
 | `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储 + 管理员账号 + 受控下发。纯数据层，不碰 HTTP。~1800 行 |
-| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 + 304 条奖励名，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
+| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 + 309 条奖励名，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
 | `rules.json` | 静态桩响应表（`"<METHOD> <路径前缀>"` → `{status, headers, body}`）。只服务那些「有响应就行」的端点 |
 | `data/tf_config.json` | 运营参数（匹配、赛季、周赛、奖励、筹码）。**唯一入库的 `data/` 文件** |
 | `data/ghosts/` | 幽灵仓库：`<赛道id>/*.bin`（游戏自带静态幽灵，入库）+ `store/` `index.json` `replays.json`（运行期，不入库） |
@@ -381,7 +381,7 @@ python -m unittest discover -s tests -v
   优先、否则跟随 `navigator.language`）。前端**只用 `textContent` 渲染玩家可控字符串**
   （账号名 / 平台名直接来自客户端上报，是信任边界）。
 * 「下发物品」屏的物品清单来自 `server/admin/items.json`（478 条物品 + 80 套服装 + 108 款涂装
-  + 12 个蓝图 + 382 条赛道 + 304 条奖励名，中英名直接取自游戏自己的本地化表），由
+  + 12 个蓝图 + 382 条赛道 + 309 条奖励名，中英名直接取自游戏自己的本地化表），由
   `tools/build_item_catalog.py` 从解包出的 `content.dat` 生成 —— 改物品表 / 套装表 / 车表 /
   升级表 / 赛道表就重跑它。每条带 `cat` 与 `verified`：
   只有**真机上确认过存档写法**的类（货币 / 消耗品 / 零件 / 服装 / 蓝图）不带「未验证」警告；
@@ -389,8 +389,8 @@ python -m unittest discover -s tests -v
   **蓝图和其余类一样是计数器**（这一条最初写错了，见下面那条）。
   另外两段不参与下发、只喂下拉：`levels`（382 条赛道 → `track_catalog()`，午夜杯的
   `weekly.track_id` 与碉堡的候选/固定赛道都用它）、`rewards`（`/conf/pvp_match_rewards.txt`
-  的 RewardID → 名字 → ItemId；碉堡「赛季奖励」的下拉**只取其中 `PVPMatchSpecialRewards`
-  那 43 个编号**，见 §7.1 那条）。
+  的 RewardID → 名字 → ItemId；碉堡「赛季奖励」的下拉**用全部 309 条**，其中带 `official`
+  标记的 43 个是客户端固定表 `PVPMatchSpecialRewards` 里的，见 §7.1 那条）。
 * **服装按「套」列**（`outfits` 段，来自 `/conf/customization.txt`）：勾一套 = 头盔 / 上衣 /
   裤装三件一起解锁（`id = ItemType * 5 + tier`），行上带官方名 + 内部代号 +
   「已拥有 n/3」+ **套装效果文案**（`BonusPower`，集齐即账号级生效，例如 The High Roller
@@ -433,12 +433,27 @@ python -m unittest discover -s tests -v
     `PopupStatePVPXGames::getPVPSeasonName` 只取第一个 `|` 之后的部分 ⇒ 含 `|` 直接 `bad-pipe`。
     **换横幅图必须换 URL**（客户端拿 URL hash 跟 `season_banner%d.bnr` 里的 4 字节比，不符才重下）。
   - **特殊奖励是 RewardID 不是 ItemId**：`item_id 145` 的 `amount` 由客户端的
-    `/conf/pvp_match_rewards.txt` 解释。★★ **只有原表 `PVPMatchSpecialRewards` 里的 43 个编号
-    能用**（`_PVP_SPECIAL_GROUPS` / `_PVP_SPECIAL_IDS`：零件 4 档 + 202 Soylent 涂装 +
-    203 Luchador 涂装 + 220 毛驴图纸），别的编号服务端判 `bad-special:<id>`，界面当场标红。
-    原因：`PVPManager::getSpecialRewardById` 是 **get-or-create**，未知编号会就地插一个空的
-    `WheelReward` ⇒ 玩家看到的是同一个占位物（毛驴轮胎）。喷漆 / 衣服 / 赛道只存在于另一张
-    309 条的轮盘表，**当不了赛季奖励**，要发请走「下发物品」页。
+    `/conf/pvp_match_rewards.txt` 解释。服务端只挡「物品表里查不到」的编号
+    （`bad-special:<id>`）；物品表（`items.json` 的 `rewards`，309 条）里存在的一律放行，
+    其中 43 条是客户端固定表 `PVPMatchSpecialRewards` 里的（`_PVP_SPECIAL_GROUPS` /
+    `_PVP_SPECIAL_IDS`：零件 4 档 + 202 Soylent 涂装 + 203 Luchador 涂装 + 220 毛驴图纸），
+    界面在下拉里给它们加 ★、对表外编号给一行黄色提示。
+    **显示规则**（2026-10-06 真机实验，覆盖包挂载后验证）：客户端先看玩家**有没有**这件物品 ——
+    没有就画真实图标，**已经有**就改画该编号自己声明的兜底奖励（原表里 237 行带 `Fallback`，
+    其中 215 行是 `221` = Doughnut「毛驴轮胎」，22 行是 `-2`）。所以同一编号在不同账号上可能
+    长得不一样，**不是配置坏了**。旧说法「表外编号一律塌成占位物」已被实验推翻（详见
+    `work/trials-frontier/notes/pvp-reward-contract.md` §5d）。要稳稳地发喷漆 / 衣服 / 整车，
+    仍然走「下发物品」页。
+  - **两屏都有「怎么运作」引导卡**（`weekly.guide.*` / `bunker.guide.*`，文案在
+    `admin/i18n.json`，不像字段标签那样放在服务端字段表里）：午夜杯那张写明**没有开关**
+    （届号 = 时间/届长，钉在 1970）、「立刻结束本届」= 周号 +1、换赛道前要先有幽灵、
+    改奖励要退出重进、次数在内存里重启回满；碉堡那张写明赛季长度与显示编号、每档增量、
+    奖励显示规则、官方 43 个带 ★、改完退出重进、段位只能在本页改。
+  - **午夜杯现状卡带赛道预检**（`admin_weekly_status()` 的 `ghosts` / `board_rows` /
+    `warnings`）：用户实测把 `track_id` 换成本服没有幽灵的赛道（1258）后，玩家卡在
+    「加入午夜杯」——服务端只能回 `replay_id=0`，客户端反复去要 `ghost/0/payload`（404）。
+    现在 `ghosts==0` 直接在卡上红字说明，`lb != track`（周榜指向别的榜）和窗口 ≠ 7 天
+    也各有一条警告。
   - **段位名不存在**（客户端 `MenuzComponentPVPRank` 里零次本地化调用、LOCF 里也没有
     `RANK_%d` 键）⇒ 只提供星章表与起始段位，卡里只读说明。
   - **绝不直接编辑 `data/pvp_state.json`**：金票 / 筹码 / 段位 / 星 / 连胜只走 `/__api/admin/*`
@@ -461,8 +476,8 @@ python -m unittest discover -s tests -v
 | `POST /__api/admin/grant` | 存档下发（可下发项 = `admin/items.json` 的 478 条，服装按套勾，蓝图按车勾、可填片数；`paints` 字段 = 涂装 id 数组，写 `items2[664+BikeID]` 的位掩码；每次先埋快照） |
 | `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
 | `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
-| `GET\|POST /__api/admin/weekly` | 午夜杯运营参数（GET = 配置 + 现状 + 赛道目录 + 模板 + 最近改动；POST `{fields:{…}}` **逐键校验、全部合法才落盘**，每个键回 `{key,before,after,audit}`） |
-| `GET\|POST /__api/admin/bunker` | 碉堡运营参数（GET = 8 张卡的字段表 + 当前值 + 现状（赛季/玩家/对局/队列/在线）+ 赛道与奖励目录 + 模板 + 最近改动；POST 同 weekly 的 `{fields:{…}}` 契约，空值 = 删键回默认） |
+| `GET\|POST /__api/admin/weekly` | 午夜杯运营参数（GET = 配置 + 现状（含 `ghosts`/`board_rows`/`warnings` 赛道预检）+ 赛道目录 + 模板 + 最近改动；POST `{fields:{…}}` **逐键校验、全部合法才落盘**，每个键回 `{key,before,after,audit}`） |
+| `GET\|POST /__api/admin/bunker` | 碉堡运营参数（GET = 8 张卡的字段表 + 当前值 + 现状（赛季/玩家/对局/队列/在线/警告）+ 赛道与 `rewards`（全 309 条，带 `official` 标记）目录 + 模板 + 最近改动；POST 同 weekly 的 `{fields:{…}}` 契约，空值 = 删键回默认） |
 | `POST /__api/admin/undo` | 撤销一条参数改动（`{id}` 来自 weekly / bunker 的 `audit`；按记录里的 `existed` 决定写回还是删键） |
 | `GET\|POST /__api/admin/templates` | 参数模板（GET `?page=weekly\|bunker`；POST `{page,action:save\|apply\|copy\|rename\|delete,name,new_name,parts}`，`parts` 可 `all` / `rewards`） |
 
