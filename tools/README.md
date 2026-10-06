@@ -369,8 +369,9 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
   脚本里的 `gh()`）。表里只有 `ITEM_<type>_<tier>`、`OUTFIT_%02d_NAME`、`LVL_<NAME>`
   这些键，所以名字必须靠 `NameId` 反查，不能直接匹配英文原文。
 * **分类 + `verified`**：分类是按 `Type` 与贴图路径推的；`verified` 表示「这个类的存档写法
-  **在真机上确认过**」——只有涂装（Type 2）与赛道（Type 1/3）是 `false`，后台会给它们挂
-  「未验证」警告。改判定就改脚本里的 `category()`。
+  **在真机上确认过**」——只剩赛道（Type 1/3）是 `false`，后台会给它挂「未验证」警告。
+  改判定就改脚本里的 `category()`。★ 涂装（Type 2）**不再是条目**：它不走 `items2` 的键
+  （见下），混在物品里发下去会写到零件计数上，所以 `category()` 里那条分支已删。
 * **服装 ← `/conf/customization.txt`**（`0007_*.bin`，脚本按内容找、不认文件名哈希）：`Rider` 数组
   80 条，每条 `NameStringId = OUTFIT_%02d_NAME`、`BonusPowerDescriptionStringId = OUTFIT_%02d_POWER`。
   **套装部件 id = `ItemType * 5 + tier`**（tier 0/1/2 = 头盔 / 上衣 / 裤装）；
@@ -381,17 +382,30 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
   part_names,unlock,hidden,derived}}`，`setKey = "OUTFIT_34_NAME#116"`（同名两套用 `Comment`
   尾巴区分，如 Henchman Uniform 黑/橙）。`hidden` = `UnlockType` 全是 4（没上架过），
   目前 46 套；`bonus` 是效果原文（`MULTIPLY_FUEL_REFILL_TIME 0.006` = High Roller 的无限汽油），
-  带效果的有 24 套。部件 id 与「赛道解锁」条目**有 19 个编号撞车**（如 1130 既是 Garbage Route
+  带效果的有 24 套。部件 id 与「赛道解锁」条目**有 20 个编号撞车**（如 1130 既是 Garbage Route
   又是 Wurst Racer 头盔）：按服装归类，旧名字记进条目的 `alias` 与 `source.overlap_ids`。
+* **涂装 ← `/conf/bikes.txt`**（`0002_*.bin`，顶层 `{"BikeData": …, "SkinData": […]}`）：`SkinData`
+  正好 108 款、`ID` 连续 0..107，每款 `{ID, Name, BikeID, SkinIndex, TextureName, PaintCanTexture,
+  [DiamondCost], [MissionUnlock]}`；官方名来自**商店/奖励表里 `Type == 2` 记录的 `NameId`**
+  （那个记录的 `ItemId` 就是 `SkinData.ID`），108 款里只有 66 款被商店引用过、67 款有官方中文名，
+  其余的显示内部名（`SkinData.Name`）。
+  ★★ **涂装不进 `items2` 的键空间**：存档里每辆车只有一条
+  `items2[664 + BikeID] = ((当前装备的 SkinIndex + 1) << 24) | 已拥有位掩码`（位 i = 第 i 款），
+  位掩码只有 24 位。这是反汇编 + 真机存档（ccb 的 665/666/668/677/678/680 六条）双向确认的；
+  反汇编里那些 XOR/rotate 只是内存内的混淆，**JSON 里存的是明文**。
+  所以 `paints` 段的字段是 `{id,bike,bike_en,slot,key,bit,name,nameid,en,cn,verified,comment,
+  [diamond],[mission_unlock]}`，`key = 664 + bike`、`bit = 1 << slot`；后台按「车」分组列，
+  勾一款 = 给那一位置 1（`tflocal_accounts._paint_value()`）。
 * `/conf/dailyrewards.txt` 有 RedLynx 原厂的漏逗号（`item-ids.md` 里记过），
-  所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试。
-  `0010_1854657d.bin` 目前仍解析不了（少 7 条 RIDER 记录），会记进 `source.skipped_files`。
+  所以脚本带 `load_json_tolerant()`：去尾逗号 / 去 `//` 注释 / 按报错位置插逗号重试（最多 16 次，
+  `0010_1854657d.bin` 需要 12 次）。**现在 0 个文件解析失败**，`source.skipped_files` 是空表。
 
 **金票（135）被显式跳过**：它不在存档 `items2` 里，走 `server/data/pvp_state.json`。
 
-生成的 `server/admin/items.json`（500 条物品 + 80 套服装）同时被三处消费：后台的折叠清单、
-`tflocal_accounts.grantable_items()`（可下发集合）、`tests/test_admin_webui.py::ItemCatalog` /
-`::OutfitSets`（形状与公式自检）。**改了物品表或套装表就重跑它。**
+生成的 `server/admin/items.json`（477 条物品 + 80 套服装 + 108 款涂装）同时被四处消费：后台的
+折叠清单、`tflocal_accounts.grantable_items()`、`tflocal_accounts.grantable_paints()`（可下发集合）、
+`tests/test_admin_webui.py::ItemCatalog` / `::OutfitSets` / `::Paints`（形状与公式自检）。
+**改了物品表 / 套装表 / 车表就重跑它。**
 
 ---
 

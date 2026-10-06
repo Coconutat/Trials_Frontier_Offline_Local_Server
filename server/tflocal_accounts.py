@@ -1207,6 +1207,48 @@ def grantable_items():
     return out or dict(GRANTABLE_FALLBACK)
 
 
+def grantable_paints():
+    """{涂装 id: {"key","slot","bike","name"}}。涂装**不是 items2 的键**：存档里每辆车一个
+    24 位拥有位掩码（键 = 664 + 车号，位 = SkinIndex，见 tools/build_item_catalog.py 开头
+    ★ 涂装）。所以位算错了会写到别的数据上 —— 目录读不到就返回空表，宁可不发。"""
+    try:
+        with open(_ITEM_CATALOG_PATH, encoding="utf-8") as fh:
+            paints = json.load(fh)["paints"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    out = {}
+    for k, p in paints.items():
+        try:
+            pid, key, slot = int(k), int(p["key"]), int(p["slot"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if key > 0 and 0 <= slot < 24:
+            out[pid] = {"key": key, "slot": slot, "bike": int(p.get("bike") or 0),
+                        "name": p.get("en") or p.get("cn") or ("paint %d" % pid)}
+    return out
+
+
+def _paint_value(cur, slot):
+    """把「第 slot 款涂装已拥有」写进这辆车的涂装字：低位 24 位 = 拥有位掩码，
+    高 8 位 = 当前装备的那一款（0 = 这辆车还没装备过任何涂装）。
+    车还没装备过时顺手把这一款设为当前 —— 否则后台发完，游戏里看不出来。"""
+    val = int(cur or 0) | (1 << slot)
+    if not (val >> 24) & 0xFF:
+        val |= (slot + 1) << 24
+    return val
+
+
+def _pair_index(pairs, iid):
+    """items2 是扁平的 [键, 值, 键, 值, …]，返回值所在的键下标。"""
+    for i in range(0, len(pairs) - 1, 2):
+        try:
+            if int(pairs[i]) == iid:
+                return i
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def load_progress_items(profile_id):
     """读该槽的 items2 可读视图：{item_id: value}。给 WebUI 显示当前余额用。"""
     doc = load_progress(profile_id)
@@ -1224,11 +1266,13 @@ def load_progress_items(profile_id):
     return out
 
 
-def grant_items(profile_id, grants):
-    """后台下发物品：改 items2，**把 version +1**，并先留一份可回滚的快照。
+def grant_items(profile_id, grants, paints=None):
+    """后台下发物品 / 涂装：改 items2，**把 version +1**，并先留一份可回滚的快照。
 
     grants: [{"item_id": 1, "amount": 1000, "mode": "add"|"set"}, …]
             mode 缺省 "add"（增量）。结果不得为负。
+    paints: [涂装 id, …]（id 来自 SkinData，**不是** items2 的键；改的是 664+车号 那一条的
+            位掩码，见 `grantable_paints` / `_paint_value`）。两者可以一起发，共用一份快照。
 
     返回 (summary, error)。
 
@@ -1255,7 +1299,10 @@ def grant_items(profile_id, grants):
     pairs = content.get("items2")
     if not isinstance(pairs, list):
         return None, "no-items2"
-    if not isinstance(grants, list) or not grants:
+    if not isinstance(grants, list):
+        return None, "bad-grant"
+    grants = [g for g in grants if isinstance(g, dict)]
+    if not grants and not paints:
         return None, "bad-grant"
 
     # ★ 在**副本**上改：doc / content 必须保持原样，直到快照写完。
@@ -1264,8 +1311,6 @@ def grant_items(profile_id, grants):
     before, applied = {}, []
     allowed = grantable_items()
     for g in grants:
-        if not isinstance(g, dict):
-            return None, "bad-grant"
         try:
             iid = int(g.get("item_id"))
             amount = int(g.get("amount"))
@@ -1293,6 +1338,35 @@ def grant_items(profile_id, grants):
         applied.append({"item_id": iid, "name": allowed.get(iid) or ("item %d" % iid),
                         "before": before[iid], "after": val})
 
+    # 涂装：改的是「这辆车」那一条的位掩码，不是 items2[涂装 id]（那个 id 有一半还同时是
+    # 零件编号，按 id 下发不但无效还会写到别人的计数上）。
+    painted = []
+    allowed_paints = grantable_paints()
+    for raw in paints or []:
+        try:
+            paint_id = int(raw)
+        except (TypeError, ValueError):
+            return None, "bad-grant"
+        info = allowed_paints.get(paint_id)
+        if info is None:
+            return None, "not-grantable-paint:%d" % paint_id
+        idx = _pair_index(new_pairs, info["key"])
+        cur = 0
+        if idx is not None:
+            try:
+                cur = int(new_pairs[idx + 1] or 0)
+            except (TypeError, ValueError):
+                cur = 0
+        owned = bool(cur & (1 << info["slot"]))
+        val = _paint_value(cur, info["slot"])
+        if idx is None:
+            new_pairs.extend([info["key"], val])
+        else:
+            new_pairs[idx + 1] = val
+        painted.append({"paint_id": paint_id, "name": info["name"], "bike": info["bike"],
+                        "slot": info["slot"], "key": info["key"],
+                        "before": 1 if owned else 0, "after": 1})
+
     now = int(time.time())
     iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
     # ① 原样留一份「下发前」的档 —— WebUI 的撤销点就是它（/__restore 认这个 ts）。
@@ -1306,15 +1380,18 @@ def grant_items(profile_id, grants):
     newdoc["saved_at_iso"] = iso
     audit = doc.get("granted")
     audit = audit if isinstance(audit, list) else []
-    newdoc["granted"] = (audit + [{"at": now, "at_iso": iso, "items": applied}])[-20:]
+    newdoc["granted"] = (audit + [{"at": now, "at_iso": iso, "items": applied,
+                                   "paints": painted}])[-20:]
     _store(os.path.join(SAVE_DIR, pid, "latest.json"), newdoc)
 
+    summary = ", ".join("%s %s->%s" % (a["name"], a["before"], a["after"]) for a in applied)
+    psum = ", ".join("涂装 %s 车%d 槽%d" % (p["name"], p["bike"], p["slot"]) for p in painted)
     print("[grant] %s <- %s（version %s -> %s，快照 %s）"
-          % (pid, ", ".join("%s %s->%s" % (a["name"], a["before"], a["after"])
-                            for a in applied),
+          % (pid, "　".join(x for x in (summary, psum) if x),
              doc.get("version"), newdoc["version"], snapshot), flush=True)
-    return {"profileId": pid, "applied": applied, "server_version": newdoc["version"],
-            "snapshot": snapshot, "grants": len(applied)}, None
+    return {"profileId": pid, "applied": applied, "paint_applied": painted,
+            "server_version": newdoc["version"], "snapshot": snapshot,
+            "grants": len(applied) + len(painted)}, None
 
 
 def restore_snapshot(profile_id, snapshot):

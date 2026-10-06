@@ -61,7 +61,7 @@ Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
 |---|---|
 | `tf_server.py` | HTTP 服务器：路由 + 全部动态端点处理器 + 请求日志 + 内嵌管理页。~4000 行 |
 | `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储 + 管理员账号 + 受控下发。纯数据层，不碰 HTTP。~1800 行 |
-| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：500 条物品 + 80 套服装，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
+| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：477 条物品 + 80 套服装 + 108 款涂装，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
 | `rules.json` | 静态桩响应表（`"<METHOD> <路径前缀>"` → `{status, headers, body}`）。只服务那些「有响应就行」的端点 |
 | `data/tf_config.json` | 运营参数（匹配、赛季、周赛、奖励、筹码）。**唯一入库的 `data/` 文件** |
 | `data/ghosts/` | 幽灵仓库：`<赛道id>/*.bin`（游戏自带静态幽灵，入库）+ `store/` `index.json` `replays.json`（运行期，不入库） |
@@ -380,16 +380,22 @@ python -m unittest discover -s tests -v
 * 页面是静态四件套（`server/admin/`），CN/EN 双语（`i18n.json`，`localStorage.tf_lang`
   优先、否则跟随 `navigator.language`）。前端**只用 `textContent` 渲染玩家可控字符串**
   （账号名 / 平台名直接来自客户端上报，是信任边界）。
-* 「下发物品」屏的物品清单来自 `server/admin/items.json`（500 条物品 + 80 套服装，中英名直接取自
-  游戏自己的本地化表），由 `tools/build_item_catalog.py` 从解包出的 `content.dat` 生成 ——
-  改物品表或套装表就重跑它。每条带 `cat` 与 `verified`：只有**真机上确认过存档写法**的类
-  （货币 / 消耗品 / 零件 / 服装 / 蓝图）不带「未验证」警告；涂装与赛道没有证据，会挂警告。
+* 「下发物品」屏的物品清单来自 `server/admin/items.json`（477 条物品 + 80 套服装 + 108 款涂装，
+  中英名直接取自游戏自己的本地化表），由 `tools/build_item_catalog.py` 从解包出的 `content.dat`
+  生成 —— 改物品表 / 套装表 / 车表就重跑它。每条带 `cat` 与 `verified`：只有**真机上确认过
+  存档写法**的类（货币 / 消耗品 / 零件 / 服装 / 蓝图）不带「未验证」警告；赛道没有证据，会挂警告。
   `outfit` / `blueprint` 在存档里是 0/1 标志（只能解锁，mode 固定 `set`），其余是计数器。
 * **服装按「套」列**（`outfits` 段，来自 `/conf/customization.txt`）：勾一套 = 头盔 / 上衣 /
   裤装三件一起解锁（`id = ItemType * 5 + tier`），行上带官方名 + 内部代号 +
   「已拥有 n/3」+ **套装效果文案**（`BonusPower`，集齐即账号级生效，例如 The High Roller
   = 无限汽油）+「隐藏」标记（`UnlockType` 全 4 = 没上架过的 46 套）。240 件里 99 件在任何
-  配置里都不出现，是按套装表推出来的；与「赛道解锁」撞车的 19 个编号按服装归类。
+  配置里都不出现，是按套装表推出来的；与「赛道解锁」撞车的 20 个编号按服装归类。
+* **涂装按「车」列**（`paints` 段，来自 `/conf/bikes.txt` 的 `SkinData`，108 款）：
+  ★ 涂装**不占 `items2` 的键**（一半涂装编号同时是零件号，按 id 发下去会写到零件计数上）。
+  存档里每辆车只有一条 `items2[664 + BikeID] = ((当前装备的 SkinIndex + 1) << 24) | 已拥有位掩码`，
+  所以界面按车分组、勾一款 = 给那一位置 1（`tflocal_accounts._paint_value()`），
+  位掩码只有 24 位。这套编码是反汇编 + 真机存档双向确认的；反汇编里的 XOR/rotate 只是
+  内存内的混淆，JSON 里是明文。
 
 ### 7.2 端点
 
@@ -405,7 +411,7 @@ python -m unittest discover -s tests -v
 | `POST /__api/admin/login` `logout` `me` | 管理员登录 / 登出 / 当前身份（`me` 未登录也 200） |
 | `GET /__api/admin/info` | 后台要展示的两条外发地址：玩家注册 `/__ui`、手机上的后台 `/__admin`（基址走 `_public_host()`，**绝不回环**） |
 | `POST /__api/admin/password` | 改口令（<8 位拒；改完**重签 Cookie**，否则把自己踢掉） |
-| `POST /__api/admin/grant` | 存档物品下发（可下发项 = `admin/items.json` 的 500 条，服装按套勾，见 7.1；每次先埋快照） |
+| `POST /__api/admin/grant` | 存档下发（可下发项 = `admin/items.json` 的 477 条，服装按套勾；`paints` 字段 = 涂装 id 数组，写 `items2[664+BikeID]` 的位掩码；每次先埋快照） |
 | `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
 | `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
 

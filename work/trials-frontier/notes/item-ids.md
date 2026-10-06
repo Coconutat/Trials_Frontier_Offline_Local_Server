@@ -178,9 +178,14 @@ and against `/conf/itemdb.txt` (rewards at ID 20040–20054 with `NameId` = `ITE
 
 ## 3. 喷漆 — bike paints / skins (108 of them)
 
-Source: `content.dat entry #2 (/conf/bikes.txt) @0x009774` → `SkinData`. The `ID` field **is** the paint item ID (the wheel-entry comment says
+Source: `content.dat entry #2 (/conf/bikes.txt) @0x009774` → `SkinData`. The `ID` field **is** the paint item id used by the shop/reward configs (the wheel-entry comment says
 “ItemId points to ID defined in bikeskins.txt”). The paint-can texture comes from the PAINT_<bike>_<slot>.PNG atlas entry,
 the 3D texture is `/GFX/OBJECT/BIKE/BIKE_<bike>_<slot>.PNG`. `DiamondCost` = gem price if sold for gems.
+Slot = `SkinIndex`（0 起）；只有 17 辆车有涂装（BikeID 18 HD EV 没有）。
+
+★ **但 `SkinData.ID` 绝不是存档 `items2` 的键** —— 见本节的「存档里怎么存」。这一条踩过坑：
+108 款里有 13 个 ID（5,13,23,28,30,33,45,46,49,51,52,53,54）同时是**零件**编号，
+按 ID 写 `items2[id]` 会改到玩家的零件计数上。
 
 | ID | name/key | item type | where it came from |
 |---|---|---|---|
@@ -292,6 +297,58 @@ the 3D texture is `/GFX/OBJECT/BIKE/BIKE_<bike>_<slot>.PNG`. `DiamondCost` = gem
 | `105` | Beluga | 喷漆 / bike skin, BikeID 15 slot 3 | `content.dat entry #2 (/conf/bikes.txt) @0x009774` SkinData[105] |
 | `106` | Sheriff | 喷漆 / bike skin, BikeID 7 slot 10 | `content.dat entry #2 (/conf/bikes.txt) @0x009774` SkinData[106] |
 | `107` | Dawn Breaker | 喷漆 / bike skin, BikeID 14 slot 1 | `content.dat entry #2 (/conf/bikes.txt) @0x009774` SkinData[107] |
+
+### 存档里怎么存（★ 反汇编 + 真机存档双向确认）
+
+每辆车**只有一条** `items2` 记录，键 = `664 + BikeID`（= `0x299 + bikeIndex`，`bikeIndex = BikeID − 1`）：
+
+```
+items2[664 + BikeID] = ((当前装备的 SkinIndex + 1) << 24) | 已拥有位掩码
+已拥有位掩码 = 位 i（i < 24）置 1 ⇔ SkinIndex == i 的那款已拥有；active 0 = 没装备涂装
+```
+
+真机存档对照（`server/data/save/53ebbd18-…/latest.json`，ccb，`items2` 632 条）：
+
+| 键 | BikeID / 车 | 值 | active | 位掩码 | 解出的 SkinIndex |
+|---|---|---|---|---|---|
+| 665 | 1 Armadillo | `0x03000014` | 2 | `0b10100` | {2,4} |
+| 666 | 2 Tango | `0x01000017` | 0 | `0b10111` | {0,1,2,4} |
+| 668 | 4 Jackal | `0x03000005` | 2 | `0b101` | {0,2} |
+| 677 | 13 KTM 500 EXC | `0x02000006` | 1 | `0b110` | {1,2} |
+| 678 | 14 KTM 450 RALLY | `0x02000002` | 1 | `0b10` | {1}（= 107 Dawn Breaker ✓） |
+| 680 | 16 BMW F800 GS | `0x02000002` | 1 | `0b10` | {1} |
+
+667 / 669 / 670 / 671 不存在 ⇒ 那几辆车一款涂装都没有。5/5 条 active ∈ 位掩码，且每个位都对应
+`SkinData` 里真实存在的 `(BikeID, SkinIndex)`。
+
+反汇编符号（`tmp\extract\libTrialsGo.so`，arm64）：
+
+| 地址 | 符号 | 关键指令 |
+|---|---|---|
+| `0x0062a12c` | `tr::UpgradeManager::getBikeIndexByID(unsigned short)` | `and w8,w1,#0xffff; sub w0,w8,#1` ⇒ bikeIndex = BikeID − 1 |
+| `0x0062c4d8` | `tr::UpgradeManager::getBikeIDbyIndex(int)` | `add w0,w1,#1` |
+| `0x0061d350` | `tr::PlayerItems::getCustomBikeTextureItemId(int bikeId)` | `getBikeIndexByID(bikeId) + 0x299`（0x299 = 665） |
+| `0x0061c04c` | `tr::PlayerItems::getCustomBikeTextures(int bikeId)` | 循环 `(1 << i) & mask`，返回已拥有的 SkinIndex 列表 |
+| `0x0061d4e8` | `tr::PlayerItems::hasCustomBikeTexture(int bikeId, int skinIndex)` | `skinIndex == -1` 直接返回 1，否则测位 |
+| `0x0061d378` | `tr::PlayerItems::getActiveCustomBikeTexture(int bikeId)` | 解 active 后再查 `isCustomSkinSupported`，不支持返回 0 |
+| `0x0061d570` | `tr::PlayerItems::setActiveCustomBikeTexture(int bikeId, int skinIndex)` | `w11 = 0x01000000 + (skinIndex << 24)`；`bfxil w11,w10,#7,#0x18`（保留低 24 位的 bit7..30） |
+| `0x0062b4c4` | `tr::UpgradeManager::isCustomSkinSupported(int bikeID, int skinIndex)` | 读配置 `bikeID*0x18 + skinIndex - 0x18` → `UpgradeManager + 0x18c`，`!= -1` 即支持 |
+
+⚠ **内存里的 XOR/rotate 只是反作弊混淆，不在 JSON 里**：RAM 中 `m_items[i]` 存的是
+`raw = rol(M, 7) ^ 0x0AB1D4F5` 这类形式（`getCustomBikeTextures` 用 `ror(raw ^ 0x0AB1D4F5, 7)`、
+`getActiveCustomBikeTexture` 用 `(byte3(ror(raw,7)) ^ 0xEA) - 1`），而**存档 JSON 存的是明文 M**
+（上表 6 条只有按明文解释才自洽）。`0x0AB1D4F5` 是**全局的数值混淆常量**，不是涂装专用
+（`tmp/skinconst.py` 扫全库命中 43 处，包括 `PlayerItems::getItemCount`、`PlayerTimers::TimedAction::start`、
+`PlayTierReward::setDiamondRewardAmount`）。
+
+官方名：108 款里只有 **66 款**被商店/奖励表引用过（`Type == 2` 记录的 `ItemId` = `SkinData.ID`，
+`NameId` 形如 `WSB_RIPTIDE_SNAKEBITE_TITLE`），其中 **67 款有官方中文名**（"Snake Bite paint job for the Riptide"
+/ "激流蛇咬涂装"；另有 11 条名字只在解析失败的 `0010_1854657d.bin` 的原始文本里，见 §9 的运行记录）。
+没有官方名的显示内部名（Boogeyman / SANDSTORM / TURTLE …）。
+
+服务端怎么发：`tflocal_accounts.grantable_paints()` 给出 `{id: {key, slot, bike, name}}`，
+`_paint_value(cur, slot)` = `int(cur or 0) | (1 << slot)`，若高 8 位为 0 再顺手 `|= (slot+1) << 24`；
+后台按「车」分组列（`paints` 段），勾一款 = 给那一位置 1。**只有 24 位可用**，所以校验 `0 <= slot < 24`。
 
 ---
 
