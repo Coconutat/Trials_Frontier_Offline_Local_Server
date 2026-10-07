@@ -221,6 +221,18 @@
   **只补缺、从不覆盖** ⇒ 换新版 exe 直接替换文件。打包白名单（`tools/build_exe.ps1`）是安全边界：
   真机存档、`admin.json`、`accounts.json`、`pvp_state.json`、审计与日志一律不进包，脚本带硬性检查。
 
+- **AIO 补丁器（`tfpatch_aio`）与两条打补丁路线**
+  给玩家用的那个带 GUI 的 exe（`dist/TrialsFrontierPatcher.exe`）：勾功能 → 出包。两条路线的 base 要求**不同**：
+  **补丁版**只改 `.so` 与清单，任何原版/整合版都能当 base；
+  **自包含版**（`bundle`）还要把启动类换成 `OfflinePayloadSetup`，而 AXML 改字符串是**等长原地改**
+  ⇒ base 的 `<application android:name>` 必须正好是 48 字符的 `DexApplicationClass`。
+  **加固包**（启动类在壳里，如 `com.SecShell.SecShell.AW`）因此做不了自包含 —— 流水线会提前报错让人换 base，
+  这不是待修的 bug。老脚本（`tools/*.py`）保持原样，AIO 用的只是它们的副本（`tfpatch_aio/vendored/`）。
+
+- **离线载荷（payload）**
+  自包含 APK 要的那 300 MB 数据（`appdata/` + `obb/`）。**不内嵌进 exe**，放 exe 同目录的
+  `payload\` 或 `payload.zip` 由 GUI 自动识别；打进去后由首启的 `OfflinePayloadSetup` 搬到应用私有目录。
+
 ## 已废弃的提法
 
 - **劫持层（VPN/DNS 重定向叠加层）**：曾被设想为独立 App，供无 root 用户填入 IP/端口/域名。

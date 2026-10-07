@@ -8,6 +8,10 @@
 两者的输出都是可复现的：顶层工具每处修改都会先校验原始字节，对不上就退出；`tools/re/`
 的工具是只读的。
 
+再往上一层是**给玩家用的 GUI**：`tools/tfpatch_aio/`（打包成 `dist\TrialsFrontierPatcher.exe`），
+一个 exe 勾选功能 → 出补丁版或自包含完整 APK，不需要装 Python（见 §9）。它不重写上面这些
+脚本，只是把它们的**副本**（`tfpatch_aio/vendored/`）串成 8 步流水线。
+
 ---
 
 ## 1. 快速开始
@@ -557,7 +561,96 @@ Authenticode 签名（找不到 `signtool.exe` 只警告）。
 
 ---
 
-## 9. 相关文档
+## 9. AIO 补丁器（`tfpatch_aio/`，带 GUI 的 exe）
+
+给「只想出个能玩的 APK」的人用：一个 exe，勾几个框，出补丁版或自包含完整 APK。
+**老脚本（§2 那 7 个 + `tfpatcher.py`）保持原样不动**，那是参考实现与本节的对照物。
+
+```powershell
+pwsh tools\build_aio.ps1                     # 出 dist\TrialsFrontierPatcher.exe（窗口版）+ -console.exe
+pwsh tools\build_aio.ps1 -Mode console -SkipTests
+pwsh tools\aio_smoke.ps1                     # 27 项冒烟：自检 / 功能清单 / 真跑一次补丁 / GUI 起得来
+pwsh tools\aio_smoke.ps1 -Full               # 再跑一次自包含大打包（约 300 MB，几分钟）
+```
+
+源码态直接跑（不打包）：
+
+```powershell
+python -m tools.tfpatch_aio                  # 开 GUI
+python -m tools.tfpatch_aio 某.apk            # 开 GUI 并预填这个 APK
+python -m tools.tfpatch_aio --cli --apk 原版.apk --out out.apk --server 192.168.5.2:8123 --features offline,noads
+python -m tools.tfpatch_aio --cli --check     # 环境自检（build-tools / java / 密钥 / 载荷）
+python -m tools.tfpatch_aio --list-features
+```
+
+### 9.1 功能开关（GUI 复选框 = CLI `--features`）
+
+| key | 名字 | 默认 | 内容 |
+| --- | --- | --- | --- |
+| `offline` | 离线可玩（核心） | **必选** | 关反作弊、放行商店/内容、去黑名单弹窗、修 VIP 空指针崩溃、`targetSdk 27`、注入「服务器地址读本地 txt」、静态改写硬编码 URL |
+| `noads` | 去广告 / 去遥测 | ✔ | `no-ads` 补丁 + dex 里 5 个方法置 `return-void` |
+| `fuel` | 无限汽油 | ✘ | `ConsumableManager::isUnlimitedFuel()` 恒真 |
+| `money` | 货币不减反增 | ✘ | `PlayerItems::remove()` 里 `sub` 改 `add` |
+| `iap` | 破解内购 | ✘ | 购买失败/取消改走 `onPurchaseComplete`（不校验票据、不联网） |
+| `vip` | 解锁骑士俱乐部 VIP | ✘ | 商店 VIP 商品返回假会员条目 |
+| `bundle` | 打包成自包含完整 APK | ✘ | 塞 `assets/tf/` + 预编 `classes4.dex` + 换 Application 类名 + `minSdk 21` |
+
+默认只勾 `offline` + `noads`（最小「能离线玩」集）；`offline` 永远入选。
+`--features all` / `none` / `offline,fuel` 都行。
+
+### 9.2 两次跑法的区别（为什么 base 不能随便挑）
+
+* **只出补丁版**：任何未加固/加固包都能当 base（`.so` 就在包里）。
+* **要自包含（`bundle`）**：必须换 `<application android:name=…>`，而 `setstr` 只能**等长原地改**
+  ⇒ base 的启动类必须正好是 48 字符的 `com.ubisoft.redlynx.trialsgo.DexApplicationClass`，
+  而且要能塞下 `com.ubisoft.redlynx.trialsgo.OfflinePayloadSetup`（同样 48 字符）。
+  ★ 加固包（如 `APKS\特技摩托前线\7.9.4 带剧情不减反增车不全.apk`，启动类是 `com.SecShell.SecShell.AW`）。这类包
+  `pipeline.py` 会在 [4/8] 直接 `throw` 出人话，让换 base 或取消 `bundle` —— 别去绕过它。
+  仓库里现成的干净 base：`dist\TrialsFrontier-offline.apk`（26.9 MB，含 3 个 dex）或 `tmp\build\tf-m16.apk`。
+
+### 9.3 离线载荷放哪
+
+不用内嵌进 exe（300 MB 太重）。把 `payload\`（或 `payload.zip` / `trials-payload\` /
+`clean-pack\` / `TrialsFrontier-clean-pack\`）放在 **exe 同目录** 或当前工作目录，GUI / `--check`
+自动认；目录里要有 `appdata\` 和 `obb\`（各一个 OBB）。内容就是
+`tmp\pack\TrialsFrontier-clean-pack` 那一份。
+
+### 9.4 还需要装什么
+
+| 需要 | 谁提供 | exe 里带了吗 |
+| --- | --- | --- |
+| AArch64 汇编 / ELF 解析 | `keystone` + `pyelftools` | ✔ `--collect-all keystone` + `--hidden-import elftools` |
+| 载荷安装类 | 预编 `assets/payload_setup.dex` | ✔ 随包（运行期**不需要** javac/d8） |
+| `zipalign` / `apksigner` | Android SDK build-tools | ✘ 要装（`ANDROID_HOME` 或 `--build-tools`） |
+| `java` / `keytool` | 任意 JDK | ✘ 要装（`JAVA_HOME`） |
+| 签名密钥 | 首次运行 `keytool` 自签 | 生成在 exe 旁的 `keystore\trials.jks` |
+
+★ **密钥优先复用已有的那把**（按顺序找：exe 旁的 `keystore\` → 源码态的
+`work/trials-frontier/keystore/` → 交付态的 `patcher/keystore/`；都没有才现场自签）。
+换了密钥 = 换了签名，覆盖安装会被拒（`INSTALL_FAILED_UPDATE_INCOMPATIBLE`），手机得先卸载（存档一起没）。
+`keystore/` 与 `*.jks` 已在 `.gitignore` 里，私钥永不入库。
+
+### 9.5 代码地图
+
+* `features.py` —— 功能开关（补丁 id + 动作位）；补丁 id 必须与 `vendored/native.py` 的 `PATCHES`
+  对得上（`tests/test_patch_aio.py` 双向校验，多一个少一个都红）。
+* `pipeline.py` —— 8 步编排：`[1/8]` 拆库/清单/dex → `[2/8]` native → `[3/8]` dynaddr + urls →
+  `[4/8]` AXML → `[5/8]` dex → `[6/8]` bundle → `[7/8]` 重写 zip → `[8/8]` zipalign + 签名 + 验签，
+  末尾写 `<out>.report.json`。
+* `payload.py` / `signer.py` / `cliutil.py` / `cli.py` / `gui.py` / `__main__.py`。
+* `vendored/` —— §2 那 6 个脚本的**副本**（原脚本不改）。`native.py` 只多了三处：
+  `--only`（按 id 取子集）、`--force`（跳过整库 sha 校验，逐处仍逐字节比）、以及
+  「已经是目标状态」不再报错（民间整合版常常已经改过几处）。
+  ★ 其它脚本做不到的事：`patch_dynaddr.py` / `patch_urls.py` 在**没有任何字面量可改**时
+  **根本不写输出文件**，流水线用 `_keep()` 回退到原库并 `_fresh()` 先删旧产物 —— 少了这两下
+  `[7/8]` 会报「找不到替换用的文件」。
+* `assets/payload_setup.dex` —— 预编的自包含载荷安装类（7224 B，
+  sha256 `c450d82a4d0f6ebe9467dce2433ff4e39f0a85c70f139328f0157a753662eb00`），
+  等价于 `make_selfcontained.ps1` 里现编的那份，只是提前编好塞进 exe。
+
+---
+
+## 10. 相关文档
 
 * `../ROADMAP.md` —— 要做什么（唯一的目标清单）
 * `../ROADMAP_STATUS.md` —— 做到哪一步了；§3.x 记的是每个真实 bug 的完整逆向链路
