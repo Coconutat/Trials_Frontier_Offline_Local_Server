@@ -262,6 +262,13 @@
   自包含 APK 要的那 300 MB 数据（`appdata/` + `obb/`）。**不内嵌进 exe**，放 exe 同目录的
   `payload\` 或 `payload.zip` 由 GUI 自动识别；打进去后由首启的 `OfflinePayloadSetup` 搬到应用私有目录。
 
+- **exe 图标（`tools/assets/tf_icon.ico`）**
+  服务器 exe 的图标就是游戏自己的启动图（戴头盔的机械师），从原版 APK 的
+  `res/mipmap-xxxhdpi-v4/ic_launcher.png`（192×192，资源里最大的一份）抠出来，做成 8 档
+  16/24/32/48/64/128/192/256。生成器 `tools/make_icon.py` **自己写 ICO 容器、每一档都是 BMP 条目** ——
+  Pillow 的 `save(format="ICO")` 会写成 PNG 条目，而 Windows 只对 256 那一档明确支持 PNG 条目，
+  小尺寸 PNG 条目可能整片渲染不出来。`.ico` **入库**，所以「打 exe」这条链不需要 Pillow（只有换图时才跑生成器）。
+
 ## 已废弃的提法
 
 - **劫持层（VPN/DNS 重定向叠加层）**：曾被设想为独立 App，供无 root 用户填入 IP/端口/域名。

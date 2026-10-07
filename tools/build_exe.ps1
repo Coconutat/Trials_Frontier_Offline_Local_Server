@@ -18,6 +18,9 @@
 #
 # 反逆向：PyInstaller 只是把字节码压缩塞进 exe（能解出来），Nuitka 是真编译成机器码。
 # 两者都请把「防止逆向」理解为抬高成本，不是安全边界：详见 PUBLISHING.md。
+#
+# ★ 图标：用游戏自己的启动图（tools\make_icon.py 从原版 APK 抠出来做的多尺寸 .ico）。
+#   产物提交进仓库，两个打包器各自内嵌（PyInstaller --icon / Nuitka --windows-icon-from-ico）。
 
 [CmdletBinding()]
 param(
@@ -42,6 +45,21 @@ if (-not $Python) {
 if (-not (Test-Path $Python)) { throw "找不到 Python：$Python" }
 $pyver = & $Python -c "import sys;print(sys.version.split()[0])"
 Write-Host "Python $pyver ($Python)" -ForegroundColor Cyan
+
+# ---------------------------------------------------------------- 0. 图标
+# 图标（用户 m11901）从游戏自己的启动图抠出来，产物 tools\assets\tf_icon.ico 提交进仓库 ——
+# 打包链因此不需要 Pillow；要重新生成或换图就 `python tools\make_icon.py`（那一步才要 Pillow）。
+$icon = Join-Path $root 'tools\assets\tf_icon.ico'
+if (-not (Test-Path $icon)) {
+    throw "找不到图标 $icon —— 先跑 python tools\make_icon.py（需要 Pillow，只在开发机上）再打包"
+}
+$iconBytes = [System.IO.File]::ReadAllBytes($icon)
+if ($iconBytes.Length -lt 4096 -or $iconBytes[0] -ne 0 -or $iconBytes[1] -ne 0 -or
+    $iconBytes[2] -ne 1 -or $iconBytes[3] -ne 0) {
+    throw "图标文件不像 ICO（$($iconBytes.Length) B，头 $($iconBytes[0..3] -join ',')）：用 python tools\make_icon.py 重新生成"
+}
+$iconEntries = [int]$iconBytes[4] + ([int]$iconBytes[5] -shl 8)
+Write-Host "图标：tools\assets\tf_icon.ico（$iconEntries 档，$([math]::Round($iconBytes.Length / 1KB)) KB）" -ForegroundColor Cyan
 
 # ---------------------------------------------------------------- 1. 暂存白名单
 Write-Host "[1/4] 暂存要打包的文件（只挑白名单）…" -ForegroundColor Cyan
@@ -92,6 +110,7 @@ function New-OneFile {
     if ($Which -eq 'pyinstaller') {
         Write-Host '[3/4] PyInstaller onefile …' -ForegroundColor Cyan
         & $Python -m PyInstaller --noconfirm --onefile --console --name $Name `
+            --icon $icon `
             --distpath $distDir --workpath (Join-Path $workDir 'pyinstaller') `
             --specpath (Join-Path $root 'tmp\exe') --paths (Join-Path $root 'server') `
             --add-data "$stage\admin;admin" --add-data "$stage\rules.json;." `
@@ -128,6 +147,7 @@ function New-OneFile {
     $nlog = Join-Path $root 'tmp\exe\nuitka.log'
     & $Python -m nuitka --onefile @ccArgs --assume-yes-for-downloads `
         --python-flag=-OO --lto=yes --remove-output --windows-console-mode=force `
+        --windows-icon-from-ico=$icon `
         --output-dir=$distDir --output-filename="$Name-nuitka.exe" `
         --include-raw-dir="$stage\admin=admin" --include-raw-dir="$stage\data=data" `
         --include-data-files="$stage\rules.json=rules.json" `
