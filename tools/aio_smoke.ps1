@@ -12,13 +12,12 @@
 #
 # 默认 base = apkmirror 下的**未改动原版**（`libTrialsGo.so` = 743f945c…，与 tfpatcher.py 的
 # 期望指纹一致）。别拿 dist\TrialsFrontier-offline.apk 当 base：它是已打补丁的产物。
-
-$defaultBase = 'dist\原版APK\com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk'
+# 注意：PowerShell 要求 param 是脚本的第一条语句，所以这份默认值只能写进 param 里。
 
 [CmdletBinding()]
 param(
     [string]$Exe = 'dist\TrialsFrontierPatcher-console.exe',
-    [string]$Base = '',
+    [string]$Base = 'dist\原版APK\com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk',
     [string]$Payload = '',
     [string]$BuildTools = '',
     [string]$Port = '8123',
@@ -28,7 +27,6 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-if (-not $Base) { $Base = $defaultBase }
 $sx = if ([System.IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path $root $Exe }
 $sb = if ([System.IO.Path]::IsPathRooted($Base)) { $Base } else { Join-Path $root $Base }
 if (-not (Test-Path $sx)) { throw "找不到 exe：$sx（先跑 pwsh tools\build_aio.ps1）" }

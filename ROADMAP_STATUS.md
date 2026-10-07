@@ -1257,7 +1257,7 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 | `tools/apkpayload/OfflinePayloadSetup.java` | 首启自解包类（`extends DexApplicationClass`，只覆盖 `onCreate`），随包进 `classes4.dex` |
 | `dist/TrialsFrontierPatcher.exe` | **AIO 打补丁器（带 GUI，给玩家用）**：约 18 MB（sha256 每次编译都变，以 `SHA256SUMS.txt` 为准），勾功能 → 出补丁版或自包含完整 APK；不需要装 Python，但要装 Android build-tools + JDK。源码 `tools/tfpatch_aio/`，见 §5.1 |
 | `dist/TrialsFrontierPatcher-console.exe` | 同一程序的命令行版（`--cli --apk … --features offline,fuel`；打包脚本与冒烟都用它做自检） |
-| `tools/build_aio.ps1` / `tools/aio_smoke.ps1` | 打上面那两个 exe / 把 exe 拷进空目录跑 27 项冒烟（`-Full` 加跑自包含大打包） |
+| `tools/build_aio.ps1` / `tools/aio_smoke.ps1` | 打上面那两个 exe / 把 exe 拷进空目录跑冒烟（补丁路径 23 项，`-Full` 加到 27 项） |
 | `tools/tfpatch_aio/vendored/` | `patch_native/patch_dynaddr/patch_urls/patch_manifest/patch_dex/build_apk` 的**副本**（原脚本不动，仍是参考实现） |
 | `work/trials-frontier/notes/*.md` | 逆向与情报笔记：`selfcontained-apk.md`（打包原理 + 两个坑）、`online-rules-evidence.md`（赛季/事件史料，带出处）、`real-server-samples.md`（全仓库唯二的真实服务器样本）、`web-research-toolkit.md`（本机抓取方法） |
 
