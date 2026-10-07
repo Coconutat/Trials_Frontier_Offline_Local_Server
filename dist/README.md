@@ -14,6 +14,8 @@
 ```
 dist/
 ├─ TrialsFrontier-offline.apk   改好的完整 APK（已签名，直接装）
+├─ 原版APK/                      apkmirror 下的**未改动原版**（打补丁认准它当 base）
+├─ TrialsFrontierPatcher.exe    带界面的打补丁器（不用装 Python，见第四节）
 ├─ README.md                    本文件
 ├─ patcher/                     自己动手打补丁用的工具（纯 Python，无第三方依赖）
 │   ├─ tfpatcher.py             一键 patcher（入口）
@@ -113,6 +115,11 @@ python dist\patcher\tfpatcher.py --apk 你的原版.apk --out 改好.apk
 ```
 
 * 默认会校验原版 native 库的 SHA256（7.9.4 专用）。版本不符会拒绝，确认无误可加 `--force`。
+* **base 认准 `原版APK/` 里那份**（apkmirror 的原始包，34 312 425 字节，sha256
+  `EDDD7DF0C482279B523255498DB448F5CE27609D8BCB1E0B94C45D5948225580`，`libTrialsGo.so` = `743f945c…`）。
+  ⚠ **别拿 `TrialsFrontier-offline.apk` / `TrialsFrontier-offline-full.apk` 当「干净 base」**：这两个是
+  **已经改过的产物**（`libTrialsGo.so` = `e9f2fa1a…`、targetSdk 已是 27、v7a 已删），
+  这个 SHA256 校验会直接拒绝它们 —— 想复现原始改动就得用 `原版APK/` 那份。
 * `--host 192.168.1.100:8000` 可以改「编译期默认地址」。
 * `--no-sign` 只出未签名包；`--keep-v7a` 保留 32 位库（不推荐）。
 * 需要 Android SDK 的 `zipalign` / `apksigner`（会自动在 `ANDROID_HOME`、`ANDROID_SDK_ROOT`

@@ -606,7 +606,20 @@ python -m tools.tfpatch_aio --list-features
   而且要能塞下 `com.ubisoft.redlynx.trialsgo.OfflinePayloadSetup`（同样 48 字符）。
   ★ 加固包（如 `APKS\特技摩托前线\7.9.4 带剧情不减反增车不全.apk`，启动类是 `com.SecShell.SecShell.AW`）。这类包
   `pipeline.py` 会在 [4/8] 直接 `throw` 出人话，让换 base 或取消 `bundle` —— 别去绕过它。
-  仓库里现成的干净 base：`dist\TrialsFrontier-offline.apk`（26.9 MB，含 3 个 dex）或 `tmp\build\tf-m16.apk`。
+* **base 认准 apkmirror 那份原版**：
+  `dist\原版APK\com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk`
+  （34 312 425 字节，sha256 `EDDD7DF0C482279B523255498DB448F5CE27609D8BCB1E0B94C45D5948225580`）。
+  `libTrialsGo.so` = `743f945cd7e3378dbf78eadc9d864de0c465b558bda8a54923b46a8f170fb7f4`，
+  正是 `tools/tfpatcher.py:69` 写死的期望指纹 ⇒ 它才是老脚本认定、也应当被认作「干净原版」的那个包。
+  ★ **别拿 `dist\TrialsFrontier-offline.apk` / `-full.apk` / `tmp\build\tf-m16.apk` 当干净 base**：
+  它们是 m16 时代的**已打补丁产物**（`libTrialsGo.so` = `e9f2fa1a4e90ac07bf196bcde5565cb4ceb11ad849457fb6499b4625c7f4c04f`、
+  targetSdk 已改成 27、v7a 已删）。`tools/tfpatcher.py` 的 SHA256 校验会**直接拒绝**它们（要 `--force` 才过）；
+  AIO 能跑通只是因为 native 补丁表容忍「已经是目标状态」，但那样 base 已经不是原版了，测不出真实回归。
+* **`lib/armeabi-v7a/` 默认丢掉**（`--keep-v7a` 可留，不推荐）：补丁表只针对 arm64 的
+  `libTrialsGo.so`，留一份没打补丁的 32 位库 ⇒ 32 位设备上跑的是原版库（连不上本地服务器、反作弊照旧），
+  坏得静悄悄；丢掉后 32 位设备会明确报 `INSTALL_FAILED_NO_MATCHING_ABIS`。
+  另见 `work/trials-frontier/notes/selfcontained-apk.md:141`：x86_64 模拟器靠 houdini 跑 arm64 库，
+  所以「只留 arm64」不影响模拟器。
 
 ### 9.3 离线载荷放哪
 
@@ -647,6 +660,33 @@ python -m tools.tfpatch_aio --list-features
 * `assets/payload_setup.dex` —— 预编的自包含载荷安装类（7224 B，
   sha256 `c450d82a4d0f6ebe9467dce2433ff4e39f0a85c70f139328f0157a753662eb00`），
   等价于 `make_selfcontained.ps1` 里现编的那份，只是提前编好塞进 exe。
+
+### 9.6 用真原版实测过（2026-10-07，Android 14 模拟器）
+
+base = 上面 apkmirror 那份原版，两条路都跑通并装上了设备：
+
+| 跑法 | 产物 | 关键日志 |
+| --- | --- | --- |
+| `--features offline,noads,fuel,money,iap,vip` | 25.7 MB，sha256 `bce44550b8a83df19b27b413edcc97f6baadc0fc0982f79458aed75ec893c487` | 17 处 native 补丁全 `[OK]`、**0 处「本来就是目标状态」**（说明 base 是纯的）；清单 `targetSdk 30 → 27`；dex 补 6 个方法；丢掉 8 个 v7a 库与 `META-INF/ANDROID.RSA`/`.SF`/`MANIFEST.MF`；重签后 v1/v2/v3 全 true |
+| 同上 `,bundle` | 320.9 MB，sha256 `0bfc74ec7444f30d78fcea63e83d097527c237eaeff43f0e930f5fb56c8ba9a3` | Application 类换成 `…OfflinePayloadSetup`、`minSdk 16 → 21`、载荷 70 条 295.2 MB、`classes4.dex` |
+
+* 结构对上了已知可用的 `dist\TrialsFrontier-offline-full.apk`：**条目 1298 = 1298**，`only in 新/旧` 都为空，
+  `assets/tf/` 71 = 71、`lib/` 7 = 7、`classes*` 4 = 4、`META-INF/` 3 = 3；只有 `assets/tf/p/*` 的分片边界不同
+  （`payload.txt` 的遍历顺序不同 ⇒ 分片大小不同，功能等价）。
+* `assets/tf/payload.txt` 自洽性检查：70 行 = 67 `r` + 1 `o` + 1 `e` + 1 `f`；每行指向的 `assets/tf/p/NNNN` 都在包里，
+  长度与 `tmp\pack\TrialsFrontier-clean-pack` 里的源文件一致；两条 `tf_server.txt` = 16 字节（`192.168.5.2:8123`）。
+* `adb install -r` 到 `emulator-5554`（Android 14 / SDK 34）**Success** —— 同一把密钥，覆盖安装不丢存档。
+  启动后 logcat：`Playground … Network is now connected` → `Starting autologin` →
+  `RuntimeLoginTask: Login request succeed.`，随后 `TaskRuntimeGetFriendsWithOptions` / `…GetUplayFriends` 发出；
+  `server/data/server.log` 同步记到 `GET /v2/profiles/me/friends -> 200`、`POST /public/friends/v1/update -> 200`。
+  游戏内表现见 `tmp\shots\emulator-after-install.png`（村庄界面正常）。
+* 顺带排掉的误报：**apkmirror 原版在 Android 14 上完全装得上**。直接 `adb install -r` 原版报的是
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（和已装的改版**签名不同**），不是系统不兼容；把包名与 8 个
+  `android:authorities` 一起改名后原样（targetSdk 30 / minSdk 16 / 含 v7a）重签 → **装上了**。
+  Android 14 的 SDK 门槛只管 `targetSdk < 23`，原版是 30。
+
+★ 结论：**补丁脚本不需要为这份原版做任何改动**，老流程与 AIO 在这个包上都一次跑通；
+真正要改的是**文档里对「干净 base」的指认**（原先指的 `dist\TrialsFrontier-offline.apk` 其实已经被改过）。
 
 ---
 

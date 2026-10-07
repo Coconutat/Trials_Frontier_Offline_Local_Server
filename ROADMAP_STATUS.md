@@ -980,10 +980,28 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
 * 功能细化（默认只勾 `offline` 必选 + `noads`）：`fuel` 无限汽油、`money` 货币不减反增、
   `iap` 破解内购、`vip` 解锁骑士俱乐部、`bundle` 自包含完整 APK。
 * ★ 两个真机教训写进了代码：**加固包的 Application 类换不了**（`APKS\特技摩托前线\7.9.4 …apk` 的启动类是
-  `com.SecShell.SecShell.AW`，24 字符塞不下 48 字符的 `OfflinePayloadSetup`）⇒ [4/8] 提前 `throw` 出人话，
-  自包含必须用干净 base（`dist\TrialsFrontier-offline.apk` 或 `tmp\build\tf-m16.apk`）；
+  `com.SecShell.SecShell.AW`，24 字符塞不下 48 字符的 `OfflinePayloadSetup`）⇒ [4/8] 提前 `throw` 出人话；
   **`patch_dynaddr.py` / `patch_urls.py` 在无可改字面量时不写输出文件** ⇒ 流水线 `_keep()` 回退 + `_fresh()` 先删，
   否则 [7/8] 报「找不到替换用的文件」。签名密钥**优先复用已有那把**（换了就覆盖安装失败）。
+* ★ **干净 base 的指认被修正**（用户 m11161 交出 apkmirror 原版后查明）：真正的未改动原版是
+  `dist\原版APK\com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk`
+  （34 312 425 B，sha256 `EDDD7DF0C482279B523255498DB448F5CE27609D8BCB1E0B94C45D5948225580`，
+  `libTrialsGo.so` = `743f945cd7e3378dbf78eadc9d864de0c465b558bda8a54923b46a8f170fb7f4`
+  = `tools/tfpatcher.py:69` 写死的期望指纹）。旧文档指的 `dist\TrialsFrontier-offline.apk` /
+  `-full.apk` / `tmp\build\tf-m16.apk` **都是已打补丁的产物**（`libTrialsGo.so` = `e9f2fa1a4e90ac07…`、
+  targetSdk 已 27、v7a 已删），`tfpatcher.py` 的 SHA256 校验会直接拒绝它们。
+* ★ 拿真原版实测（2026-10-07，`emulator-5554` / Android 14 / SDK 34）：补丁版 25.7 MB
+  sha256 `bce44550b8a83df19b27b413edcc97f6baadc0fc0982f79458aed75ec893c487`（17 处 native 全 `[OK]`、
+  **0 处「本来就是目标状态」**），自包含版 320.9 MB sha256 `0bfc74ec7444f30d78fcea63e83d097527c237eaeff43f0e930f5fb56c8ba9a3`
+  （载荷 70 条 295.2 MB、`classes4.dex`、minSdk 16→21）。自包含产物与已知可用的
+  `dist\TrialsFrontier-offline-full.apk` **条目 1298 = 1298、路径集合完全相同**（只有 `assets/tf/p/*` 分片边界不同）；
+  `payload.txt` 70 行全部自洽（67 `r` + 1 `o` + 1 `e` + 1 `f`，长度与载荷源一致）。`adb install -r` 装到 Android 14
+  **Success**，logcat `RuntimeLoginTask: Login request succeed.`，服务器日志同时记到
+  `GET /v2/profiles/me/friends -> 200`。⇒ **脚本无需为这份原版改动**，只改文档。
+* ★ 顺带排掉的误报（用户说「这 apk 在安卓14以上显示不兼容」）：原版**装得上**。直接 `adb install -r` 报的是
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（与原已装改版**签名不同**）；把包名 + 8 个 `android:authorities`
+  一起改名后原样（targetSdk 30 / minSdk 16 / 含 v7a）重签 → 装上成功。Android 14 的 SDK 门槛只管
+  `targetSdk < 23`，原版是 30，不在门槛内。
 
 ---
 
@@ -1222,7 +1240,9 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 
 | 路径 | 说明 |
 | --- | --- |
-| `dist/TrialsFrontier-offline.apk` | 完整离线版 APK（m16），26 906 224 字节，SHA-256 `EA77B0B420BF790BB626189F74A3BC64BB384607C2A273F36ADBF558FD8EAB53` |
+| `dist/TrialsFrontier-offline.apk` | 完整离线版 APK（m16），26 906 224 字节，SHA-256 `EA77B0B420BF790BB626189F74A3BC64BB384607C2A273F36ADBF558FD8EAB53`。⚠ 这是**已打补丁的产物**，不能再当「干净 base」 |
+| `dist/原版APK/com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk` | **未改动的真原版**（apkmirror 下载，用户 m11161 交出）：34 312 425 字节，SHA-256 `EDDD7DF0C482279B523255498DB448F5CE27609D8BCB1E0B94C45D5948225580`；`libTrialsGo.so` = `743f945cd7e3378d…`（= `tools/tfpatcher.py:69` 的期望指纹），minSdk 16 / targetSdk 30，arm64 + v7a 双 ABI，Ubisoft 原签名。**打补丁认它当 base** |
+| `dist/SHA256SUMS.txt` | 4 行校验和：`TrialsFrontierServer.exe` / `-nuitka.exe` / `TrialsFrontierPatcher.exe` / `-console.exe`（各带 `.sha256` 边车） |
 | `dist/patcher/` | 面向用户自己原版 APK 的补丁工具链（含 `tfpatcher.py`、`patch_native.py` 等） |
 | `dist/server/` | 本地服务器（`tf_server.py`、`tflocal_accounts.py`、`rules.json`、`data/ghosts/`） |
 | `dist/README.md` | 完整交付说明（526 行，含内购破解章节） |

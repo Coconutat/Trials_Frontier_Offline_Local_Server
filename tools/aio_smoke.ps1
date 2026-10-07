@@ -9,11 +9,16 @@
 # 零依赖的边界（两样绕不过去，脚本会检查）：
 #   * build-tools 里的 zipalign / apksigner
 #   * 一个 JDK（apksigner 要 java）
+#
+# 默认 base = apkmirror 下的**未改动原版**（`libTrialsGo.so` = 743f945c…，与 tfpatcher.py 的
+# 期望指纹一致）。别拿 dist\TrialsFrontier-offline.apk 当 base：它是已打补丁的产物。
+
+$defaultBase = 'dist\原版APK\com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk'
 
 [CmdletBinding()]
 param(
     [string]$Exe = 'dist\TrialsFrontierPatcher-console.exe',
-    [string]$Base = 'dist\TrialsFrontier-offline.apk',
+    [string]$Base = '',
     [string]$Payload = '',
     [string]$BuildTools = '',
     [string]$Port = '8123',
@@ -23,10 +28,13 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+if (-not $Base) { $Base = $defaultBase }
 $sx = if ([System.IO.Path]::IsPathRooted($Exe)) { $Exe } else { Join-Path $root $Exe }
 $sb = if ([System.IO.Path]::IsPathRooted($Base)) { $Base } else { Join-Path $root $Base }
 if (-not (Test-Path $sx)) { throw "找不到 exe：$sx（先跑 pwsh tools\build_aio.ps1）" }
-if (-not (Test-Path $sb)) { throw "找不到基准 APK：$sb" }
+if (-not (Test-Path $sb)) {
+    throw "找不到基准 APK：$sb`n用 -Base 指一份未改动的原版（7.9.4/561）。"
+}
 
 $smoke = Join-Path $root 'tmp\aio\smoke'
 if (Test-Path $smoke) { Remove-Item $smoke -Recurse -Force }
