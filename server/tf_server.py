@@ -817,6 +817,27 @@ def _lan_ip():
     return "127.0.0.1"          # 探测不出来就给个能看的，别让 URL 变成 "http://:8123"
 
 
+def _lan_ips():
+    """所有可能的局域网 IPv4，默认路由那个排最前。
+
+    ★ 为什么要一串：多网卡机器（Hyper-V / WSL / VMware / 虚拟热点）上
+      `_lan_ip()` 选中的那个不一定是手机能走通的那个 —— 「对方连不上」时
+      把候选地址都打出来，比让人猜快得多。
+    """
+    out = []
+    primary = _lan_ip()
+    if primary and not primary.startswith("127."):
+        out.append(primary)
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith(("127.", "169.254.")) and ip not in out:
+                out.append(ip)
+    except OSError:
+        pass
+    return out
+
+
 def _public_host(headers):
     """给 `h_app_configuration` 用的基址 host —— **绝不把回环地址发出去**。
 
@@ -6739,6 +6760,11 @@ class Handler(BaseHTTPRequestHandler):
         # ★ /__log 不在这里抄近路：它必须和别的 /__* 一样过 _introspect 里的门禁，
         #   在 _handle 里提前 return 等于绕过访问控制（日志里有全部请求路径）。
         if path == "/__ping":
+            # ★ 这条单独留痕（别的 /__* 按设计不进请求日志 —— 那是客户端流量的账本）。
+            #   「对方连不上」时的第一步就是让他用手机浏览器打开 /__ping，服务器这边
+            #   必须能看见「他的包到底打进来没有」以及来自哪个网段。
+            print("%-15s PING  %s" % (self.client_address[0] if self.client_address else "-",
+                                      "pong"), flush=True)
             self._send(200, {"Content-Type": "text/plain"}, b"pong\n")
             return
         if path.startswith("/__"):
@@ -6761,6 +6787,8 @@ class Handler(BaseHTTPRequestHandler):
 
         entry = {
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds"),
+            # 来源 IP = 排障的第一现场：「连不上」时先看日志里有没有他那个网段的请求。
+            "client": self.client_address[0] if self.client_address else "",
             "method": method,
             "url": raw_path,
             "path": path,
@@ -6788,8 +6816,9 @@ class Handler(BaseHTTPRequestHandler):
         # 控制台精简输出
         mark = "" if which == "default" else ("  <- " + which)
         print(
-            "%-6s %-70s -> %d  %4dms%s"
-            % (method, (path + ("?" + query if query else ""))[:70], status, entry["ms"], mark),
+            "%-15s %-6s %-70s -> %d  %4dms%s"
+            % (entry["client"] or "-", method,
+               (path + ("?" + query if query else ""))[:70], status, entry["ms"], mark),
             flush=True,
         )
         if body:
@@ -7405,12 +7434,33 @@ def main():
               flush=True)
         return 1
     srv.daemon_threads = True
-    print("Trials Frontier 本地服务器已启动： http://%s:%d" % (args.host, port), flush=True)
+    # 「谁的设备连不上」最先要回答的问题是「他的包到底到没到」——所以来源 IP 要落进
+    # 请求日志与控制台（以前两者都没有，只能猜）。绑定地址也照实打印：0.0.0.0 不是
+    # 一个能填进手机里的地址，以前那句「已启动：http://0.0.0.0:8123」会误导人。
+    listen = ("%s（所有网卡，局域网里的设备都能连）" % args.host
+              if args.host in ("0.0.0.0", "::") else args.host)
+    print("Trials Frontier 本地服务器已启动： 监听 %s:%d" % (listen, port), flush=True)
     print("数据目录： %s" % DATA_DIR, flush=True)
     print("规则文件： %s" % RULES_PATH, flush=True)
     print("请求日志： %s" % LOG_PATH, flush=True)
-    print("后台管理页： http://127.0.0.1:%d/__admin  （手机用 http://%s:%d/__admin）"
-          % (port, _lan_ip(), port), flush=True)
+    ips = _lan_ips()
+    print("后台管理页： http://127.0.0.1:%d/__admin" % port, flush=True)
+    if ips:
+        print("手机/其它设备用： %s"
+              % "  ".join("http://%s:%d/__admin" % (ip, port) for ip in ips), flush=True)
+    else:
+        print("手机/其它设备用： 找不到局域网地址（没连网线/Wi-Fi？）", flush=True)
+    if args.host not in ("0.0.0.0", "::"):
+        print("⚠ --host %s：只有这个地址能连进来。要在局域网里被访问，去掉 --host 用默认的 0.0.0.0。"
+              % args.host, flush=True)
+    else:
+        print("连不上先查三件事：① 设备与这台电脑要在**同一个局域网**"
+              "（192.168.x.x 这类地址不能跨网段/走公网）；"
+              "② 第一次运行要在弹出的 Windows 防火墙提示里点「允许访问」"
+              "（把 exe 换个目录会再问一次，点了取消就一直连不上）；"
+              "③ 手机浏览器打开 http://%s:%d/__ping ，能看到 pong 才说明网络是通的。"
+              % (ips[0] if ips else "<本机IP>", port), flush=True)
+
     if FROZEN and port_src == "默认":
         print("  想换端口：在 %s 旁边新建 port.txt 写一行数字（比如 9000）。" % EXE_DIR, flush=True)
     if boot:

@@ -944,7 +944,7 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
    + PyInstaller / Nuitka 两支 + `SHA256SUMS.txt` + 可选 Authenticode 签名（`$env:TF_SIGN_PFX`）。
 5. `tools/exe_smoke.ps1`：把 exe 拷进一个空目录，当「玩家第一次拿到」跑一遍。
 
-验证（2026-10-06）：PyInstaller 版约 **10.2 MB**、Nuitka 版约 **7.7 MB**（体积与 sha256 每次编译都会变，
+验证（2026-10-06，2026-10-07 复查 35 项）：PyInstaller 版约 **10.2 MB**、Nuitka 版约 **7.7 MB**（体积与 sha256 每次编译都会变，
 以产物旁边的 `dist\SHA256SUMS.txt` 为准），空目录冒烟**全绿**：零依赖启动 / `port.txt` 生效 / 在 exe 旁建 `data\` 与 `logs\requests.jsonl` /
 只播种 46 个已入库幽灵 / 随机口令能登录 / `/__admin` 与 `app.js` 字节数与源码一致 / 退出无残余进程；
 全程没碰开发机的 `server\data\admin.json`。新增 `tests/test_packaging.py` 17 项回归（全库 229 → 246 项），
@@ -1010,6 +1010,36 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
   原样进成品。现在：`_baked_in()` 跑全表 dry-run 列出已带的补丁，没勾「忽略原版校验」就 `raise ToolError`
   （点名功能 + 原始 id + 该换哪份原版）；勾了才放行并打 `[WARN]`。GUI 选 APK 的文件框默认开在
   `原版APK\`。`tools/aio_smoke.ps1` 加了 5 项脏 base 检查，`tests/test_patch_aio.py` 加了 7 项。
+
+### 5.2 服务器「连不上」可诊断化（2026-10-07，用户 m11662）
+
+> 用户要求（m11662）：**「服务器代码审计，有人反馈他设备和电脑服务器ip192.168.140.57：8123连接不上」**
+
+* 审计结论（**代码不是原因**）：`main()` 默认 `--host 0.0.0.0`（`server/tf_server.py:7353`，只由命令行决定，
+  没有配置文件能把它改成回环），`ThreadingHTTPServer((args.host, port))` 绑 `0.0.0.0`；游戏端点**无 IP 白名单/ACL**，
+  唯一的门禁是 `/__*` 要管理员 Cookie（`_PUBLIC` = `/__ping`、`/__ui`、`/__register`、`POST /__api/register`），
+  未知客户端被 `resolve_identity` 兜成匿名档案而不是拒绝 ⇒ 连不上只会是「包没到」或「地址/端口不对」。
+* ★ 但当时**服务端答不出「他的包到没到」**：`Handler.log_message` 被改成 `pass`，日志条目与控制台行
+  **都没有来源 IP**，`/__ping` 又在 `_handle` 里提前 `return`（在记账之前）⇒ 连探测都不留痕。已修：
+  * 日志条目新增 `client`（`self.client_address[0]`）；控制台摘要改为 IP 打头的
+    `"%-15s %-6s %-70s -> %d  %4dms%s"`。
+  * `/__ping` 单独留一行 `192.168.5.2   PING  pong`（别的 `/__*` 仍按设计不进请求日志）。
+  * 新增 `_lan_ips()`（多网卡时列出全部候选局域网 IPv4，默认路由那个最前，滤掉 `127.`/`169.254.`）；启动横幅重写：
+    `0.0.0.0` 只作为**绑定地址**出现（旧横幅直接印 `http://0.0.0.0:8123` 会把人带进沟里），
+    另打「后台管理页 127.0.0.1」+「手机/其它设备用 <每个候选 IP>」+「连不上先查三件事」口诀
+    （同一局域网 / 防火墙弹窗点过「允许访问」/ 浏览器开 `/__ping` 看到 pong）；`--host` 不是 `0.0.0.0` 时打 ⚠。
+* 头号真因（本机侦查得到）：**Windows 防火墙的入站放行是按程序绝对路径逐条存在的**
+  （`C:\python314\python.exe`、`…\tmp\exe\smoke\trialsfrontierserver.exe`、`…\dist\trialsfrontierserver-nuitka.exe` …），
+  把 exe 换到新目录 = 旧规则不再匹配 = 默认拦掉；用户点过「取消」或网络配置档判成「公用」时更彻底。
+  其它候选：跨网段（`192.168.x.x` 不能走公网）、`--host 127.0.0.1`、端口填错（`--port` > `port.txt` > 8123）、
+  手机侧 AP 隔离/访客网络。
+* 回归：`tests/test_admin_webui.py` 加 2 项（`_lan_ips` 过滤+去重、DNS 失败不抛），单个文件 171 项、全库 **287 项 OK**；
+  `tools/exe_smoke.ps1` 从 30 项加到 **35 项**（横幅给的是能填进手机的地址、没把 `0.0.0.0` 当可用地址、
+  排查口诀在、日志条目带来源 IP、`/__ping` 在控制台留 `来源IP  PING  pong`），两个 exe 各 35/35 全绿。
+  实测：`Invoke-WebRequest http://192.168.5.2:8123/__ping` → `200 pong` 且控制台出现该 IP；
+  `GET /` 的日志条目 `client=192.168.5.2  GET / -> 200`。
+* 顺手修的交付态 bug：`tools/build_exe.ps1` 的 `[4/4]` 原来**整体重写** `dist\SHA256SUMS.txt`，
+  跑一次服务器构建就把 `tools/build_aio.ps1` 写的补丁器 exe 两行抹掉 ⇒ 改成只替换本次构建的那几行。
 
 ---
 
@@ -1250,7 +1280,8 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 | --- | --- |
 | `dist/TrialsFrontier-offline.apk` | 完整离线版 APK（m16），26 906 224 字节，SHA-256 `EA77B0B420BF790BB626189F74A3BC64BB384607C2A273F36ADBF558FD8EAB53`。⚠ 这是**已打补丁的产物**，不能再当「干净 base」 |
 | `dist/原版APK/com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk` | **未改动的真原版**（apkmirror 下载，用户 m11161 交出）：34 312 425 字节，SHA-256 `EDDD7DF0C482279B523255498DB448F5CE27609D8BCB1E0B94C45D5948225580`；`libTrialsGo.so` = `743f945cd7e3378d…`（= `tools/tfpatcher.py:69` 的期望指纹），minSdk 16 / targetSdk 30，arm64 + v7a 双 ABI，Ubisoft 原签名。**打补丁认它当 base** |
-| `dist/SHA256SUMS.txt` | 4 行校验和：`TrialsFrontierServer.exe` / `-nuitka.exe` / `TrialsFrontierPatcher.exe` / `-console.exe`（各带 `.sha256` 边车） |
+| `dist/SHA256SUMS.txt` | 4 行校验和：`TrialsFrontierServer.exe` / `-nuitka.exe` / `TrialsFrontierPatcher.exe` / `-console.exe`（各带 `.sha256` 边车；由两个构建脚本各自替换自己的行） |
+| `dist/TrialsFrontierServer.exe` / `-nuitka.exe` | 本地服务器的一键版（PyInstaller 单文件 ~10.2 MB / Nuitka 真编译 ~7.7 MB）。拷到任意目录双击即跑，数据落在 exe 旁 `data\`、日志在 `logs\requests.jsonl`；横幅打印「手机/其它设备用」的地址与连不上排查口诀，请求日志带来源 IP（见 §5.2） |
 | `dist/patcher/` | 面向用户自己原版 APK 的补丁工具链（含 `tfpatcher.py`、`patch_native.py` 等） |
 | `dist/server/` | 本地服务器（`tf_server.py`、`tflocal_accounts.py`、`rules.json`、`data/ghosts/`） |
 | `dist/README.md` | 完整交付说明（526 行，含内购破解章节） |

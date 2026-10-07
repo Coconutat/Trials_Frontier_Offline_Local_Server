@@ -118,9 +118,14 @@ Handler.do_GET / do_POST / do_PUT / do_DELETE
         最后统一 _send() + 追加一条 JSONL 日志 + 控制台摘要
 ```
 
-日志条目字段：`ts / method / url / path / query / req_headers / req_body / req_body_len / rule / status / resp_body / ms`。
+日志条目字段：`ts / client / method / url / path / query / req_headers / req_body / req_body_len / rule / status / resp_body / ms`。
+`client` 是来源 IP（`self.client_address[0]`）—— 有人喊「连不上」时，先用它回答「他的包到底到没到」。
+控制台摘要同样以来源 IP 打头：`192.168.5.2   GET   /v2/profiles/me  -> 200   3ms`。
 落到 `work/trials-frontier/notes/server-log.jsonl`（同时进内存环形缓冲 `RECENT`，`/__log` 可读，**要管理员**）。
-`/__*` 请求本身不进这个日志（`/__admin` 的访问也不会污染游戏端点统计）。
+`/__*` 请求本身不进这个日志（`/__admin` 的访问也不会污染游戏端点统计），
+**唯一的例外是 `/__ping`**：它过 `_handle` 时打一行 `192.168.5.2   PING   pong` 到控制台。
+`/__ping` 是排查「对方连不上」的第一步（让对端用浏览器打开 `http://<你的IP>:<端口>/__ping`），
+不留痕就没法区分「防火墙拦了」和「他填错地址了」。
 
 **`X-TF-Client`**：服务器在把请求交给动态处理器前，用来源 IP **覆盖**同名请求头。
 `tflocal_accounts.save_progress()` / `serve_progress()` 靠它判断「这是不是同一台设备」，
@@ -428,8 +433,21 @@ python -m unittest discover -s tests -v
 ### 7.1 后台管理页 `/__admin`
 
 ```
-后台管理页： http://127.0.0.1:8000/__admin   （手机用 http://<局域网IP>:8000/__admin）
+监听 0.0.0.0（所有网卡，局域网里的设备都能连）：8123
+后台管理页： http://127.0.0.1:8123/__admin
+手机/其它设备用： http://192.168.5.2:8123/__admin
+连不上先查三件事：① 设备与这台电脑要在**同一个局域网**（192.168.x.x 这类地址不能跨网段/走公网）；
+② 第一次运行要在弹出的 Windows 防火墙提示里点「允许访问」（把 exe 换个目录会再问一次，点了取消就一直连不上）；
+③ 手机浏览器打开 http://192.168.5.2:8123/__ping ，能看到 pong 才说明网络是通的。
 ```
+
+* 启动横幅只打「能填进手机」的地址：`0.0.0.0` 是绑定地址、**不是**给客户端用的地址，
+  旧版横幅直接印 `http://0.0.0.0:8123` 会把人带进沟里。多网卡（Hyper-V/WSL/VMware/虚拟热点）
+  时逐个列出 `_lan_ips()` 的候选（默认路由那个排最前），因为它选中的那个不一定通得了。
+* `--host` 不是 `0.0.0.0`/`::` 时横幅会打 ⚠：只有这个地址能连进来（例：`--host 127.0.0.1`
+  等于只让本机连，局域网里的设备必然「连不上」）。
+* 端口优先级：`--port` > `<程序目录>/port.txt` 第一行 > 8123。对方填错端口和防火墙拦掉是
+  两种不同的「连不上」——横幅把当前端口和绑定方式一起打出来，先排除前者。
 
 * 管理员账号**独立于玩家账号**，存在 `data/admin.json`（`_hash_pw` = sha256(salt+用户名小写+NUL+口令)，
   与账号库同一套；不入库）。**没有网页自助创建** —— 否则第一个访问到 `/__admin` 的人
@@ -629,7 +647,7 @@ pwsh tools\exe_smoke.ps1 -Exe dist\TrialsFrontierServer.exe   # 丢进空目录�
 * 产物 `dist\TrialsFrontierServer.exe`（约 10.2 MB）／`dist\TrialsFrontierServer-nuitka.exe`（约 7.7 MB）
   ＋ `dist\SHA256SUMS.txt`（体积与 sha256 每次编译都会变，别照抄文档里的数）。用法：拷到任意目录
   （别放 `C:\Program Files`，那里不可写）双击运行，它会在**自己旁边**建 `data\`（存档、`tf_config.json`、
-  幽灵库）和 `logs\requests.jsonl`，控制台打印局域网地址与首次随机口令。
+  幽灵库）和 `logs\requests.jsonl`，控制台打印局域网地址（多网卡逐个列出）、首次随机口令与「连不上先查三件事」。
 * 打包白名单本身就是安全边界（`tools/build_exe.ps1` 第 2 步硬性检查）：真机存档 `data\save\`、
   `admin.json`、`accounts.json`、`sessions.json`、`pvp_state.json`、审计与日志**一律不进包**；
   幽灵只拷 `git ls-files server/data/ghosts` 里已入库的那 46 个（开发机上还混着真机上传的，整目录拷会漏发）。
