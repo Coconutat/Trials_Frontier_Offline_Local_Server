@@ -569,8 +569,8 @@ Authenticode 签名（找不到 `signtool.exe` 只警告）。
 ```powershell
 pwsh tools\build_aio.ps1                     # 出 dist\TrialsFrontierPatcher.exe（窗口版）+ -console.exe
 pwsh tools\build_aio.ps1 -Mode console -SkipTests
-pwsh tools\aio_smoke.ps1                     # 27 项冒烟：自检 / 功能清单 / 真跑一次补丁 / GUI 起得来
-pwsh tools\aio_smoke.ps1 -Full               # 再跑一次自包含大打包（约 300 MB，几分钟）
+pwsh tools\aio_smoke.ps1                     # 23 项冒烟：自检 / 功能清单 / 真跑一次补丁 / GUI 起得来
+pwsh tools\aio_smoke.ps1 -Full               # 再跑一次自包含大打包（约 300 MB，几分钟，共 27 项）
 ```
 
 源码态直接跑（不打包）：
