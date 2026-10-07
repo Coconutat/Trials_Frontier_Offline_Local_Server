@@ -569,8 +569,8 @@ Authenticode 签名（找不到 `signtool.exe` 只警告）。
 ```powershell
 pwsh tools\build_aio.ps1                     # 出 dist\TrialsFrontierPatcher.exe（窗口版）+ -console.exe
 pwsh tools\build_aio.ps1 -Mode console -SkipTests
-pwsh tools\aio_smoke.ps1                     # 23 项冒烟：自检 / 功能清单 / 真跑一次补丁 / GUI 起得来
-pwsh tools\aio_smoke.ps1 -Full               # 再跑一次自包含大打包（约 300 MB，几分钟，共 27 项）
+pwsh tools\aio_smoke.ps1                     # 28 项冒烟：自检 / 功能清单 / 真跑一次补丁 / GUI 起得来
+pwsh tools\aio_smoke.ps1 -Full               # 再跑一次自包含大打包（约 300 MB，几分钟，共 32 项）
 ```
 
 源码态直接跑（不打包）：
@@ -613,8 +613,13 @@ python -m tools.tfpatch_aio --list-features
   正是 `tools/tfpatcher.py:69` 写死的期望指纹 ⇒ 它才是老脚本认定、也应当被认作「干净原版」的那个包。
   ★ **别拿 `dist\TrialsFrontier-offline.apk` / `-full.apk` / `tmp\build\tf-m16.apk` 当干净 base**：
   它们是 m16 时代的**已打补丁产物**（`libTrialsGo.so` = `e9f2fa1a4e90ac07bf196bcde5565cb4ceb11ad849457fb6499b4625c7f4c04f`、
-  targetSdk 已改成 27、v7a 已删）。`tools/tfpatcher.py` 的 SHA256 校验会**直接拒绝**它们（要 `--force` 才过）；
-  AIO 能跑通只是因为 native 补丁表容忍「已经是目标状态」，但那样 base 已经不是原版了，测不出真实回归。
+  targetSdk 已改成 27、v7a 已删）。`tools/tfpatcher.py` 的 SHA256 校验会**直接拒绝**它们（要 `--force` 才过）。
+  ★★ **AIO 现在也默认拒绝**：`libTrialsGo.so` 指纹对不上基准时，`pipeline.py` 先跑一遍全表 dry-run，
+  把 base 里「已经是改好状态」的补丁列出来并 `raise ToolError`（报错里点名「货币不减反增」这类开关、
+  列出原始 id、给出该换哪份原版）。原因：**补丁器只往原版上「加」补丁，去不掉 base 里已有的改动** ——
+  拿 `-full.apk` 当 base 又不勾 `money`，成品里照样带着不减反增（这就是用户报的
+  「没勾不减反增却还是有」）。确实要在这份 base 上继续，就勾「忽略原版校验」（命令行 `--force`），
+  它会改成 `[WARN]` 放行并把已带的补丁打出来。
 * **`lib/armeabi-v7a/` 默认丢掉**（`--keep-v7a` 可留，不推荐）：补丁表只针对 arm64 的
   `libTrialsGo.so`，留一份没打补丁的 32 位库 ⇒ 32 位设备上跑的是原版库（连不上本地服务器、反作弊照旧），
   坏得静悄悄；丢掉后 32 位设备会明确报 `INSTALL_FAILED_NO_MATCHING_ABIS`。

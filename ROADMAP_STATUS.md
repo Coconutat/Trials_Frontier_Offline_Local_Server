@@ -15,7 +15,7 @@
 | 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **部分实现；本轮补齐碉堡奖励/结赛及基础货币链，21项隔离回归通过，待真机到账验证** | 不再沿用旧95%估计 |
 | 4 | WebUI 管理界面 | 🟡 **五屏已交付（`/__admin`：登录／账号／存档／下发＋午夜杯运营屏＋碉堡运营屏，CN+EN，160 项后台回归 + headless 冒烟）；概览等两屏待做** | 65% |
 | 5 | 一键开服打包成 exe | ✅ **零依赖单文件已交付（PyInstaller 10.2 MB + Nuitka 真编译 7.7 MB；空目录冒烟全绿，数据落在 exe 旁）** | 100% |
-| 5b | AIO 打补丁器 exe（带 GUI，见 §5.1） | ✅ **已交付（`dist\TrialsFrontierPatcher.exe` 18.0 MB；补丁版 + 自包含完整 APK 两条路都跑通，27 项冒烟全绿）** | 100% |
+| 5b | AIO 打补丁器 exe（带 GUI，见 §5.1） | ✅ **已交付（`dist\TrialsFrontierPatcher.exe` 18.0 MB；补丁版 + 自包含完整 APK 两条路都跑通，28 项冒烟全绿）** | 100% |
 | 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
 
 ---
@@ -972,9 +972,9 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
   `signer.py` / `cliutil.py` / `cli.py` / `gui.py`（tkinter）/ `vendored/`（§2 那 6 个脚本的**副本**）。
   **老脚本一个没动**，仍是参考实现。
 * `tools/build_aio.ps1` → `dist\TrialsFrontierPatcher.exe`（窗口版 18.0 MB）+ `-console.exe`（同尺寸）；
-  `tools/aio_smoke.ps1` 把 exe 拷进空目录跑 **27 项**（自检 / 功能清单 / 真跑一次补丁并验签 /
+  `tools/aio_smoke.ps1` 把 exe 拷进空目录跑 **28 项**（自检 / 功能清单 / 真跑一次补丁并验签 /
   查产物里没多出 `assets/tf`、`classes4.dex`、旧 `META-INF/CERT.*` / GUI 起得来）；`-Full` 再跑
-  自包含大打包。`tests/test_patch_aio.py` 21 项回归（全库 255 → 276）。
+  自包含大打包。`tests/test_patch_aio.py` 30 项回归（全库 255 → 285）。
 * 依赖：`keystone` + `pyelftools` 随包；`payload_setup.dex` 预先编好随包（运行期**不需要** javac/d8）；
   仍然需要外部 **Android build-tools（zipalign/apksigner）+ 一个 JDK（java/keytool）**，这两个不塞进 exe。
 * 功能细化（默认只勾 `offline` 必选 + `noads`）：`fuel` 无限汽油、`money` 货币不减反增、
@@ -1002,6 +1002,14 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
   `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（与原已装改版**签名不同**）；把包名 + 8 个 `android:authorities`
   一起改名后原样（targetSdk 30 / minSdk 16 / 含 v7a）重签 → 装上成功。Android 14 的 SDK 门槛只管
   `targetSdk < 23`，原版是 30，不在门槛内。
+* ★ **脏 base 从「默默放行」改成硬拦**（用户 m11473：「检查一下修补apk的exe程序，我没有选择物品不减反增，但是还是有。」）：
+  取证结论 —— 勾选逻辑本身没问题（`features.defaults()` 只含 `offline`+`noads`，`native.py` 的 `--only`
+  过滤正确），真因是他拿 `dist\TrialsFrontier-offline-full.apk` 当 base（`%TEMP%\tfpatch-aio\orig\*.so`
+  指纹 `73c3ff5f…`/`be6a10ab…` 与他那份 `-full.apk` 一致），而旧 `pipeline.py` 在 `.so` 指纹对不上基准时
+  **自动 `--force` 放行**；补丁器只加不减 ⇒ base 里那 17 处（含 `spend-adds-instead-of-subtracts`）
+  原样进成品。现在：`_baked_in()` 跑全表 dry-run 列出已带的补丁，没勾「忽略原版校验」就 `raise ToolError`
+  （点名功能 + 原始 id + 该换哪份原版）；勾了才放行并打 `[WARN]`。GUI 选 APK 的文件框默认开在
+  `原版APK\`。`tools/aio_smoke.ps1` 加了 5 项脏 base 检查，`tests/test_patch_aio.py` 加了 7 项。
 
 ---
 
@@ -1257,7 +1265,7 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 | `tools/apkpayload/OfflinePayloadSetup.java` | 首启自解包类（`extends DexApplicationClass`，只覆盖 `onCreate`），随包进 `classes4.dex` |
 | `dist/TrialsFrontierPatcher.exe` | **AIO 打补丁器（带 GUI，给玩家用）**：约 18 MB（sha256 每次编译都变，以 `SHA256SUMS.txt` 为准），勾功能 → 出补丁版或自包含完整 APK；不需要装 Python，但要装 Android build-tools + JDK。源码 `tools/tfpatch_aio/`，见 §5.1 |
 | `dist/TrialsFrontierPatcher-console.exe` | 同一程序的命令行版（`--cli --apk … --features offline,fuel`；打包脚本与冒烟都用它做自检） |
-| `tools/build_aio.ps1` / `tools/aio_smoke.ps1` | 打上面那两个 exe / 把 exe 拷进空目录跑冒烟（补丁路径 23 项，`-Full` 加到 27 项） |
+| `tools/build_aio.ps1` / `tools/aio_smoke.ps1` | 打上面那两个 exe / 把 exe 拷进空目录跑冒烟（补丁路径 28 项，`-Full` 加到 32 项） |
 | `tools/tfpatch_aio/vendored/` | `patch_native/patch_dynaddr/patch_urls/patch_manifest/patch_dex/build_apk` 的**副本**（原脚本不动，仍是参考实现） |
 | `work/trials-frontier/notes/*.md` | 逆向与情报笔记：`selfcontained-apk.md`（打包原理 + 两个坑）、`online-rules-evidence.md`（赛季/事件史料，带出处）、`real-server-samples.md`（全仓库唯二的真实服务器样本）、`web-research-toolkit.md`（本机抓取方法） |
 

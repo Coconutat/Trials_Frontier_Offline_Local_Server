@@ -100,6 +100,57 @@ def _app_class(man_path):
     return ""
 
 
+def _baked_in(lib, work, log):
+    """这份 base 里哪些补丁**已经是改好的状态**（= 别人已经改过、我们改不回来）。
+
+    跑一遍全表 dry-run 拿报告。补丁位既不是原始字节也不是目标字节、或者符号找不到时
+    脚本会退出码 2 而不写报告 —— 那就返回 None（拿不准，报错文案退化成通用版）。
+    """
+    rep = os.path.join(work, "base-scan.json")
+    if os.path.exists(rep):
+        os.remove(rep)
+    r = cliutil.run_cli(native, ["--so", lib, "--dry-run", "--force",
+                                 "--report", rep], lambda s: None)
+    if r.rc != 0 or not os.path.isfile(rep):
+        return None
+    try:
+        with open(rep, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return [p["id"] for p in (d.get("patches") or []) if p.get("already")]
+
+
+def _describe_baked(ids):
+    """「base 里已经带了什么」：功能名去重在前，原始 id 列在后（方便 grep）。"""
+    seen, labels = set(), []
+    for pid in ids:
+        label = features.label_for_patch(pid) or "(认不出来)"
+        if label not in seen:
+            seen.add(label)
+            labels.append(label)
+    return "%s\n      （id：%s）" % ("、".join(labels), ", ".join(ids))
+
+
+def _dirty_base_msg(sha, baked):
+    return "\n".join([
+        "这份 APK 不是未改动的原版，不能当 base：",
+        "    libTrialsGo.so sha256 = %s" % sha,
+        "    基准原版              = %s"
+        % getattr(native, "EXPECTED_SHA256", "(未知)"),
+        "    它里面已经是「改好」状态的补丁：%s"
+        % (_describe_baked(baked) if baked else "（读不出来，总之库被动过）"),
+        "",
+        "补丁器只会往原版上「加」补丁，**不会把 base 里已经有的改动去掉** —— "
+        "所以就算没勾「货币不减反增」，成品里照样会带着它。",
+        "常见的错：拿 dist\\TrialsFrontier-offline.apk / -full.apk 当 base，"
+        "那两个本身就是 17 处全打过的产物（含不减反增、无限汽油）。",
+        "请换一份未改动的原版（仓库现成的：dist\\原版APK\\ 下那份 apkmirror 原版，"
+        "sha256 以 EDDD7DF0 开头）。",
+        "确实要在这份 base 上继续，就勾上「忽略原版校验」（命令行 --force）。",
+    ])
+
+
 def run(o):
     log = o.log
     keys, patches, actions, labels = features.resolve(o.selected)
@@ -155,10 +206,16 @@ def run(o):
     ltg1 = os.path.join(work, "libTrialsGo.1.so")
     sha_ltg = _sha256(libs["libTrialsGo.so"])
     force = o.force
-    if not force and sha_ltg != getattr(native, "EXPECTED_SHA256", ""):
-        force = True
-        log("    原版 libTrialsGo.so 的 sha256 与基准不同（民间重打包版？），"
-            "自动放行整库校验；每处补丁仍逐字节比对。")
+    if sha_ltg != getattr(native, "EXPECTED_SHA256", ""):
+        # base 被动过 = 里面可能已经带着「不减反增」之类的改动，而补丁器只加不减。
+        # 以前这里默默 force 放行，结果就是「没勾也照样有」——现在默认报错。
+        baked = _baked_in(libs["libTrialsGo.so"], work, log)
+        if not force:
+            raise ToolError(_dirty_base_msg(sha_ltg, baked))
+        log("    [WARN] 已勾「忽略原版校验」：base 的 libTrialsGo.so 不是基准原版，"
+            "它已经有的改动会原样留着。")
+        if baked:
+            log("           已经是「改好」状态的补丁：%s" % _describe_baked(baked))
     argv = ["--so", libs["libTrialsGo.so"], "--out", ltg1,
             "--only", ",".join(patches),
             "--report", os.path.join(work, "native-report.json")]

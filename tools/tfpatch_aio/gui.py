@@ -22,6 +22,21 @@ HINT_DIRTEXT = ("手机上要填的私服地址。APK 里的 URL 会指向它；
                 "Android/data/com.ubisoft.redlynx.trialsfrontier.ggp/files/tf_server.txt")
 
 
+def _original_dir():
+    """选 APK 的文件框先开在放未改动原版的目录里。
+
+    exe 旁边的 dist\\ 里既有原版也有 TrialsFrontier-offline*.apk（那是已经打过补丁的
+    产物，拿来当 base 会带着它原有的改动 —— 正是「没勾不减反增却还是有」的成因），
+    所以优先把人领到 原版APK\\ 去。
+    """
+    d = cliutil.app_dir()
+    for sub in ("原版APK", os.path.join("dist", "原版APK")):
+        p = os.path.join(d, sub)
+        if os.path.isdir(p):
+            return p
+    return d
+
+
 class App(object):
     def __init__(self, root):
         self.root = root
@@ -171,7 +186,8 @@ class App(object):
 
     # ------------------------------------------------------------ 文件选择
     def _pick_apk(self):
-        p = filedialog.askopenfilename(title="选原版 APK",
+        p = filedialog.askopenfilename(title="选原版 APK（未改动的那个）",
+                                       initialdir=_original_dir(),
                                        filetypes=[("Android 包", "*.apk"),
                                                   ("所有文件", "*.*")])
         if p:

@@ -115,6 +115,25 @@ else {
     Check '产出了补丁版 APK' $false
 }
 
+# ------------------------------------------------- 2b 脏 base 必须被拦住
+# 「没勾货币不减反增，成品里却还是有」的成因：拿已打过补丁的产物当 base。
+# 补丁器只加不减，所以默认必须报错，而不是默默放行。
+$dirty = Join-Path $root 'dist\TrialsFrontier-offline.apk'
+if (Test-Path $dirty) {
+    $dlog = Join-Path $smoke 'dirty.log'
+    & $exe --cli --apk $dirty --out (Join-Path $smoke 'dirty-out.apk') `
+        --work (Join-Path $smoke 'dirty-work') --features offline,noads @extra *> $dlog
+    $dtxt = Get-Content $dlog -Raw -Encoding UTF8
+    Check '拿已打补丁的产物当 base 会拒绝（退出码非 0）' ($LASTEXITCODE -ne 0) "(实际 $LASTEXITCODE)"
+    Check '拒绝理由点明「不是未改动的原版」' ($dtxt -match '不是未改动的原版')
+    Check '拒绝理由列出 base 里已有的「货币不减反增」' ($dtxt -match '货币不减反增')
+    Check '拒绝理由指了该换哪份原版' ($dtxt -match '原版APK')
+    Check '脏 base 没产出 APK' (-not (Test-Path (Join-Path $smoke 'dirty-out.apk')))
+}
+else {
+    Write-Host "跳过脏 base 的检查（没有 $dirty）" -ForegroundColor Yellow
+}
+
 # ---------------------------------------------------------------- 3 自包含（可选）
 if ($Full) {
     $pl = $Payload
