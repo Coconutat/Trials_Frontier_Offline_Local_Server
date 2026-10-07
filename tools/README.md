@@ -495,6 +495,7 @@ python tools/build_item_catalog.py --packout <dir> --out <file>
 | Android SDK build-tools | `tfpatcher.py` 最后一步 | zipalign + apksigner；没有就用 `--no-sign` |
 | PyInstaller ≥6.22 | `build_exe.ps1`（默认分支） | `pip install pyinstaller`（本机已装 6.22.3） |
 | Nuitka ≥4.2 + MSVC | `build_exe.ps1 -Packer nuitka` | `pip install nuitka`；编译器用 Visual Studio 生成工具（**Python ≥3.13 不许用 MinGW**） |
+| Pillow | 只有 `make_icon.py`（一次性） | `pip install pillow`；产物 `tools\assets\tf_icon.ico` **已入库**，打包链不需要 Pillow |
 
 ---
 
@@ -520,19 +521,29 @@ pwsh tools\build_exe.ps1 -Packer nuitka     # Nuitka 真编译 → dist\TrialsFr
 pwsh tools\build_exe.ps1 -Packer both       # 两个都出，方便比体积 / 启动时间
 pwsh tools\build_exe.ps1 -SkipTests         # 跳过打包前的全库回归
 pwsh tools\exe_smoke.ps1 -Exe dist\TrialsFrontierServer.exe [-Port 8199]
+python tools\make_icon.py                    # 重新生成图标（要 Pillow；换图时才跑）
+python tools\make_icon.py --list             # 列出 APK 里所有候选图标
 ```
+
+**图标**：两个 exe 都嵌了 `tools\assets\tf_icon.ico` —— 游戏自己的启动图（戴头盔的机械师），
+8 档 16/24/32/48/64/128/192/256，从原版 APK 的 `res/mipmap-xxxhdpi-v4/ic_launcher.png`（192×192）抠出来。
+产物**提交进仓库**，所以打包链不依赖任何图像库；Pillow 只有 `make_icon.py` 那一步要（`--list` 用来挑源图）。
+`make_icon.py` **自己写 ICO 容器**、每一档都是 BMP 条目：Pillow 的 `save(format="ICO")` 会把所有档位写成
+PNG 条目，而 Windows 只对 256×256 那档明确支持 PNG 条目，小尺寸 PNG 条目可能整片渲染不出来。
+`build_exe.ps1` 的第 0 步会先确认这个文件在、且像 ICO（头 `00 00 01 00`）才继续。
 
 `build_exe.ps1` 四步：① 按白名单暂存到 `tmp\exe\stage`（`admin/` 前端、`rules.json`、
 `wts_rewards.json`，幽灵用 `git ls-files server/data/ghosts` 挑**已入库的 46 个**）；
 ② **硬性安全检查**（`admin.json` / `accounts.json` / `sessions.json` / `pvp_state.json` / `save` / 日志
-等命中就 `throw`）；③ 打包（默认 PyInstaller；Nuitka 自动找 MSVC，`--lto=yes --python-flag=-OO
---windows-console-mode=force`）；④ 写 `dist\SHA256SUMS.txt`（**只替换本次构建的那几行**，`tools\build_aio.ps1` 写的补丁器 exe 保留），
+等命中就 `throw`）；③ 打包（默认 PyInstaller `--icon`；Nuitka 自动找 MSVC，`--lto=yes --python-flag=-OO
+--windows-console-mode=force --windows-icon-from-ico`）；④ 写 `dist\SHA256SUMS.txt`（**只替换本次构建的那几行**，`tools\build_aio.ps1` 写的补丁器 exe 保留），
 设了 `$env:TF_SIGN_PFX` 就顺手 Authenticode 签名（找不到 `signtool.exe` 只警告）。
 
-`exe_smoke.ps1` 把 exe 拷进 `tmp\exe\smoke` 空目录，当「玩家第一次拿到」跑一遍（**35 项**）：零依赖启动、
+`exe_smoke.ps1` 把 exe 拷进 `tmp\exe\smoke` 空目录，当「玩家第一次拿到」跑一遍（**38 项**）：零依赖启动、
 `port.txt` 生效、在 exe 旁建 `data\` 与 `logs\requests.jsonl`、只播种白名单、随机管理员口令能登录、
 `/__admin` 与 `app.js` 的字节数与源码一致、横幅给的是**能填进手机**的地址（不是 `0.0.0.0`）与
-「连不上先查三件事」、请求日志条目带来源 IP、`/__ping` 在控制台留一行 `来源IP  PING  pong`、退出后无残余进程。
+「连不上先查三件事」、请求日志条目带来源 IP、`/__ping` 在控制台留一行 `来源IP  PING  pong`、
+**图标的 8 档数据全在 exe 里、且 Windows 从 exe 抠出来的 32×32 与我们那份逐字节相同**、退出后无残余进程。
 
 ★ 踩过的坑（脚本里已处理，改的时候别拆掉）：
 

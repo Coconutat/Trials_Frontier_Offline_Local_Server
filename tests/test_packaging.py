@@ -193,5 +193,47 @@ class AdminPageOpen(unittest.TestCase):
             self.assertFalse(srv._open_admin_page(8123))
 
 
+class IconAsset(unittest.TestCase):
+    """exe 图标（`tools/assets/tf_icon.ico`）—— 产物入库，打包时直接内嵌。
+
+    两条都是**曾经会踩的坑**，所以写死在这里（不需要 Pillow）：
+      * 每一档必须是 **BMP** 条目：Pillow 的 `save(format="ICO")` 会写成 PNG 条目，而 Windows 只对
+        256×256 那一档明确支持 PNG 条目，小尺寸 PNG 条目有可能整片渲染不出来。
+      * 目录项与 `BITMAPINFOHEADER` 要自洽：32bpp、`biHeight == 2 × 宽`（XOR 位图 + AND 掩码）。
+    生成器是 `tools/make_icon.py`（`write_ico()`）。
+    """
+
+    ICO = REPO / "tools" / "assets" / "tf_icon.ico"
+
+    def entries(self):
+        import struct
+        self.assertTrue(self.ICO.exists(), "tools/assets/tf_icon.ico 必须入库（打包链不能依赖 Pillow）")
+        data = self.ICO.read_bytes()
+        reserved, kind, n = struct.unpack_from("<HHH", data, 0)
+        self.assertEqual((reserved, kind), (0, 1), "ICO 头不对")
+        out = []
+        for i in range(n):
+            w, _h, _colors, _rsv, _planes, bpp, size, off = struct.unpack_from("<BBBBHHII", data, 6 + i * 16)
+            out.append({"size": w or 256, "bpp": bpp, "bytes": size, "off": off,
+                        "bih": struct.unpack_from("<IiiHHIIiiII", data, off),
+                        "magic": data[off:off + 8]})
+        return out
+
+    def test_every_frame_is_a_bmp_entry(self):
+        for e in self.entries():
+            with self.subTest(size=e["size"]):
+                self.assertNotEqual(e["magic"], b"\x89PNG\r\n\x1a\n", "PNG 条目在小尺寸上不一定渲染得出来")
+                bi_size, bi_w, bi_h, planes, bpp, compress = e["bih"][:6]
+                self.assertEqual((bi_size, planes, bpp, compress), (40, 1, 32, 0))
+                self.assertEqual((bi_w, e["bpp"]), (e["size"], 32))
+                self.assertEqual(bi_h, e["size"] * 2, "biHeight 该是 2×宽（XOR + AND）")
+                self.assertGreaterEqual(e["bytes"], e["bih"][6], "目录项长度盖不住位图数据")
+
+    def test_covers_the_sizes_windows_asks_for(self):
+        """16=任务栏/资源管理器小图标，32=桌面，48=中等，256=大图标（jumbo）。"""
+        sizes = {e["size"] for e in self.entries()}
+        self.assertTrue({16, 32, 48, 256} <= sizes, "缺档：%s" % sorted({16, 32, 48, 256} - sizes))
+
+
 if __name__ == "__main__":
     unittest.main()

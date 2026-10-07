@@ -153,6 +153,35 @@ try {
     Check '/__ping 返回 pong' ($pong.StatusCode -eq 200 -and $pong.Content -match 'pong')
     $stdout2 = [string](Get-Content $out -Raw)
     Check '/__ping 在控制台留了来源 IP' ([bool]($stdout2 -match '127\.0\.0\.1\s+PING\s+pong'))
+
+    # ---- 图标（用户 m11901）：exe 必须真带着游戏 logo ----
+    # 两条独立判据，都不看 DPI、也不依赖图像库：
+    #   ① 多尺寸 .ico 的**每一档**像素数据在 exe 里逐字节都在（资源编译器没丢档）；
+    #   ② Windows 从这个 exe 抠出来的 32×32 图标 == 从同一个 .ico 抠出来的 32×32
+    #      （证明那是一份 Windows 认得出的图标，不是「有数据但读不出来」）。
+    $icoPath = Join-Path $root 'tools\assets\tf_icon.ico'
+    Check '仓库里有图标 tools\assets\tf_icon.ico' (Test-Path $icoPath)
+    if (Test-Path $icoPath) {
+        $ib = [IO.File]::ReadAllBytes($icoPath)
+        $cnt = [int]$ib[4] + ([int]$ib[5] -shl 8)
+        $hay = [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes((Join-Path $box $name)))
+        $miss = @()
+        for ($i = 0; $i -lt $cnt; $i++) {
+            $b = 6 + $i * 16
+            $w = [int]$ib[$b]; if ($w -eq 0) { $w = 256 }
+            $off = [BitConverter]::ToUInt32($ib, $b + 12)
+            $mid = $off + 40 + [int]($w * $w * 2)     # XOR 数据的中点，取 64 字节当指纹
+            if ($hay.IndexOf([Text.Encoding]::Latin1.GetString($ib[$mid..($mid + 63)])) -lt 0) { $miss += $w }
+        }
+        Check "图标的 $cnt 档全在 exe 里" ($miss.Count -eq 0) $(if ($miss) { "缺 $($miss -join ',')" })
+        Add-Type -AssemblyName System.Drawing
+        $got = [System.Drawing.Icon]::ExtractAssociatedIcon((Join-Path $box $name)).ToBitmap()
+        $ref = [System.Drawing.Icon]::new($icoPath, 32, 32).ToBitmap()
+        $gms = New-Object System.IO.MemoryStream; $got.Save($gms, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $rms = New-Object System.IO.MemoryStream; $ref.Save($rms, [System.Drawing.Imaging.ImageFormat]::Bmp)
+        $same = ($got.Width -eq 32) -and (($gms.ToArray() -join ',') -eq ($rms.ToArray() -join ','))
+        Check 'Windows 从 exe 抠出的图标就是这份' $same "($($got.Width)x$($got.Height))"
+    }
 }
 finally {
     if (-not $SkipKill) {

@@ -642,10 +642,12 @@ pwsh tools\build_exe.ps1 -Packer nuitka    # Nuitka 真编译（几分钟，自�
 pwsh tools\exe_smoke.ps1 -Exe dist\TrialsFrontierServer.exe   # 丢进空目录冒烟
 ```
 
-* 产物 `dist\TrialsFrontierServer.exe`（约 10.2 MB）／`dist\TrialsFrontierServer-nuitka.exe`（约 7.7 MB）
+* 产物 `dist\TrialsFrontierServer.exe`（约 10.7 MB）／`dist\TrialsFrontierServer-nuitka.exe`（约 8.5 MB）
   ＋ `dist\SHA256SUMS.txt`（体积与 sha256 每次编译都会变，别照抄文档里的数）。用法：拷到任意目录
   （别放 `C:\Program Files`，那里不可写）双击运行，它会在**自己旁边**建 `data\`（存档、`tf_config.json`、
   幽灵库）和 `logs\requests.jsonl`，控制台打印局域网地址（多网卡逐个列出）、首次随机口令与「连不上先查三件事」。
+* 图标：两个 exe 都内嵌 `tools\assets\tf_icon.ico`（游戏自己的启动图，8 档 16→256，由
+  `python tools\make_icon.py` 从原版 APK 的 `res/mipmap-xxxhdpi-v4/ic_launcher.png` 生成，产物已入库）。
 * 打包白名单本身就是安全边界（`tools/build_exe.ps1` 第 2 步硬性检查）：真机存档 `data\save\`、
   `admin.json`、`accounts.json`、`sessions.json`、`pvp_state.json`、审计与日志**一律不进包**；
   幽灵只拷 `git ls-files server/data/ghosts` 里已入库的那 46 个（开发机上还混着真机上传的，整目录拷会漏发）。

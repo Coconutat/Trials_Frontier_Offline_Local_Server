@@ -14,7 +14,7 @@
 | 2b | VIP 下发（买了 VIP 就激活 VIP 事件） | ✅ **已实机验证（m16）** | 100% |
 | 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **部分实现；本轮补齐碉堡奖励/结赛及基础货币链，21项隔离回归通过，待真机到账验证** | 不再沿用旧95%估计 |
 | 4 | WebUI 管理界面 | 🟡 **五屏已交付（`/__admin`：登录／账号／存档／下发＋午夜杯运营屏＋碉堡运营屏，CN+EN，160 项后台回归 + headless 冒烟）；概览等两屏待做** | 65% |
-| 5 | 一键开服打包成 exe | ✅ **零依赖单文件已交付（PyInstaller 10.2 MB + Nuitka 真编译 7.7 MB；空目录冒烟全绿，数据落在 exe 旁）** | 100% |
+| 5 | 一键开服打包成 exe | ✅ **零依赖单文件已交付（PyInstaller 10.7 MB + Nuitka 真编译 8.5 MB；带游戏图标；空目录冒烟 38 项全绿，数据落在 exe 旁）** | 100% |
 | 5b | AIO 打补丁器 exe（带 GUI，见 §5.1） | ✅ **已交付（`dist\TrialsFrontierPatcher.exe` 18.0 MB；补丁版 + 自包含完整 APK 两条路都跑通，28 项冒烟全绿）** | 100% |
 | 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
 
@@ -941,10 +941,14 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
 3. 端口优先级 `--port` > `<exe 目录>\port.txt` 第一行 > 8123；冻结时启动自动打开 `/__admin`
    （`--no-browser` 关掉）；首次运行随机生成管理员口令打到控制台（`--reset-admin` 重来）。
 4. `tools/build_exe.ps1`：白名单暂存（幽灵用 `git ls-files` 挑，避免把真机上传的一起发出去）+ 私有数据**硬性检查**
-   + PyInstaller / Nuitka 两支 + `SHA256SUMS.txt` + 可选 Authenticode 签名（`$env:TF_SIGN_PFX`）。
+   + PyInstaller / Nuitka 两支（第 0 步先验图标 `tools\assets\tf_icon.ico`）+ `SHA256SUMS.txt` + 可选 Authenticode 签名（`$env:TF_SIGN_PFX`）。
 5. `tools/exe_smoke.ps1`：把 exe 拷进一个空目录，当「玩家第一次拿到」跑一遍。
+6. 图标（2026-10-07，用户 m11901）：`python tools\make_icon.py` 从原版 APK 的
+   `res/mipmap-xxxhdpi-v4/ic_launcher.png`（192×192）抠出游戏启动图，写成 8 档
+   16/24/32/48/64/128/192/256 的 `tools\assets\tf_icon.ico`（**提交进仓库**，打包链不依赖 Pillow）；
+   两个打包器各自内嵌（PyInstaller `--icon` / Nuitka `--windows-icon-from-ico`）。
 
-验证（2026-10-06，2026-10-07 复查 35 项）：PyInstaller 版约 **10.2 MB**、Nuitka 版约 **7.7 MB**（体积与 sha256 每次编译都会变，
+验证（2026-10-06，2026-10-07 复查 38 项）：PyInstaller 版约 **10.7 MB**、Nuitka 版约 **8.5 MB**（体积与 sha256 每次编译都会变，
 以产物旁边的 `dist\SHA256SUMS.txt` 为准），空目录冒烟**全绿**：零依赖启动 / `port.txt` 生效 / 在 exe 旁建 `data\` 与 `logs\requests.jsonl` /
 只播种 46 个已入库幽灵 / 随机口令能登录 / `/__admin` 与 `app.js` 字节数与源码一致 / 退出无残余进程；
 全程没碰开发机的 `server\data\admin.json`。新增 `tests/test_packaging.py` 17 项回归（全库 229 → 246 项），
@@ -957,6 +961,14 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
 另一个坑：Nuitka 的 `--include-data-dir` 按自带 `default_ignored_suffixes` 过滤，其中含 `.bin`，
 把 44 个 `ghost_*.bin` 全丢了（冒烟「幽灵数量 = 入库的 46 个 实际 2」）⇒ 改用 `--include-raw-dir`，
 并在编译后比对日志里的 `Included data file '…'` 行数与暂存清单，少了就中止。
+（Nuitka 自己会打 `Nuitka-Postprocessing: Adding 8 icon(s) from icon file '…tf_icon.ico'`，那是图标 8 档都进去了。）
+
+★ **图标（2026-10-07，用户 m11901）**：`tools\make_icon.py` 从原版 APK 抠出启动图（192×192，戴头盔的机械师）
+写成 8 档 `.ico`。★ **自己写 ICO 容器、每档都用 BMP 条目**：Pillow 的 `save(format="ICO")` 会把这些档位全写成
+PNG 条目，而 Windows 只对 256×256 那档明确支持 PNG 条目 —— 小尺寸 PNG 条目有可能整片渲染不出来。
+冒烟里的判据不靠图像库也不看 DPI：① `.ico` 每一档的像素数据在 exe 里逐字节都能搜到（8/8）；
+② `[System.Drawing.Icon]::ExtractAssociatedIcon(exe)` 抠出的 32×32 与我们从同一个 `.ico` 抠出的 32×32
+**逐字节相同**（实测 MAD=0；没图标的那两个补丁器 exe 是 MAD≈84，一眼能分开）。
 
 **「json 要不要加密」的结论：不要。** 运行期数据必须明文（能备份 / 能迁移是特性，且密钥随 exe 发出＝白给）；
 反逆向只能抬高成本，真正防「别人塞木马二次分发」靠正规代码签名 —— 见 `PUBLISHING.md`。
@@ -1035,7 +1047,8 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
   手机侧 AP 隔离/访客网络。
 * 回归：`tests/test_admin_webui.py` 加 2 项（`_lan_ips` 过滤+去重、DNS 失败不抛），单个文件 171 项、全库 **287 项 OK**；
   `tools/exe_smoke.ps1` 从 30 项加到 **35 项**（横幅给的是能填进手机的地址、没把 `0.0.0.0` 当可用地址、
-  排查口诀在、日志条目带来源 IP、`/__ping` 在控制台留 `来源IP  PING  pong`），两个 exe 各 35/35 全绿。
+  排查口诀在、日志条目带来源 IP、`/__ping` 在控制台留 `来源IP  PING  pong`），两个 exe 各 35/35 全绿；
+   2026-10-07 又补图标 3 项 ⇒ **38 项**，两个 exe 各 38/38 全绿。
   实测：`Invoke-WebRequest http://192.168.5.2:8123/__ping` → `200 pong` 且控制台出现该 IP；
   `GET /` 的日志条目 `client=192.168.5.2  GET / -> 200`。
 * 顺手修的交付态 bug：`tools/build_exe.ps1` 的 `[4/4]` 原来**整体重写** `dist\SHA256SUMS.txt`，
@@ -1281,7 +1294,8 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 | `dist/TrialsFrontier-offline.apk` | 完整离线版 APK（m16），26 906 224 字节，SHA-256 `EA77B0B420BF790BB626189F74A3BC64BB384607C2A273F36ADBF558FD8EAB53`。⚠ 这是**已打补丁的产物**，不能再当「干净 base」 |
 | `dist/原版APK/com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk` | **未改动的真原版**（apkmirror 下载，用户 m11161 交出）：34 312 425 字节，SHA-256 `EDDD7DF0C482279B523255498DB448F5CE27609D8BCB1E0B94C45D5948225580`；`libTrialsGo.so` = `743f945cd7e3378d…`（= `tools/tfpatcher.py:69` 的期望指纹），minSdk 16 / targetSdk 30，arm64 + v7a 双 ABI，Ubisoft 原签名。**打补丁认它当 base** |
 | `dist/SHA256SUMS.txt` | 4 行校验和：`TrialsFrontierServer.exe` / `-nuitka.exe` / `TrialsFrontierPatcher.exe` / `-console.exe`（各带 `.sha256` 边车；由两个构建脚本各自替换自己的行） |
-| `dist/TrialsFrontierServer.exe` / `-nuitka.exe` | 本地服务器的一键版（PyInstaller 单文件 ~10.2 MB / Nuitka 真编译 ~7.7 MB）。拷到任意目录双击即跑，数据落在 exe 旁 `data\`、日志在 `logs\requests.jsonl`；横幅打印「手机/其它设备用」的地址与连不上排查口诀，请求日志带来源 IP（见 §5.2） |
+| `dist/TrialsFrontierServer.exe` / `-nuitka.exe` | 本地服务器的一键版（PyInstaller 单文件 ~10.7 MB / Nuitka 真编译 ~8.5 MB）。拷到任意目录双击即跑，数据落在 exe 旁 `data\`、日志在 `logs\requests.jsonl`；横幅打印「手机/其它设备用」的地址与连不上排查口诀，请求日志带来源 IP（见 §5.2）；两个 exe 都带游戏启动图当图标（`tools/assets/tf_icon.ico`，见 §5） |
+| `tools/make_icon.py` / `tools/assets/tf_icon.ico` | 从原版 APK 的 `ic_launcher.png` 抠出游戏 logo，写成 8 档多尺寸 `.ico`（自己写 ICO 容器、全 BMP 条目）。`.ico` 已入库，打包链不需要 Pillow；要换图才跑 `python tools\make_icon.py` |
 | `dist/patcher/` | 面向用户自己原版 APK 的补丁工具链（含 `tfpatcher.py`、`patch_native.py` 等） |
 | `dist/server/` | 本地服务器（`tf_server.py`、`tflocal_accounts.py`、`rules.json`、`data/ghosts/`） |
 | `dist/README.md` | 完整交付说明（526 行，含内购破解章节） |
