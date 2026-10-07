@@ -5,6 +5,7 @@
 跑法：python -m unittest discover -s tests
 """
 import io
+import json
 import os
 import sys
 import tempfile
@@ -16,7 +17,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from tools.tfpatch_aio import cliutil, features, payload, signer  # noqa: E402
+from tools.tfpatch_aio import cliutil, features, payload, pipeline, signer  # noqa: E402
 from tools.tfpatch_aio.vendored import native  # noqa: E402
 
 
@@ -79,6 +80,76 @@ class PatchIdsMatchNative(unittest.TestCase):
     def test_no_duplicate_ids_in_native(self):
         ids = self.native_ids()
         self.assertEqual(len(ids), len(set(ids)))
+
+
+class DirtyBaseGuard(unittest.TestCase):
+    """base 被动过时必须拦下来（用户报的「没勾不减反增却还是有」就是这么来的）。
+
+    补丁器只往原版上「加」补丁，去不掉 base 里已有的改动；旧代码在这里默默
+    --force 放行，于是脏 base 里那 17 处已打过的补丁原样进了成品。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.report = os.path.join(self.tmp.name, "base-scan.json")
+        self.lib = os.path.join(self.tmp.name, "libTrialsGo.so")
+        with open(self.lib, "wb") as f:
+            f.write(b"\x7fELF" + b"\0" * 32)
+
+    def _fake_scan(self, payload, rc=0, raw=None):
+        """假装跑了一遍 native.py --dry-run：写报告 / 只给退出码。"""
+        def fake(mod, argv, log=None):
+            if raw is not None:
+                with open(self.report, "w", encoding="utf-8") as f:
+                    f.write(raw)
+            elif payload is not None:
+                with open(self.report, "w", encoding="utf-8") as f:
+                    json.dump(payload, f)
+            return cliutil.CliResult(rc, None)
+        return fake
+
+    def test_already_flags_become_the_baked_list(self):
+        payload = {"patches": [{"id": "no-ads", "already": True},
+                               {"id": "unlimited-fuel", "already": False},
+                               {"id": "spend-adds-instead-of-subtracts", "already": True}]}
+        with mock.patch.object(pipeline.cliutil, "run_cli", self._fake_scan(payload)):
+            got = pipeline._baked_in(self.lib, self.tmp.name, lambda s: None)
+        self.assertEqual(got, ["no-ads", "spend-adds-instead-of-subtracts"])
+
+    def test_failed_scan_is_unknown_not_empty(self):
+        """扫不动得说「拿不准」（None），返回空列表会被当成「确实是干净原版」。"""
+        with mock.patch.object(pipeline.cliutil, "run_cli", self._fake_scan(None, rc=2)):
+            self.assertIsNone(pipeline._baked_in(self.lib, self.tmp.name, lambda s: None))
+
+    def test_garbage_report_is_unknown(self):
+        raw = "{ 不是 json"
+        with mock.patch.object(pipeline.cliutil, "run_cli", self._fake_scan(None, raw=raw)):
+            self.assertIsNone(pipeline._baked_in(self.lib, self.tmp.name, lambda s: None))
+
+    def test_message_names_the_base_and_the_baked_features(self):
+        msg = pipeline._dirty_base_msg("e9f2fa1a" + "0" * 56,
+                                       ["spend-adds-instead-of-subtracts", "unlimited-fuel"])
+        self.assertIn("不是未改动的原版", msg)
+        self.assertIn("-full.apk", msg)          # 指出最常见的那个错 base
+        self.assertIn("货币不减反增", msg)        # 用户报的那个开关
+        self.assertIn("无限汽油", msg)
+        self.assertIn("spend-adds-instead-of-subtracts", msg)   # 原始 id，方便 grep
+        self.assertIn("--force", msg)            # 明确给出强行继续的出口
+        self.assertIn("原版APK", msg)            # 明确指出该换哪份
+
+    def test_message_survives_an_unknown_scan(self):
+        msg = pipeline._dirty_base_msg("e9f2fa1a" + "0" * 56, None)
+        self.assertIn("读不出来", msg)
+        self.assertNotIn("None", msg)
+
+
+class PatchLabels(unittest.TestCase):
+    def test_money_patch_maps_to_the_money_feature(self):
+        self.assertIn("不减反增", features.label_for_patch("spend-adds-instead-of-subtracts"))
+
+    def test_unknown_patch_has_no_label(self):
+        self.assertEqual(features.label_for_patch("no-such-patch-id"), "")
 
 
 class PayloadManifest(unittest.TestCase):

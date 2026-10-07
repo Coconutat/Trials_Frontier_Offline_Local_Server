@@ -25,6 +25,10 @@
   写死的期望指纹）。**`dist/TrialsFrontier-offline.apk` / `-full.apk` / `tmp/build/tf-m16.apk` 不是干净 base**：
   它们是已打补丁的产物（`libTrialsGo.so` = `e9f2fa1a4e90ac07…`、targetSdk 已改成 27、v7a 已删），
   `tfpatcher.py` 的 SHA256 校验会直接拒绝。
+  ★ **AIO 把它变成了硬拦截**（`tools/tfpatch_aio/pipeline.py` 的 [2/8]）：指纹对不上基准时先跑一遍全表
+  dry-run，把 base 里「已经是改好状态」的补丁列出来，没勾「忽略原版校验」就 `raise ToolError`。
+  理由是**补丁器只加不减** —— base 里已经有的 `spend-adds-instead-of-subtracts`（货币不减反增）
+  改不回来，于是「没勾却还是有」。勾了 `--force` 才放行，并换成 `[WARN]` + 列出已带的补丁。
 
 - **mod 包（外壳包 / shell build）**
   `APKS\特技摩托前线\7.9.4 带剧情不减反增车不全.apk`。

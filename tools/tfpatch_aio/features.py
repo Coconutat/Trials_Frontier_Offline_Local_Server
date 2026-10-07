@@ -113,3 +113,11 @@ def resolve(selected):
 
 def defaults():
     return [f.key for f in FEATURES if f.default or f.required]
+
+
+def label_for_patch(patch_id):
+    """这个补丁 id 属于哪个开关（日志/报错文案用）。认不出来返回空串。"""
+    for f in FEATURES:
+        if patch_id in f.patches:
+            return f.label
+    return ""
