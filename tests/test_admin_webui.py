@@ -16,6 +16,7 @@ import io
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -782,6 +783,24 @@ class Endpoints(Base):
         loop["Host"] = "127.0.0.1:8123"
         with patch.object(srv, "_lan_ip", return_value="10.1.2.3"):
             self.assertEqual(srv._public_host(loop), "10.1.2.3:8123")
+
+    def test_lan_ips_lists_candidates_without_junk(self):
+        """「对方连不上」时要能一眼看到所有候选地址。
+
+        默认路由那个排最前；回环与 169.254.* 自赋值地址是噪声（打印出来只会误导）。
+        """
+        fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.1.7", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.9.9.9", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.9.9", 0))]
+        with patch.object(srv, "_lan_ip", return_value="192.168.9.9"), \
+                patch.object(srv.socket, "getaddrinfo", return_value=fake):
+            self.assertEqual(srv._lan_ips(), ["192.168.9.9", "10.9.9.9"])
+
+    def test_lan_ips_survives_a_socket_failure(self):
+        with patch.object(srv, "_lan_ip", return_value="127.0.0.1"), \
+                patch.object(srv.socket, "getaddrinfo", side_effect=OSError("no dns")):
+            self.assertEqual(srv._lan_ips(), [])
 
     def test_help_lists_admin_ui_and_new_endpoints(self):
         token = self.login()

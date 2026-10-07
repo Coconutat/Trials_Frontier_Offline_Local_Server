@@ -526,12 +526,13 @@ pwsh tools\exe_smoke.ps1 -Exe dist\TrialsFrontierServer.exe [-Port 8199]
 `wts_rewards.json`，幽灵用 `git ls-files server/data/ghosts` 挑**已入库的 46 个**）；
 ② **硬性安全检查**（`admin.json` / `accounts.json` / `sessions.json` / `pvp_state.json` / `save` / 日志
 等命中就 `throw`）；③ 打包（默认 PyInstaller；Nuitka 自动找 MSVC，`--lto=yes --python-flag=-OO
---windows-console-mode=force`）；④ 写 `dist\SHA256SUMS.txt`，设了 `$env:TF_SIGN_PFX` 就顺手
-Authenticode 签名（找不到 `signtool.exe` 只警告）。
+--windows-console-mode=force`）；④ 写 `dist\SHA256SUMS.txt`（**只替换本次构建的那几行**，`tools\build_aio.ps1` 写的补丁器 exe 保留），
+设了 `$env:TF_SIGN_PFX` 就顺手 Authenticode 签名（找不到 `signtool.exe` 只警告）。
 
-`exe_smoke.ps1` 把 exe 拷进 `tmp\exe\smoke` 空目录，当「玩家第一次拿到」跑一遍：零依赖启动、
+`exe_smoke.ps1` 把 exe 拷进 `tmp\exe\smoke` 空目录，当「玩家第一次拿到」跑一遍（**35 项**）：零依赖启动、
 `port.txt` 生效、在 exe 旁建 `data\` 与 `logs\requests.jsonl`、只播种白名单、随机管理员口令能登录、
-`/__admin` 与 `app.js` 的字节数与源码一致、退出后无残余进程。
+`/__admin` 与 `app.js` 的字节数与源码一致、横幅给的是**能填进手机**的地址（不是 `0.0.0.0`）与
+「连不上先查三件事」、请求日志条目带来源 IP、`/__ping` 在控制台留一行 `来源IP  PING  pong`、退出后无残余进程。
 
 ★ 踩过的坑（脚本里已处理，改的时候别拆掉）：
 

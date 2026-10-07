@@ -80,7 +80,11 @@ try {
     }
     Check '控制台有横幅' ([bool]($stdoutText -match 'Trials Frontier 本地服务器已启动'))
     Check '打印了数据目录' ([bool]($stdoutText -match '数据目录：'))
-    Check '打印了手机地址' ([bool]($stdoutText -match '手机用 http://192\.168\.|手机用 http://10\.|手机用 http://172\.'))
+    # ★ 横幅必须给出「能填进手机」的地址：0.0.0.0 只是绑定地址，旧横幅印 http://0.0.0.0:8123
+    #   会把人带进沟里（有人报「192.168.x.x:8123 连不上」时查到的第一处误导）。
+    Check '打印了手机/其它设备用的地址' ([bool]($stdoutText -match '手机/其它设备用：\s*http://(192\.168|10\.|172)\.'))
+    Check '没把 0.0.0.0 当可用地址印出来' (-not [bool]($stdoutText -match '已启动：\s*http://0\.0\.0\.0'))
+    Check '打印了连不上排查口诀' ([bool]($stdoutText -match '连不上先查三件事'))
     $pw = $null
     if ($stdoutText -match '口\s*令\s*[:：]\s*([0-9a-f]{6,})') { $pw = $Matches[1] }
     Check '首次运行打印了随机口令' ([bool]$pw) "(长度 $(@($pw)[0].Length))"
@@ -136,10 +140,19 @@ try {
     $reqlog = Join-Path $box 'logs\requests.jsonl'
     Check '日志落到 exe 旁的 logs\requests.jsonl' (Test-Path $reqlog)
     if (Test-Path $reqlog) {
-        $paths = @(Get-Content $reqlog | ForEach-Object { ($_ | ConvertFrom-Json).path })
+        $rows = @(Get-Content $reqlog | ForEach-Object { $_ | ConvertFrom-Json })
+        $paths = @($rows | ForEach-Object { $_.path })
         Check '日志里记到了客户端请求' ($paths -contains '/public/pvp_matches/v1/matches') "($($paths.Count) 行)"
         Check '日志里记到了好友列表请求' ($paths -contains '/v2/profiles/me/friends')
+        # ★ 「他的包到底到没到」只能靠这两条回答：来源 IP 进日志 + /__ping 留痕。
+        $clients = @($rows | ForEach-Object { "$($_.client)" })
+        Check '日志条目带来源 IP' (-not ($clients -contains '') -and ($clients -contains '127.0.0.1')) `
+            "(client=$([string]::Join(',', ($clients | Select-Object -Unique))))"
     }
+    $pong = Invoke-WebRequest "http://127.0.0.1:$Port/__ping" -UseBasicParsing -TimeoutSec 20
+    Check '/__ping 返回 pong' ($pong.StatusCode -eq 200 -and $pong.Content -match 'pong')
+    $stdout2 = [string](Get-Content $out -Raw)
+    Check '/__ping 在控制台留了来源 IP' ([bool]($stdout2 -match '127\.0\.0\.1\s+PING\s+pong'))
 }
 finally {
     if (-not $SkipKill) {

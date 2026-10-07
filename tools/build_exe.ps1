@@ -168,7 +168,19 @@ foreach ($exe in $built) {
     Write-Host ("      {0}  {1} MB  sha256={2}" -f (Split-Path -Leaf $exe), $mb, $h.Substring(0, 16)) `
         -ForegroundColor Green
 }
-$lines | Set-Content (Join-Path $distDir 'SHA256SUMS.txt') -Encoding ascii
+# ★ 只替换/追加「本次构建的这几个文件」的行，别把别人的行冲掉：`dist\` 里还有
+#   `tools\build_aio.ps1` 产出的补丁器 exe（它自己是按同名行替换的），以前这个文件
+#   整体重写，跑一次服务器构建就把那两行抹了。
+$sumPath = Join-Path $distDir 'SHA256SUMS.txt'
+$mine = @($built | ForEach-Object { Split-Path -Leaf $_ })
+$keep = @()
+if (Test-Path $sumPath) {
+    $keep = @(Get-Content $sumPath | Where-Object {
+        $n = ($_ -split '\s+', 3)[-1]
+        $n -and ($mine -notcontains $n.Trim())
+    })
+}
+($keep + $lines) | Set-Content $sumPath -Encoding ascii
 
 # 有正规代码签名证书时顺手签上（防「别人往你的 exe 里塞木马再转发」）。
 # 自签名证书不算解法：Windows 照样报「未知发布者」，只会更吓人。
