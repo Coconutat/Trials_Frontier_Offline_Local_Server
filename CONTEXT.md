@@ -6,11 +6,25 @@
 ## 对象
 
 - **原版（干净原版 / clean original）**
-  `com.ubisoft.redlynx.trialsfrontier.ggp` v7.9.4（versionCode 561）由 Ubisoft 官方签名的完整 APK，
-  当前以 `assets/ERRKGc5F/aUiMEPVatQ.apk` 形式内嵌在 mod 包中。
+  `com.ubisoft.redlynx.trialsfrontier.ggp` v7.9.4（versionCode 561）由 Ubisoft 官方签名的完整 APK。
   自包含：含 `classes.dex`/`classes2.dex`/`classes3.dex`、`resources.arsc`、完整 `res/`、`assets/`、
   以及 `lib/arm64-v8a` 与 `lib/armeabi-v7a` 两套原生库。
   **不含** `libSecShell.so` / `libsupi.so` / `libSignatureKiller.so`。
+  两份等价来源（2026-10-07 逐条目比对：**1234 个条目的 CRC32 与长度全部相同**，
+  只有 zip 容器压缩方式差 4 KB，`libTrialsGo.so` 均为 `743f945cd7e3378d…`）：
+  ① 用户从 apkmirror 下的
+  `dist\原版APK\com.ubisoft.redlynx.trialsfrontier.ggp_7.9.4-561_minAPI16(arm64-v8a,armeabi-v7a)(nodpi)_apkmirror.com.apk`
+  （34 312 425 字节，sha256 `EDDD7DF0C482279B523255498DB448F5CE27609D8BCB1E0B94C45D5948225580`，
+  minSdk 16 / targetSdk 30，原签名 `CN=Ubisoft`，v1+v2+v3）；
+  ② 本仓库离线载荷里的 `tmp\pack\TrialsFrontier-clean-pack\appdata\aUiMEPVatQ.apk`
+  （34 316 521 字节，sha256 `3E62EF058C90CD03B896B84E0E9699576ACB970AB648275097ED6018FDF9F812`，
+  即 mod 包内嵌的那份被壳解密出来的原版）。
+
+- **打补丁的 base 认谁**
+  只认上面①/②两份**未改动**的原版（`libTrialsGo.so` = `743f945cd7e3378d…`，= `tools/tfpatcher.py:69`
+  写死的期望指纹）。**`dist/TrialsFrontier-offline.apk` / `-full.apk` / `tmp/build/tf-m16.apk` 不是干净 base**：
+  它们是已打补丁的产物（`libTrialsGo.so` = `e9f2fa1a4e90ac07…`、targetSdk 已改成 27、v7a 已删），
+  `tfpatcher.py` 的 SHA256 校验会直接拒绝。
 
 - **mod 包（外壳包 / shell build）**
   `APKS\特技摩托前线\7.9.4 带剧情不减反增车不全.apk`。
@@ -24,9 +38,11 @@
   本项目最终产出的 APK，由基线重建而来：剥离广告与遥测、关闭反作弊、开放内容、接入本地服务器地址。
 
 - **两形态（两种交付形态）**
-  同一套改造成果的两种交付方式：①**完整 APK**（`dist/TrialsFrontier-offline.apk`，开箱即用）；
-  ②**patcher**（`dist/patcher/`，用户拿自己的原版 APK 在本地重新生成）。
+  同一套改造成果的两种交付方式：①**完整 APK**（`dist/TrialsFrontier-offline-full.apk` 全自包含 / 
+  `dist/TrialsFrontier-offline.apk` 瘦包，开箱即用）；
+  ②**patcher**（`dist/patcher/` 或带界面的 `dist/TrialsFrontierPatcher.exe`，用户拿自己的原版 APK 在本地重新生成）。
   两种形态必须能产出**逐字节相同**的原生库 —— 这是工具链正确性的验收标准。
+  （2026-10-07 已用真原版实测两条路并对上结构，见 `tools/README.md` §9.6。）
 
 ## 结构
 
