@@ -123,6 +123,30 @@ python dist\patcher\tfpatcher.py --apk 你的原版.apk --out 改好.apk
 > 本包附带 APK 是用一把自签的本地调试密钥（别名 `trials`）签的；
 > **密钥文件与口令不随仓库分发**，只保留在本地 `patcher/keystore/`。
 
+### 不想敲命令：`TrialsFrontierPatcher.exe`（带界面，不用装 Python）
+
+`dist\TrialsFrontierPatcher.exe` 是上面那套脚本的图形版，双击就开（`-console.exe` 是同内容的命令行版）：
+
+1. **原版 APK** 选你的包（**要自包含打包的话必须是未加固的原版**，加固包会在第 4 步报错让你换包）；
+2. **功能** 勾选 —— 默认只勾「离线可玩（核心）」和「去广告 / 去遥测」，
+   另外可选 `无限汽油` / `货币不减反增` / `破解内购` / `解锁骑士俱乐部 VIP` / `打包成自包含完整 APK`；
+3. 要自包含就把 `payload\` 放在 exe 同目录（里面有 `appdata\` 与 `obb\`，即
+   `TrialsFrontier-clean-pack` 里那两份），GUI 会自动认出来；
+4. 填服务器地址 → 点「开始打补丁」，日志实时打在窗口里，产物旁会写一份 `<产物>.report.json`。
+
+命令行同样能用（不带参数 = 开界面）：
+
+```powershell
+TrialsFrontierPatcher-console.exe --check                       # 环境自检
+TrialsFrontierPatcher-console.exe --list-features
+TrialsFrontierPatcher-console.exe --cli --apk 原版.apk --out out.apk `
+    --server 192.168.5.2:8123 --features offline,noads,fuel
+```
+
+exe 里已含 AArch64 汇编器与 ELF 解析（不需要 `pip install`），但**仍然需要**：
+Android SDK 的 `zipalign`/`apksigner`，以及任意一个 JDK（`java`/`keytool`）。
+签名密钥与源码态共用 `patcher/keystore/trials.jks`，没有就现场自签一把。
+
 ---
 
 ## 五、到底改了什么

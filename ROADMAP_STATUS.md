@@ -15,6 +15,7 @@
 | 3 | 在线功能完善（碉堡 / 午夜杯 / 限时活动 / 排行榜 / 幽灵对手） | 🟡 **部分实现；本轮补齐碉堡奖励/结赛及基础货币链，21项隔离回归通过，待真机到账验证** | 不再沿用旧95%估计 |
 | 4 | WebUI 管理界面 | 🟡 **五屏已交付（`/__admin`：登录／账号／存档／下发＋午夜杯运营屏＋碉堡运营屏，CN+EN，160 项后台回归 + headless 冒烟）；概览等两屏待做** | 65% |
 | 5 | 一键开服打包成 exe | ✅ **零依赖单文件已交付（PyInstaller 10.2 MB + Nuitka 真编译 7.7 MB；空目录冒烟全绿，数据落在 exe 旁）** | 100% |
+| 5b | AIO 打补丁器 exe（带 GUI，见 §5.1） | ✅ **已交付（`dist\TrialsFrontierPatcher.exe` 18.0 MB；补丁版 + 自包含完整 APK 两条路都跑通，27 项冒烟全绿）** | 100% |
 | 6 | 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` | ✅ **绑定挂载已实机验证 + 重启自动恢复** | 90% |
 
 ---
@@ -960,6 +961,30 @@ response 0.34`，只有手势回弹给 0.8），三档 `prefers-reduced-motion /
 **「json 要不要加密」的结论：不要。** 运行期数据必须明文（能备份 / 能迁移是特性，且密钥随 exe 发出＝白给）；
 反逆向只能抬高成本，真正防「别人塞木马二次分发」靠正规代码签名 —— 见 `PUBLISHING.md`。
 
+### 5.1 AIO 补丁器 exe —— 打 APK 的 GUI（2026-10-06，用户 m10528）
+
+> 用户要求（原话）：**「patch APK的脚本做成一个AIO版本，老脚本不动做参考。然后脚本功能细化，选择是否无限汽油+货币不减反曾，是否破解IAP等等。然后做一个带GUI的patch APK + 打包成完整APK的exe程序。程序要求在没有python环境下也能用。」**
+
+拍板（m10569–m10572）：① 签名**调系统 apksigner**，不自研签名器；② 离线载荷**放 exe 同目录**（`payload\` 或
+`payload.zip`，GUI 自动认），不内嵌进 exe；③ GUI 默认**只勾「能离线玩」的最小集**，其余手选。
+
+* `tools/tfpatch_aio/` —— 新包。`features.py`（7 个功能开关）/ `pipeline.py`（8 步）/ `payload.py` /
+  `signer.py` / `cliutil.py` / `cli.py` / `gui.py`（tkinter）/ `vendored/`（§2 那 6 个脚本的**副本**）。
+  **老脚本一个没动**，仍是参考实现。
+* `tools/build_aio.ps1` → `dist\TrialsFrontierPatcher.exe`（窗口版 18.0 MB）+ `-console.exe`（同尺寸）；
+  `tools/aio_smoke.ps1` 把 exe 拷进空目录跑 **27 项**（自检 / 功能清单 / 真跑一次补丁并验签 /
+  查产物里没多出 `assets/tf`、`classes4.dex`、旧 `META-INF/CERT.*` / GUI 起得来）；`-Full` 再跑
+  自包含大打包。`tests/test_patch_aio.py` 21 项回归（全库 255 → 276）。
+* 依赖：`keystone` + `pyelftools` 随包；`payload_setup.dex` 预先编好随包（运行期**不需要** javac/d8）；
+  仍然需要外部 **Android build-tools（zipalign/apksigner）+ 一个 JDK（java/keytool）**，这两个不塞进 exe。
+* 功能细化（默认只勾 `offline` 必选 + `noads`）：`fuel` 无限汽油、`money` 货币不减反增、
+  `iap` 破解内购、`vip` 解锁骑士俱乐部、`bundle` 自包含完整 APK。
+* ★ 两个真机教训写进了代码：**加固包的 Application 类换不了**（`APKS\特技摩托前线\7.9.4 …apk` 的启动类是
+  `com.SecShell.SecShell.AW`，24 字符塞不下 48 字符的 `OfflinePayloadSetup`）⇒ [4/8] 提前 `throw` 出人话，
+  自包含必须用干净 base（`dist\TrialsFrontier-offline.apk` 或 `tmp\build\tf-m16.apk`）；
+  **`patch_dynaddr.py` / `patch_urls.py` 在无可改字面量时不写输出文件** ⇒ 流水线 `_keep()` 回退 + `_fresh()` 先删，
+  否则 [7/8] 报「找不到替换用的文件」。签名密钥**优先复用已有那把**（换了就覆盖安装失败）。
+
 ---
 
 ## 6. 设备侧：游戏数据重定向到 `/sdcard/Android/data/<pkg>` —— ⛔ 已放弃并回滚
@@ -1210,6 +1235,10 @@ signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0    Cause: null pointer
 | `dist/TrialsFrontier-clean-pack.7z` | 干净整合包（APK + OBB + data 区、无存档），给**有 root / 用 adb** 的人；347 128 628 字节，SHA-256 `41AB9DD206A9F4C1C793B42743D6D7F3DEBBF8AFA5A77CF1F7477C331B95B2DC` |
 | `tools/make_selfcontained.ps1` | 打全自包含 APK 的流水线：换 Application 名 → javac+d8 出 `classes4.dex` → 生成 `payload.txt` → `build_apk --add` → `zipalign -p -f 4` → `apksigner` |
 | `tools/apkpayload/OfflinePayloadSetup.java` | 首启自解包类（`extends DexApplicationClass`，只覆盖 `onCreate`），随包进 `classes4.dex` |
+| `dist/TrialsFrontierPatcher.exe` | **AIO 打补丁器（带 GUI，给玩家用）**：约 18 MB（sha256 每次编译都变，以 `SHA256SUMS.txt` 为准），勾功能 → 出补丁版或自包含完整 APK；不需要装 Python，但要装 Android build-tools + JDK。源码 `tools/tfpatch_aio/`，见 §5.1 |
+| `dist/TrialsFrontierPatcher-console.exe` | 同一程序的命令行版（`--cli --apk … --features offline,fuel`；打包脚本与冒烟都用它做自检） |
+| `tools/build_aio.ps1` / `tools/aio_smoke.ps1` | 打上面那两个 exe / 把 exe 拷进空目录跑 27 项冒烟（`-Full` 加跑自包含大打包） |
+| `tools/tfpatch_aio/vendored/` | `patch_native/patch_dynaddr/patch_urls/patch_manifest/patch_dex/build_apk` 的**副本**（原脚本不动，仍是参考实现） |
 | `work/trials-frontier/notes/*.md` | 逆向与情报笔记：`selfcontained-apk.md`（打包原理 + 两个坑）、`online-rules-evidence.md`（赛季/事件史料，带出处）、`real-server-samples.md`（全仓库唯二的真实服务器样本）、`web-research-toolkit.md`（本机抓取方法） |
 
 ### 构建流水线

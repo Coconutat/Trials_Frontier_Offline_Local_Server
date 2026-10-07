@@ -80,3 +80,6 @@ server/data/*.json
 # 8123 的 stdout/stderr（重定向到文件，见 server/README.md「启动」一节）：
 # 含真人 id 与对局细节，只当现场证据用，不入库。
 server/data/*.log
+
+# AIO 补丁器用的签名密钥目录（私钥！上面 *.jks / *.keystore 已忽略，这里连目录一起挡）：
+keystore/
