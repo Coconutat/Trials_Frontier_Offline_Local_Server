@@ -16,6 +16,12 @@ The server can currently run directly on Windows 10/11. The client is limited to
 5. Support account registration and save-data management
 6. Support Midnight Circuit, Bunker, and leaderboards
   
+## Important Notes  
+Since this does not involve official servers, there is no official leaderboard data. This means your existing data cannot be carried over, and you will not be able to see information regarding other players from the official servers.  
+If you play with other players on a local server, their track records can be uploaded to the server and displayed.  
+PvP Matchmaking Mechanism:  
+If there are players online on the server (at least two players required) and both parties initiate matchmaking within one minute, they will be matched against each other. Otherwise, you will be matched with a **Ghost Rider** — an AI-controlled opponent.  
+  
 ## Privacy and Legal Notice
 1. This project does not collect any data unless you submit a log to report a bug.  
 2. This project is non-profit, will never charge any fees, and will not request sponsorship.  
@@ -36,5 +42,12 @@ The [Trials Frontier Revival Project](https://trialsproject.com/) provides a ric
 If you’re looking for a richer gaming experience, I recommend giving their version a try.  
 ***
 
+## The future of the project? Or, can I help with this project?  
+Regarding the **future of the project**:  
+To be honest, I’m not sure. This project was created by me, with the assistance of AI. I have already implemented the vast majority of the essential features. Given that the superior [Trials Frontier Revival Project](https://trialsproject.com/) has already been released to the public, the only remaining advantage of this project is that it is open-source.  
+Regarding **whether you can help**:  
+Of course you can! I would be very happy to have players or developers who love **Trials Frontier** contribute to making this project even better.  
+Regardless of whether you are interested in this project or not, thank you for reading this far.  
+  
 ## Open-Source License
 GPL-v3 Only: [LICENSE](LICENSE)
