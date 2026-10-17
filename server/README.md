@@ -8,9 +8,11 @@
 
 ```
 python server/tf_server.py --host 0.0.0.0 --port 8123
+python server/tf_server.py --host 0.0.0.0 --port 8123
 ```
 
 改 APK 让它指向本机地址的是 `../tools/` 里的补丁工具（见 `../tools/README.md`）。
+想「零依赖发给别人玩」不用装 Python：`pwsh tools\build_exe.ps1` 出一个单文件 exe（见 §10）。
 想「零依赖发给别人玩」不用装 Python：`pwsh tools\build_exe.ps1` 出一个单文件 exe（见 §10）。
 
 ---
@@ -18,6 +20,7 @@ python server/tf_server.py --host 0.0.0.0 --port 8123
 ## 1. 快速开始
 
 ```bash
+# 启动（默认就是 0.0.0.0:8123）
 # 启动（默认就是 0.0.0.0:8123）
 python server/tf_server.py
 
@@ -27,10 +30,15 @@ python server/tf_server.py --host 127.0.0.1 --port 8080
 # 端口也可以写成文件：<程序目录>/port.txt 里一行数字（命令行 --port 优先）
 # 冻结成 exe 时启动会自动打开管理页，不想开就加 --no-browser
 
+# 端口也可以写成文件：<程序目录>/port.txt 里一行数字（命令行 --port 优先）
+# 冻结成 exe 时启动会自动打开管理页，不想开就加 --no-browser
+
 # 语法自检（改完先跑这个再重启）
 python -m py_compile server/tf_server.py
 ```
 
+打开 <http://127.0.0.1:8123/__ui> 是内嵌的账号管理页（注册 / 改密 / 删号 / 看存档 /
+看排行榜 / 看幽灵 / 看运行时配置）。`http://127.0.0.1:8123/__help` 列出全部本地端点。
 打开 <http://127.0.0.1:8123/__ui> 是内嵌的账号管理页（注册 / 改密 / 删号 / 看存档 /
 看排行榜 / 看幽灵 / 看运行时配置）。`http://127.0.0.1:8123/__help` 列出全部本地端点。
 
@@ -42,9 +50,19 @@ python -m py_compile server/tf_server.py
 Stop-Process -Id (Get-NetTCPConnection -LocalPort 8123 -State Listen).OwningProcess -Force
 Start-Process C:\Python314\python.exe `
   -ArgumentList "-u","server\tf_server.py","--host","0.0.0.0","--port","8123" `
+# Windows 上重启（杀掉占着 8123 的那个进程再拉起）
+Stop-Process -Id (Get-NetTCPConnection -LocalPort 8123 -State Listen).OwningProcess -Force
+Start-Process C:\Python314\python.exe `
+  -ArgumentList "-u","server\tf_server.py","--host","0.0.0.0","--port","8123" `
   -WorkingDirectory <仓库根> -WindowStyle Hidden `
   -RedirectStandardOutput server\data\server.log -RedirectStandardError server\data\server.err.log
+  -RedirectStandardOutput server\data\server.log -RedirectStandardError server\data\server.err.log
 ```
+
+> ★ `-u`（无缓冲）与两个 `-Redirect*` **都要带上**：`-WindowStyle Hidden` 起的进程没有控制台，
+> 不带重定向时所有 `print()`（对局开局 `[pvp] open …`、收局 `[pvp] close …`、`[liveevent] …`、
+> `[save] …`）**直接丢掉**，出问题就只能靠请求日志倒推。
+> `server\data\*.log` 已在 `.gitignore` 里（含真人 id 与对局细节，只当现场证据用）。
 
 > ★ `-u`（无缓冲）与两个 `-Redirect*` **都要带上**：`-WindowStyle Hidden` 起的进程没有控制台，
 > 不带重定向时所有 `print()`（对局开局 `[pvp] open …`、收局 `[pvp] close …`、`[liveevent] …`、
@@ -61,10 +79,14 @@ Get-Content work\trials-frontier\notes\server-log.jsonl -Tail 2000 |
 
 # 看 print 出来的现场（开局 / 收局 / 存档摘要）
 Get-Content server\data\server.log -Tail 50
+
+# 看 print 出来的现场（开局 / 收局 / 存档摘要）
+Get-Content server\data\server.log -Tail 50
 ```
 
 > ⚠ `ts` 是 ISO 时间字符串，比较请用 `[datetime]::Parse(...)`，不要用 `.Substring()`；
 > `query` 有些端点是**对象**不是字符串；`resp_body` 可能是 bytes。
+> 打包成 exe 后请求日志在 `<exe 目录>\logs\requests.jsonl`（现场 `print` 走控制台，见 §10）。
 > 打包成 exe 后请求日志在 `<exe 目录>\logs\requests.jsonl`（现场 `print` 走控制台，见 §10）。
 
 ---
@@ -76,9 +98,12 @@ Get-Content server\data\server.log -Tail 50
 | `tf_server.py` | HTTP 服务器：路由 + 全部动态端点处理器 + 请求日志 + 内嵌管理页。~4000 行 |
 | `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储 + 管理员账号 + 受控下发。纯数据层，不碰 HTTP。~1800 行 |
 | `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 + 309 条奖励名，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
+| `tflocal_accounts.py` | 本地账号 / 会话 / 长期凭据 / 设备 / 存档 / 幽灵存储 + 管理员账号 + 受控下发。纯数据层，不碰 HTTP。~1800 行 |
+| `admin/` | 后台管理页（`/__admin`）：`index.html` + `app.css` + `app.js` + `i18n.json`（CN/EN）+ `items.json`（官方物品目录：478 条物品 + 80 套服装 + 108 款涂装 + 12 个蓝图 + 382 条赛道 + 309 条奖励名，由 `tools/build_item_catalog.py` 生成）。纯静态、零依赖，由 `_ADMIN_FILES` 把「路径 → 文件名」写死成白名单（杜绝路径穿越） |
 | `rules.json` | 静态桩响应表（`"<METHOD> <路径前缀>"` → `{status, headers, body}`）。只服务那些「有响应就行」的端点 |
 | `data/tf_config.json` | 运营参数（匹配、赛季、周赛、奖励、筹码）。**唯一入库的 `data/` 文件** |
 | `data/ghosts/` | 幽灵仓库：`<赛道id>/*.bin`（游戏自带静态幽灵，入库）+ `store/` `index.json` `replays.json`（运行期，不入库） |
+| `data/save/` `accounts.json` `sessions.json` `devices.json` `remember.json` `leaderboards.json` `admin.json` `player_levels.json` | 全部是运行期私有数据（`admin.json` 是管理员口令哈希 + 票据），被 `.gitignore` 排除 |
 | `data/save/` `accounts.json` `sessions.json` `devices.json` `remember.json` `leaderboards.json` `admin.json` `player_levels.json` | 全部是运行期私有数据（`admin.json` 是管理员口令哈希 + 票据），被 `.gitignore` 排除 |
 
 `tf_server.py` 的分区（行号截至 2026-10，只作导航用）：
@@ -112,12 +137,24 @@ Handler.do_GET / do_POST / do_PUT / do_DELETE
   │     ├─ /__api/admin/*                  -> 管理员登录 / 登出 / 改口令 / 下发 …
   │     ├─ _PUBLIC = /__ping /__ui /__register /__api/register
   │     └─ 其余 /__*  无有效 tf_admin Cookie -> 401 admin-required    ★ 唯一的墙
+  │     ├─ /__admin、/__admin/*            -> 后台页静态文件（_ADMIN_FILES 白名单）
+  │     ├─ /__api/admin/*                  -> 管理员登录 / 登出 / 改口令 / 下发 …
+  │     ├─ _PUBLIC = /__ping /__ui /__register /__api/register
+  │     └─ 其余 /__*  无有效 tf_admin Cookie -> 401 admin-required    ★ 唯一的墙
   ├─ pick_dynamic(method, path)            # 命中 -> (handler, which)
   │     命中：构造 hdrs，注入 X-TF-Client = 客户端 IP，调用处理器
   └─ 未命中：load_rules() -> pick_rule() -> render() -> 兜底
         最后统一 _send() + 追加一条 JSONL 日志 + 控制台摘要
 ```
 
+日志条目字段：`ts / client / method / url / path / query / req_headers / req_body / req_body_len / rule / status / resp_body / ms`。
+`client` 是来源 IP（`self.client_address[0]`）—— 有人喊「连不上」时，先用它回答「他的包到底到没到」。
+控制台摘要同样以来源 IP 打头：`192.168.5.2   GET   /v2/profiles/me  -> 200   3ms`。
+落到 `work/trials-frontier/notes/server-log.jsonl`（同时进内存环形缓冲 `RECENT`，`/__log` 可读，**要管理员**）。
+`/__*` 请求本身不进这个日志（`/__admin` 的访问也不会污染游戏端点统计），
+**唯一的例外是 `/__ping`**：它过 `_handle` 时打一行 `192.168.5.2   PING   pong` 到控制台。
+`/__ping` 是排查「对方连不上」的第一步（让对端用浏览器打开 `http://<你的IP>:<端口>/__ping`），
+不留痕就没法区分「防火墙拦了」和「他填错地址了」。
 日志条目字段：`ts / client / method / url / path / query / req_headers / req_body / req_body_len / rule / status / resp_body / ms`。
 `client` 是来源 IP（`self.client_address[0]`）—— 有人喊「连不上」时，先用它回答「他的包到底到没到」。
 控制台摘要同样以来源 IP 打头：`192.168.5.2   GET   /v2/profiles/me  -> 200   3ms`。
@@ -222,6 +259,20 @@ Handler.do_GET / do_POST / do_PUT / do_DELETE
   服务端取不到真值时统一用 `_lb_ghost_data()`（`_LB_GHOST_OUTFITS` 里按 owner 稳定挑一套），
   绝不再发 0 —— 发 0 会让客户端拿没见过的值去渲染（服装错、骑手没脑袋）。
 
+**榜行里的 `data` / `upgrades` 是位域，不是计数器**（反汇编定论，见
+`work/trials-frontier/notes/online-endpoints.md`）：
+
+* `data` = 那一场**骑手外观**：bits 0–7 未用、8–13 一个 6 位字段（真机取 1/2/4/13，
+  `encodeData` 会把 ≤1 归 0）、bits 14–19 / 20–25 / 26–31 分别是 outfit 的 part2 / part1 / part0。
+  部件的**高 2 位不在 `data` 里**，合起来是 24 位 = 存档 `content.profile.outfit`。
+  客户端 `LeaderBoardData::getOutfit(int)` 就是解它。
+* `upgrades` = 车辆升级：bits 6–15 一个 10 位字段 + 四个 4 位字段（bit0–5 未用）。
+* `bikeSkin` 只从 `extradata` 来（`parseData2` @0x625134），而**这一版客户端从不发 `extradata`**。
+* **0 不是客户端会产生的外观值**：真机 172 条真成绩里 `data` 最小 `0x100`，
+  而 `outfit = 0`（没自定义过的号，如华为账号）确实就是 `0x100` ⇔ parts (0,0,0)。
+  服务端取不到真值时统一用 `_lb_ghost_data()`（`_LB_GHOST_OUTFITS` 里按 owner 稳定挑一套），
+  绝不再发 0 —— 发 0 会让客户端拿没见过的值去渲染（服装错、骑手没脑袋）。
+
 ### 5.3 幽灵 / 回放
 
 | 方法 | 路径 | 处理器 |
@@ -242,6 +293,20 @@ Handler.do_GET / do_POST / do_PUT / do_DELETE
 * 拿到的 id 之后会走 `GET …/content/ghost/<id>/payload`，所以**回的 id 必须真的能下到**。
 
 ### 5.4 PVP / 碉堡（`pvp_matches/v1`）
+
+**2026-10-05：奖励/经济链修复，尚待真机到账验收。**
+`start_race → race → increase_rewards → matches → close` 现有实际记账；奖池、对局、免费票、金票、筹码和领取状态持久化。
+金币/宝石由客户端成功回调发放，服务端不直接修改角色存档重复加币。
+季奖配置仍为扁平运营条目，wire输出26档嵌套数组；特殊项 `item_id=145` 的 `amount` 是原表RewardID。
+旧固定 `rewards.default/win` 占位奖池已删除，改为实际转盘上报累计。
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+当前仅验证基础价金票购买，套装折扣/旧缓存价会被拒绝；不能将21项隔离回归等同于真机完整复刻。
+部署前备份数据并停止旧进程，源码修改需重启；不要同时开两个进程写同一状态文件。
+详见 [本轮修复报告](<../work/trials-frontier/notes/2026-10-05_pvp-economy-report.md>)。
 
 **2026-10-05：奖励/经济链修复，尚待真机到账验收。**
 `start_race → race → increase_rewards → matches → close` 现有实际记账；奖池、对局、免费票、金票、筹码和领取状态持久化。
@@ -304,12 +369,73 @@ python -m unittest discover -s tests -v
 而 **`chip_base` 恒为 0**（用户 m01903 纠正：局内筹码从 0 起算，只有赢下赛道才开始涨；
 以前把钱包余额灌进去，结果对手头像下面直接显示你的存款）。结算不受影响 ——
 `_pvp_bank_match_chips` 只把「本局产出 = match − base」计入钱包，掠夺输家的也只是他这一局的产出。
+* **对局胜负 = 占住的赛道比对手多**（`_pvp_match_won`，2026-10-06 改）。客户端屏幕
+  （`parseMatch` 的 score 比较）和这个函数都只看「每条赛道谁更快」，所以 **1:0 也算赢**；
+  0:0（谁都没跑出成绩）是平局 ⇒ 不写 `last_match_winner`、段位与连胜不动。
+  ★ 由来的真机案例（用户 m08968）：`matchmaking.match_duration_seconds` 被手写成 300 秒的
+  测试值，只跑完 1 条赛道就到点，客户端下一次 `/start_race` 吃 409 `match-ended` 后收局，
+  并在屏幕上判他胜利；老规则「3 条里占住 ≥2 条」却算出平局 —— 屏幕与服务端对不上。
+  现在归属只看份额，不再要求过半。收局时 `/close` 会往 stdout 打一行
+  `[pvp] close mid=… dur=…s elapsed=…s winner=… tracks=… done=n/N`（开局有对应的
+  `[pvp] open …`），配 `server\data\server.log` 一眼可查（见 §1 启动）。
 
+**发车（bike）**：原版对局的**车是随机的、但和图的级别挂钩**。客户端权威规则在
+`LevelManager::isCorrectBikeTier @0x47c170`：图的 `B` 字段（`/conf/levels.txt`，`0xff` = 不限）
+是要求的车辆级别，车的级别（`/conf/bikes.txt` 的 `Tier`）必须**相等**，且玩家的升级状态要
+`BikeUpgrade::getBikeStatus` 认账。服务端的发车规则（2026-10-06 落地）：
+
+* `matchmaking.bike_random`（默认开）= 按**每条赛道的级别**从玩家**已拥有**的车里随机抽一辆。
+  「已拥有」来自客户端 `pvp_init` 上报的 `bikes` 位图（`h_pvp_init` → `_pvp_set_bikes()`，
+  `UpgradeManager::getBikeIDbyIndex` 证明 **bit i = 车号 i+1**；位图里位为 1 还要求
+  `getBikeStatus == 0`）。机器人的车不参与筛选。
+* `matchmaking.bike_story_only`（默认开）把随机池限制在剧情车 1..9：10/11/12/19 是 255 级
+  特殊车（Stallion / BMW / Moonrover / Donkey），塞进剧情图很出戏。
+* 关掉随机 = 所有赛道都发 `matchmaking.bike_id`（默认 1）。★ 这台车必须能跑**每张**候选图，
+  级别不符时客户端 `IngameStateSelectBike` 只能退它的默认车。
+* 一个真人玩家都没有该级别的车时，那条赛道直接从本轮候选里剔掉（日志 `[pvp] 发车池筛掉 …`）。
+  发车池见车表：T0 = 1/2/3/13/15/18、T1 = 4/5/6/14、T2 = 7/8/9/16/17、255 = 10/11/12/19。
+* 抽签结果在对局记录里**固化**（`pvp_matches[mid]["bikes"][pid][track]`，种子 `"<mid>|<pid>"`）
+  ⇒ 同一局重连 / 重算不会换车，换一局才重抽。
+
+**外观（`outfit`）**：碉堡界面两侧的骑手立绘取自 `parseMatch` @0x4fd9d0 的 `player1`/`player2` 槽，
+槽里 `outfit` 是 24 位（3 个 8 位部件：头盔 / 上身 / 下身），**直接来自该玩家存档的
+`content.profile.outfit`**（`_pvp_outfit_of()`）。曾经这里硬编码 0，于是把对手也画成 0 号部件
+（默认黄盔迷彩）⇒ 两台机器看起来"衣服没同步"。对局里客户端自己上报的 `outfit` / `bike_data`
+也存在结果行里（`_pvp_reported()` 只收合法整数，垃圾值回退）。
+
+**局内筹码与局外钱包是两笔钱**：对局槽里的数字 = `chip_base` + 局内占住赛道产出的筹码，
+而 **`chip_base` 恒为 0**（用户 m01903 纠正：局内筹码从 0 起算，只有赢下赛道才开始涨；
+以前把钱包余额灌进去，结果对手头像下面直接显示你的存款）。结算不受影响 ——
+`_pvp_bank_match_chips` 只把「本局产出 = match − base」计入钱包，掠夺输家的也只是他这一局的产出。
+
+### 5.5 限时活动 / 午夜杯（`liveevents/v1/weekly_track_system`）
 ### 5.5 限时活动 / 午夜杯（`liveevents/v1/weekly_track_system`）
 
 `config/<week_index>`、`basic_info`(GET+POST)、`find_opponent`、`reward_config/<n>`、
 `start_race` / `end_race` / `skip_cooldown` / `refill_retry_count`（后四个都进 `h_liveevents_accept`）。
 
+* 周赛固定跑 `weekly.track_id`（默认 1041）；`_week_index()` 按 7 天一个窗口算，
+  `weekly.week_offset` 把「本周」整体推后 N 周（= **模拟翻周**，真机验「敲奖杯/领奖」用）。
+* `week_settings.week_leaderboard` 是客户端认的**排行榜数字 id**：发 `0` 等于告诉它「本模式没有榜」
+  （榜区空白 + TOP 1% 条 + 周奖杯一起退化）。`weekly.leaderboard_id = 0` 时自动用本周赛道
+  （`track<id>` 榜，复用榜单视图里已有的行）。
+* `basic_info` 的 `(last_participated_week, last_participated_week_lb)` 决定客户端进哪个子状态：
+  本周参加过 → 结算/领奖屏；只参加过上一周（配 `week_offset=1`）→ 上周结算屏。见 `_weekly_joined()`。
+* `config/<week>` 必须**按请求的那一周**回 —— 翻周后客户端会来要上一周，回本周它会判定
+  「配置不属于当前周」并每秒重试（界面卡在「查看进度…」）。
+* `find_opponent` 必须回**pid + 该 pid 在本周赛道上的幽灵 contentId**：回显示名 + `replay_id=0`
+  会让客户端以 ~30 次/秒刷 `find_opponent`+`stats`+`ghost/0/payload`(404)。见 `_weekly_opponent()`。
+* 榜单里的「其他玩家」由 `weekly.fake_field`（默认 120）+ `fake_field_base_ms/fast_pct/slow_pct`
+  合成（客户端用「名次/playerCount」算百分位，只有 3 行时永远进不了全球 1%）。合成行不落盘、
+  不进总榜、同周内恒定。
+* 每周次数是**服务端权威**的：`start_race` 扣、`skip_cooldown` 补满、`refill_retry_count` 加；
+  剩余走 `basic_info.left_retry_times`，冷却**时长**是 `weekly.cooldown_seconds`（规则）。
+  `ponytail:` 次数只在内存里（`_WEEKLY_ATTEMPTS`），重启服务器会白送满次数。
+* 奖励池内容在客户端 `/conf/wts_rewards.txt`（15 个池子），服务端只能选「哪一档用哪个池子」：
+  `weekly.reward_slots`(1..3) / `weekly.reward_ids`。**完整对照表**见
+  `work/trials-frontier/notes/weekly-reward-pools.md`，WebUI 用的机器可读版本是
+  `data/wts_rewards.json`（由 `tools/wts_reward_doc.py` 生成）。
+  ★ 客户端挑「池内哪一件」用的是它**不播种的 `rand()`** —— 池子不变就永远是同一件。
 * 周赛固定跑 `weekly.track_id`（默认 1041）；`_week_index()` 按 7 天一个窗口算，
   `weekly.week_offset` 把「本周」整体推后 N 周（= **模拟翻周**，真机验「敲奖杯/领奖」用）。
 * `week_settings.week_leaderboard` 是客户端认的**排行榜数字 id**：发 `0` 等于告诉它「本模式没有榜」
@@ -344,6 +470,17 @@ python -m unittest discover -s tests -v
   不如本周的车，就借你一辆**带固定升级**的来跑，这辆车不进你的车库」：没车的玩家拿到 5 级租借车，
   自己车更强的玩家照样用自己的升级。**不需要**单独的「租赁」标志位。
   代价：客户端只在进入午夜杯时读一次，改完要让玩家退出再进。
+  曾经给 0 导致「进入午夜杯场地」直接崩溃。现在它由 `weekly.bike_id` 决定：
+  `0`（默认）= **按本周赛道的级别自动随机**，用 `random.Random("weekly-bike|<周号>")` 播种
+  ⇒ 整周固定同一辆（原版就是「一周一条赛道一辆车」，客户端 `doesPlayerHasWeeklyBike()` 只认一辆）；
+  填 `>0` = 整届固定这辆（`bad-bike:<id>` 会挡住不存在的车号，合法范围 1..19）。
+* **租借升级**（`weekly.loan_upgrade`，默认 5，0..10）：客户端
+  `WeeklyChallengeManager::setBikeUpgradeLevel @0x636710` 在 `force_upgrade == 0` 时对四个部件取
+  **`max(玩家自己的升级, 配置值)`**（`force_upgrade != 0` 才无条件覆盖）。
+  所以服务端发 5/5/5/5 + `force_upgrade = 0` 就正好是原版那句「你没有这辆车、或者自己的升级
+  不如本周的车，就借你一辆**带固定升级**的来跑，这辆车不进你的车库」：没车的玩家拿到 5 级租借车，
+  自己车更强的玩家照样用自己的升级。**不需要**单独的「租赁」标志位。
+  代价：客户端只在进入午夜杯时读一次，改完要让玩家退出再进。
 
 ### 5.6 内购 / 礼包 / 好友（targeting）
 
@@ -357,6 +494,17 @@ python -m unittest discover -s tests -v
 | POST | `/public/targeting/v1/vip_registration`、`/private/targeting/v1/direct_vip_registration` | `h_vip_registration` |
 | GET/POST | `/public/targeting/v1/vip_badge_option` | `h_vip_badge_option` |
 | POST | `/public/friends/v1/update` | `h_friends_update` |
+| GET | `/v2/profiles/me/friends` | `h_friends_list`（**不是** rules.json 的桩；按登录者查 `server/data/friends.json`）|
+
+> **好友列表是「后台维护的真关系」**（2026-10-07）。★ 游戏里**没有**加好友这回事：
+> 唯一接口 `tr::OnlineFriends::addFriend @0x51bed4` 的调用者全在 UPlay 覆盖层那条线上，
+> 私服接不到；客户端只负责**显示** —— `onFriendlistRecieved @0x51cee8` 收完立刻
+> `syncFriendList()`，**服务器没给的条目会被它从本地好友表删掉**。
+> 所以关系只能在 `/__admin` 的「账号」页维护（加/删好友、改昵称），游戏内立即可见。
+> 昵称（`nameOnPlatform`）也在那里改，落到 `accounts.json` / `devices.json`。
+> 形状约束（客户端会崩的那种）见 `rules.json` 的 `//friends2~4`：**空列表也必须回
+> `{"friends":[]}`**（`{}` 会让 `0x51cf18` 读 NULL+0x10 ⇒ SIGSEGV），三个值必须是字符串，
+> `pid` 必须排在 `nameOnPlatform` 之前。
 | GET | `/v2/profiles/me/friends` | `h_friends_list`（**不是** rules.json 的桩；按登录者查 `server/data/friends.json`）|
 
 > **好友列表是「后台维护的真关系」**（2026-10-07）。★ 游戏里**没有**加好友这回事：
@@ -591,6 +739,28 @@ python -m unittest discover -s tests -v
   bump 是必需的（否则 `remote == local`，客户端静默用本地档覆盖服务器），但 bump 后
   客户端也**可能不弹** `MenuzStateSyncProgress` 而是直接推本地档 ⇒ 不保证送达。
   界面上必须如实这么写，别承诺「即点即得」。
+| `/__help` | 端点清单（**新增端点要同步登记**，这是自发现的唯一入口） |
+| `POST /__api/admin/login` `logout` `me` | 管理员登录 / 登出 / 当前身份（`me` 未登录也 200） |
+| `GET /__api/admin/info` | 后台要展示的两条外发地址：玩家注册 `/__ui`、手机上的后台 `/__admin`（基址走 `_public_host()`，**绝不回环**） |
+| `POST /__api/admin/password` | 改口令（<8 位拒；改完**重签 Cookie**，否则把自己踢掉） |
+| `POST /__api/admin/grant` | 存档下发（可下发项 = `admin/items.json` 的 478 条，服装按套勾，蓝图按车勾、可填片数；`paints` 字段 = 涂装 id 数组，写 `items2[664+BikeID]` 的位掩码；每次先埋快照） |
+| `POST /__api/admin/rollback` `revert` | 回滚到历史快照 / 撤销上一次下发（回 `snapshot` 名字给界面做「撤销」） |
+| `POST /__api/admin/sessions/clear` | 清会话票据（不动 `remember.json`，玩家不会被踢出登录态） |
+| `GET\|POST /__api/admin/weekly` | 午夜杯运营参数（GET = 配置 + 现状（含 `ghosts`/`board_rows`/`warnings` 赛道预检、`effective_bike`/`track_bike`、`bikes` 车表）+ 赛道目录 + 模板 + 最近改动；POST `{fields:{…}}` **逐键校验、全部合法才落盘**，每个键回 `{key,before,after,audit}`） |
+| `GET\|POST /__api/admin/bunker` | 碉堡运营参数（GET = 8 张卡的字段表 + 当前值 + 现状（赛季/玩家/对局/队列/在线/警告）+ 赛道与 `rewards`（全 309 条，带 `official` 标记）、`bikes`（19 辆，带级别/剧情标记）目录 + 模板 + 最近改动；POST 同 weekly 的 `{fields:{…}}` 契约，空值 = 删键回默认） |
+| `POST /__api/admin/undo` | 撤销一条参数改动（`{id}` 来自 weekly / bunker 的 `audit`；按记录里的 `existed` 决定写回还是删键） |
+| `GET\|POST /__api/admin/templates` | 参数模板（GET `?page=weekly\|bunker`；POST `{page,action:save\|apply\|copy\|rename\|delete,name,new_name,parts}`，`parts` 可 `all` / `rewards`） |
+| `GET\|POST /__api/admin/social` | 昵称与好友（GET = 本服所有真人（账号 + 设备槽）及其好友、`links` 对数；POST `{action:"rename",profile,nameOnPlatform}` 改昵称 / `{action:"set_friends",profile,friends:[pid,…]}` 整表替换好友，**双向**写 `server/data/friends.json`）|
+
+### 7.3 下发的两条通道（别搞混）
+
+* **竞技场（服务端权威，即时生效）**：金票 / 筹码直接写 `data/pvp_state.json`，
+  客户端无从覆盖。金票**不是存档物品**（`items2` 里 id 135 从来不存在），
+  所以它只能走这条路 —— 见 `ROADMAP_STATUS.md` 的「金票」条目。
+* **存档物品（尽力而为）**：改 `data/save/<pid>/latest.json` 的 `items2` 并 **bump `version`**。
+  bump 是必需的（否则 `remote == local`，客户端静默用本地档覆盖服务器），但 bump 后
+  客户端也**可能不弹** `MenuzStateSyncProgress` 而是直接推本地档 ⇒ 不保证送达。
+  界面上必须如实这么写，别承诺「即点即得」。
 
 ---
 
@@ -633,6 +803,47 @@ python -m unittest discover -s tests -v
   目前只回 `{"data": []}`，够用但没做真的语义。
 
 真正还没闭环的以 `../ROADMAP.md` 和 `../ROADMAP_STATUS.md` 为准。
+
+---
+
+## 10. 打包成 exe（零依赖分发）
+
+```powershell
+pwsh tools\build_exe.ps1                  # PyInstaller onefile（默认，约 10 秒）→ dist\TrialsFrontierServer.exe
+pwsh tools\build_exe.ps1 -Packer nuitka    # Nuitka 真编译（几分钟，自动找 MSVC）→ dist\TrialsFrontierServer-nuitka.exe
+pwsh tools\exe_smoke.ps1 -Exe dist\TrialsFrontierServer.exe   # 丢进空目录冒烟
+```
+
+* 产物 `dist\TrialsFrontierServer.exe`（约 10.7 MB）／`dist\TrialsFrontierServer-nuitka.exe`（约 8.5 MB）
+  ＋ `dist\SHA256SUMS.txt`（体积与 sha256 每次编译都会变，别照抄文档里的数）。用法：拷到任意目录
+  （别放 `C:\Program Files`，那里不可写）双击运行，它会在**自己旁边**建 `data\`（存档、`tf_config.json`、
+  幽灵库）和 `logs\requests.jsonl`，控制台打印局域网地址（多网卡逐个列出）、首次随机口令与「连不上先查三件事」。
+* 图标：两个 exe 都内嵌 `tools\assets\tf_icon.ico`（游戏自己的启动图，8 档 16→256，由
+  `python tools\make_icon.py` 从原版 APK 的 `res/mipmap-xxxhdpi-v4/ic_launcher.png` 生成，产物已入库）。
+* 打包白名单本身就是安全边界（`tools/build_exe.ps1` 第 2 步硬性检查）：真机存档 `data\save\`、
+  `admin.json`、`accounts.json`、`sessions.json`、`pvp_state.json`、审计与日志**一律不进包**；
+  幽灵只拷 `git ls-files server/data/ghosts` 里已入库的那 46 个（开发机上还混着真机上传的，整目录拷会漏发）。
+* 路径规则（`tf_server.py` 头部）：**只读资源**（`admin/`、`rules.json`、`items.json`、静态幽灵）从包内
+  `HERE` 读；**运行期数据**写 `<exe 目录>/data`。冻结判据 = `sys.frozen` 或 Nuitka 的 `__compiled__`；
+  exe 目录用 `_frozen_exe_dir()` 取 —— ★ **Nuitka onefile 的 `sys.executable` 是临时解包的 `python.exe`**
+  （真目录在 `NUITKA_ONEFILE_DIRECTORY`），照 `sys.executable` 算会把存档写进 `%TEMP%\onefile_…`。
+* 首次运行 `seed_data_dir()` 只补缺（`tf_config.json` 写**内置默认值**、拷 `wts_rewards.json` 与 `ghosts/`），
+  **从不覆盖**已有数据 ⇒ 换新版 exe 直接替换文件即可，玩家的存档与手调配置都在。
+* 端口：`--port` > `<exe 目录>\port.txt` 第一行 > 8123；冻结时启动会自动打开
+  `http://127.0.0.1:<端口>/__admin`（不想开加 `--no-browser`）。走**系统默认浏览器**
+  （`_open_admin_page()`，Windows 上就是 `os.startfile`）：没有桌面会话时它开不出来，
+  这时只在控制台说一句「自己开 …」，**绝不让服务起不来**（`tests/test_packaging.py` 的
+  `AdminPageOpen` 用假 `webbrowser` 守着这两条）。
+* 编译器：Nuitka 4.2.2 **在 Python ≥3.13 上不许用 MinGW**（原文 `FATAL: Error, cannot use '--mingw64'
+  on Python version 3.13 or higher.`），默认走 MSVC（本机 = Visual Studio 生成工具 2026 / MSVC 14.51.36231）；
+  `-MinGW` 只在 Python ≤3.12 有意义，脚本在更高版本上会忽略它并警告。
+* ★ **别用 `--include-data-dir` 喂 Nuitka**：它按 Nuitka 自己的 `default_ignored_suffixes` 过滤，那张表里有
+  `.bin` —— 幽灵库全是 `ghost_*.bin`，会被静默丢掉（症状：冒烟「幽灵数量 = 入库的 46 个 实际 2」）。
+  脚本用 `--include-raw-dir`（不过滤），并在编译后拿日志里的 `Included data file '…'` 行数与暂存清单比对。
+* 反逆向是「抬高成本」不是安全边界（`../PUBLISHING.md`）：PyInstaller 能解出字节码，Nuitka 编成机器码。
+  真正能防「别人塞木马二次分发」的只有**正规 Authenticode 代码签名**（设 `$env:TF_SIGN_PFX` /
+  `$env:TF_SIGN_PASSWORD`，脚本自己找 `signtool.exe`），自签名不算解法。
+
 
 ---
 
