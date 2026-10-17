@@ -43,6 +43,9 @@ __pycache__/
 *.jks
 *.keystore
 
+# Early Encryption Research（早期加密研究）相关的工作区 / 产物 / 日志 / 证据
+encryption*
+
 # ── 运行期私有数据：绝不入库 ──────────────────────────────
 # 本地账号（含用户名 / 盐 / 口令哈希）、会话票据、设备槽
 server/data/accounts.json

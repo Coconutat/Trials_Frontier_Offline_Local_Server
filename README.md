@@ -1,0 +1,40 @@
+# Trials Frontier **Original** Local Server Project
+
+## Language:
+**English** | [简体中文](README_CN.md)
+
+## Project Overview
+**This project was initially put on hold indefinitely due to a lack of technical expertise. After AI-assisted reverse engineering, the old version (unreleased) was reorganized and the code was written.**  
+The reason for creating this project is simple: the game was shut down. Without the server, the online mode and some specific features are unavailable.  
+The server can currently run directly on Windows 10/11. The client is limited to Android devices.
+  
+## Project Goals
+1. Become fully open source, with transparent and reviewable data (however, save data remains in the hands of the person hosting the server locally)
+2. Do not connect to Ubisoft services or depend on Ubisoft accounts
+3. Support local multiplayer and, optionally, multiplayer over a wide-area network through local tunneling
+4. Provide a minimal playable server
+5. Support account registration and save-data management
+6. Support Midnight Circuit, Bunker, and leaderboards
+  
+## Privacy and Legal Notice
+1. This project does not collect any data unless you submit a log to report a bug.  
+2. This project is non-profit, will never charge any fees, and will not request sponsorship.  
+3. This project is intended for communication and educational purposes only.  
+
+## Installation and How to Play
+1. Download the server (`TrialsFrontierServer_vx.x.exe`) and client (`Trials_Frintier_Local_server_patched.apk`) from [Releases](https://github.com/Coconutat/Trials_Frontier_Offline_Hack_Server/releases).  
+2. Install `Trials_Frintier_Local_server_patched.apk`.  
+3. Place `TrialsFrontierServer_vx.x.exe` in a separate folder you can easily find, then double-click it to open it. This will open a console and a browser page. The console will output an admin username and password; enter them on the web page to access the admin panel. You can change the admin password after logging in.  
+4. Register a game account as instructed in the admin panel.  
+5. On your Android phone, open `/sdcard/Android/data/com.ubisoft.redlynx.trialsfrontier.ggp/files/`, find `tf_server.txt`, and enter the IP address and port shown in the web admin panel on your computer.  
+6. Open the game and log in with the account you registered.
+
+***
+## Additional Notice
+This project is not affiliated with the [Trials Frontier Revival Project](https://trialsproject.com/) in any way. The [Trials Frontier Revival Project](https://trialsproject.com/) is owned by AurisTFG and Somnic.  
+The [Trials Frontier Revival Project](https://trialsproject.com/) provides a richer and more modern gaming experience.  
+If you’re looking for a richer gaming experience, I recommend giving their version a try.  
+***
+
+## Open-Source License
+GPL-v3 Only: [LICENSE](LICENSE)
