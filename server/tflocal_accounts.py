@@ -83,6 +83,73 @@ ADMIN_SESSION_TTL = 7 * 24 * 3600
 _LOCK = threading.RLock()
 
 
+def _safe_component(value):
+    """Return one safe path component, or None for traversal/invalid input."""
+    if not isinstance(value, str) or not value or "\x00" in value:
+        return None
+    if value in (".", "..") or os.path.basename(value) != value:
+        return None
+    return value
+
+
+def _safe_profile_dir(profile_id):
+    """Resolve a profile directory while keeping it under SAVE_DIR."""
+    profile = _safe_component(profile_id)
+    if profile is None:
+        return None
+    root = os.path.realpath(SAVE_DIR)
+    candidate = os.path.realpath(os.path.join(root, profile))
+    try:
+        if os.path.commonpath((root, candidate)) != root:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
+def _safe_history_dir(profile_id):
+    """Resolve a profile's history directory under the save root."""
+    profile_dir = _safe_profile_dir(profile_id)
+    if profile_dir is None:
+        return None
+    root = os.path.realpath(SAVE_DIR)
+    history = os.path.realpath(os.path.join(profile_dir, "history"))
+    try:
+        if os.path.commonpath((root, profile_dir, history)) != root:
+            return None
+    except ValueError:
+        return None
+    return history
+
+
+def _safe_history_file(profile_id, ts):
+    """Resolve history/<ts>.json without allowing separators or symlink escapes."""
+    history = _safe_history_dir(profile_id)
+    component = _safe_component(ts)
+    if history is None or component is None:
+        return None
+    candidate = os.path.realpath(os.path.join(history, component + ".json"))
+    try:
+        if os.path.commonpath((history, candidate)) != history:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
+def _safe_latest_file(profile_id):
+    profile_dir = _safe_profile_dir(profile_id)
+    if profile_dir is None:
+        return None
+    candidate = os.path.realpath(os.path.join(profile_dir, "latest.json"))
+    try:
+        if os.path.commonpath((os.path.realpath(SAVE_DIR), candidate)) != os.path.realpath(SAVE_DIR):
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
 # ------------------------------------------------------------------ 基础 IO
 def _load(path, default):
     try:
@@ -896,8 +963,10 @@ def save_progress(headers, body, client_ip=None):
     if err:
         return None, {}, err
     pid, who = who_info["profileId"], who_info["who"]
-    d = os.path.join(SAVE_DIR, pid)
-    hist = os.path.join(d, "history")
+    d = _safe_profile_dir(pid)
+    hist = _safe_history_dir(pid)
+    if d is None or hist is None:
+        return None, {}, "bad-profile"
     os.makedirs(hist, exist_ok=True)
     now = int(time.time())
     # ★ 每次**被接受**的上报把版本号 +1。客户端把 sync 响应里的 version 记进
@@ -916,7 +985,11 @@ def save_progress(headers, body, client_ip=None):
         "client_ip": client_ip,
         "content": obj,
     }
-    _store(os.path.join(d, "history", "%d.json" % now), payload)
+    history_file = _safe_history_file(pid, str(now))
+    latest_file = _safe_latest_file(pid)
+    if history_file is None or latest_file is None:
+        return None, {}, "bad-profile"
+    _store(history_file, payload)
     with _LOCK:
         try:
             files = sorted(f for f in os.listdir(hist) if f.endswith(".json"))
@@ -951,7 +1024,7 @@ def save_progress(headers, body, client_ip=None):
                      "new_richness": new_rich, "saved_at": now, "account": who,
                      "server_version": old_ver + 1}, None
 
-    _store(os.path.join(d, "latest.json"), payload)
+    _store(latest_file, payload)
     brief = {
         "account": who,
         "kind": who_info["kind"],
@@ -971,7 +1044,8 @@ def save_progress(headers, body, client_ip=None):
 
 
 def load_progress(profile_id):
-    return _load(os.path.join(SAVE_DIR, profile_id, "latest.json"), None)
+    path = _safe_latest_file(profile_id)
+    return _load(path, None) if path else None
 
 
 def _all_saves():
@@ -1043,9 +1117,13 @@ def serve_progress(headers, client_ip=None):
         "adopted_from": src_pid,
         "adopted_at_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
     })
-    d = os.path.join(SAVE_DIR, pid)
-    os.makedirs(os.path.join(d, "history"), exist_ok=True)
-    _store(os.path.join(d, "latest.json"), adopted)
+    d = _safe_profile_dir(pid)
+    latest_file = _safe_latest_file(pid)
+    history_dir = _safe_history_dir(pid)
+    if d is None or latest_file is None or history_dir is None:
+        return None, None, "bad-profile"
+    os.makedirs(history_dir, exist_ok=True)
+    _store(latest_file, adopted)
     print("[save] 收养存档：%s(%s) 继承 %s 的进度（items=%d, tracks=%d）"
           % (who_info["who"], who_info["kind"], src_pid,
              len((adopted.get("content") or {}).get("items2") or []) // 2,
@@ -1223,8 +1301,8 @@ def list_saves():
 
 def list_history(profile_id):
     """列某个槽的全部历史快照（供 /__restore 用）。"""
-    hist = os.path.join(SAVE_DIR, profile_id, "history")
-    if not os.path.isdir(hist):
+    hist = _safe_history_dir(profile_id)
+    if hist is None or not os.path.isdir(hist):
         return []
     out = []
     for f in sorted(os.listdir(hist)):
@@ -1254,12 +1332,17 @@ SNAPSHOT_KEEP = 10
 
 def _snapshot(profile_id, doc, tag):
     """在 history/ 下留一个命名恢复点，返回它的名字（可直接喂给 /__restore）。"""
-    hist = os.path.join(SAVE_DIR, profile_id, "history")
+    hist = _safe_history_dir(profile_id)
+    if hist is None:
+        return None
     os.makedirs(hist, exist_ok=True)
     # 秒级时间戳会撞（同一秒连点两次下发），补三个随机字节当后缀。
     name = "%s%d%s" % (tag, int(time.time()),
                        binascii.hexlify(os.urandom(3)).decode("ascii"))
-    _store(os.path.join(hist, name + ".json"), doc)
+    path = _safe_history_file(profile_id, name)
+    if path is None:
+        return None
+    _store(path, doc)
     pref = sorted(f for f in os.listdir(hist) if "_" in f and f.endswith(".json"))
     for old in pref[:-SNAPSHOT_KEEP]:
         try:
@@ -1274,16 +1357,22 @@ def rollback_save(profile_id, ts):
 
     返回 (恢复点名字, err)。恢复点名字可以是 None（原档读不出来时没什么可留的）。
     """
-    if ts in (None, "", "latest"):
+    if _safe_profile_dir(profile_id) is None:
+        return None, "bad-profile"
+    if ts in (None, "", "latest") or _safe_component(ts) is None:
         return None, "bad-ts"
-    doc = _load(os.path.join(SAVE_DIR, profile_id, "history", "%s.json" % ts), None)
+    history_file = _safe_history_file(profile_id, ts)
+    latest_file = _safe_latest_file(profile_id)
+    if history_file is None or latest_file is None:
+        return None, "bad-ts"
+    doc = _load(history_file, None)
     if not doc:
         return None, "not-found"
     # ★ 覆盖前先留一份现场：回滚**本身**是不可逆的（latest.json 被直接换掉），
     #   所以按「给撤销而不是给确认框」的原则，先埋一个回到回滚前的点。
     cur = load_progress(profile_id)
     snap = _snapshot(profile_id, cur, RESTORE_SNAPSHOT_TAG) if cur else None
-    _store(os.path.join(SAVE_DIR, profile_id, "latest.json"), doc)
+    _store(latest_file, doc)
     print("[save] 已把 %s 的 history/%s.json 提回 latest.json（items=%d, richness=%d，"
           "恢复点 %s）" % (profile_id, ts,
                         len((doc.get("content") or {}).get("items2") or []) // 2,
@@ -1293,6 +1382,8 @@ def rollback_save(profile_id, ts):
 
 def restore_save(profile_id, ts):
     """把某个历史快照提回 latest.json。ts 为 'latest' 或 history 文件名里的时间戳。"""
+    if _safe_profile_dir(profile_id) is None:
+        return None
     if ts in (None, "", "latest"):
         return load_progress(profile_id)
     _, err = rollback_save(profile_id, ts)
@@ -1418,7 +1509,7 @@ def grant_items(profile_id, grants, paints=None):
       这里是服务端自己受控地加数字，只会让 richness 变大。护栏不进反出会误伤。
     """
     pid = (profile_id or "").strip()
-    if not pid:
+    if not pid or _safe_profile_dir(pid) is None:
         return None, "bad-profile"
     doc = load_progress(pid)
     if not doc or not isinstance(doc.get("content"), dict):
@@ -1510,7 +1601,10 @@ def grant_items(profile_id, grants, paints=None):
     audit = audit if isinstance(audit, list) else []
     newdoc["granted"] = (audit + [{"at": now, "at_iso": iso, "items": applied,
                                    "paints": painted}])[-20:]
-    _store(os.path.join(SAVE_DIR, pid, "latest.json"), newdoc)
+    latest_file = _safe_latest_file(pid)
+    if latest_file is None:
+        return None, "bad-profile"
+    _store(latest_file, newdoc)
 
     summary = ", ".join("%s %s->%s" % (a["name"], a["before"], a["after"]) for a in applied)
     psum = ", ".join("涂装 %s 车%d 槽%d" % (p["name"], p["bike"], p["slot"]) for p in painted)
@@ -1819,6 +1913,8 @@ def ghost_update(cid, metadata, owner=None):
         rec = obj["items"].get(str(cid))
         if rec is None:
             return None
+        if owner is not None and rec.get("owner") != owner:
+            return None
         md = dict(metadata) if isinstance(metadata, dict) else {}
         merged = dict(rec.get("metadata") or {})
         merged.update(md)
@@ -1832,17 +1928,17 @@ def ghost_update(cid, metadata, owner=None):
             val = _as_int(merged.get(key))
             if val is not None:
                 rec[key] = val
-        if owner:
-            rec["owner"] = owner
         rec["updated"] = int(time.time())
         _save_ghosts(obj)
     return rec
 
 
-def ghost_put_payload(cid, blob):
-    rec = _ghost_record(cid)
-    if rec is None:
-        return None
+def ghost_put_payload(cid, blob, owner=None):
+    with _LOCK:
+        obj = _load_ghosts()
+        rec = obj["items"].get(str(cid))
+        if rec is None or (owner is not None and rec.get("owner") != owner):
+            return None
     os.makedirs(GHOST_STORE, exist_ok=True)
     tmp = os.path.join(GHOST_STORE, "%s.bin.tmp" % cid)
     with open(tmp, "wb") as f:
@@ -1852,7 +1948,7 @@ def ghost_put_payload(cid, blob):
     with _LOCK:
         obj = _load_ghosts()
         rec = obj["items"].get(str(cid))
-        if rec is None:
+        if rec is None or (owner is not None and rec.get("owner") != owner):
             return None
         rec["size"] = len(blob)
         rec["stored"] = True
@@ -1887,12 +1983,16 @@ def ghost_payload(cid):
     return None
 
 
-def ghost_delete(cid):
+def ghost_delete(cid, owner=None):
     with _LOCK:
         obj = _load_ghosts()
-        rec = obj["items"].pop(str(cid), None)
-        if rec is not None:
-            _save_ghosts(obj)
+        rec = obj["items"].get(str(cid))
+        if rec is None:
+            return False
+        if owner is not None and rec.get("owner") != owner:
+            return False
+        obj["items"].pop(str(cid), None)
+        _save_ghosts(obj)
     p = os.path.join(GHOST_STORE, "%s.bin" % cid)
     if os.path.isfile(p):
         try:
