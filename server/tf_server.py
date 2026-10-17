@@ -1376,6 +1376,29 @@ def _ghost_caller(headers):
     return None
 
 
+def _ghost_auth(headers):
+    """Authenticate userstorage writes without resolve_identity fallback."""
+    try:
+        return acct.authenticate(headers or {})
+    except Exception:
+        return None, "unknown-ticket"
+
+
+def _ghost_mutation_auth(headers, cid):
+    """Return authenticated owner for an existing ghost, or (None, HTTP status)."""
+    info, err = _ghost_auth(headers)
+    if err or not isinstance(info, dict):
+        return None, 401
+    if info.get("kind") not in ("account", "device"):
+        return None, 403
+    rec = acct.ghost_get(cid)
+    if rec is None:
+        return None, 404
+    if rec.get("owner") != info.get("profileId"):
+        return None, 403
+    return info, None
+
+
 def _ghost_metadata(body):
     """客户端发的 body 是 {"metadata": {...}}；兼容直接给 metadata 的情况。
 
@@ -1427,7 +1450,6 @@ def h_userstorage(method, path, query, body, headers):
         return 200, {"Content-Type": "application/json"}, {"data": []}
     kind, rest = m.group(1), (m.group(2) or "").strip("/")
     q = dict(parse_qsl(query, keep_blank_values=True))
-    owner = _ghost_caller(headers)
 
     if kind == "content":
         parts = [p for p in rest.split("/") if p] if rest else []
@@ -1440,6 +1462,10 @@ def h_userstorage(method, path, query, body, headers):
 
         # POST /content/ghost —— 建容器，必须回真实 contentId
         if method == "POST" and cid is None:
+            info, auth_err = _ghost_auth(headers)
+            if auth_err or not isinstance(info, dict):
+                return 401, {"Content-Type": "application/json"}, {"error": auth_err or "unknown-ticket"}
+            owner = info.get("profileId")
             md = _ghost_metadata(body)
             track = md.get("track_id")
             try:
@@ -1456,12 +1482,13 @@ def h_userstorage(method, path, query, body, headers):
 
         # PUT /content/ghost/<id>/payload —— 传二进制
         if tail == "payload" and method == "PUT":
+            info, auth_status = _ghost_mutation_auth(headers, cid)
+            if auth_status:
+                return auth_status, {"Content-Type": "application/json"}, {"error": "ghost-write-not-allowed"}
             raw = body if isinstance(body, (bytes, bytearray)) else b""
-            rec = acct.ghost_put_payload(cid, bytes(raw))
+            rec = acct.ghost_put_payload(cid, bytes(raw), info.get("profileId"))
             if rec is None:
-                print("[ghost] payload id=%d 不存在，仍然接收（%d 字节）" % (cid, len(raw)),
-                      flush=True)
-                return 200, {"Content-Type": "application/json"}, {"contentId": cid}
+                return 404, {"Content-Type": "application/json"}, {"error": "ghost-not-found"}
             print("[ghost] payload id=%d 赛道 %s %d 字节 drive_time=%s frames=%s"
                   % (cid, rec.get("track_id"), len(raw), rec.get("drive_time"),
                      rec.get("frames")), flush=True)
@@ -1482,19 +1509,22 @@ def h_userstorage(method, path, query, body, headers):
 
         # PUT /content/ghost/<id> —— 更新 metadata（body 里没有 track_id，靠合并）
         if method == "PUT" and not tail:
+            info, auth_status = _ghost_mutation_auth(headers, cid)
+            if auth_status:
+                return auth_status, {"Content-Type": "application/json"}, {"error": "ghost-write-not-allowed"}
             md = _ghost_metadata(body)
-            rec = acct.ghost_update(cid, md, owner)
+            rec = acct.ghost_update(cid, md, info.get("profileId"))
             if rec is None:
-                new_id = acct.ghost_create(None, owner, md)
-                print("[ghost] update id=%d 不存在，补建 contentId=%d" % (cid, new_id),
-                      flush=True)
-                return 200, {"Content-Type": "application/json"}, {"contentId": new_id}
+                return 404, {"Content-Type": "application/json"}, {"error": "ghost-not-found"}
             print("[ghost] 更新 metadata id=%d 赛道 %s drive_time=%s"
                   % (cid, rec.get("track_id"), rec.get("drive_time")), flush=True)
             return 200, {"Content-Type": "application/json"}, {"contentId": cid}
 
         if method == "DELETE" and not tail:
-            acct.ghost_delete(cid)
+            _info, auth_status = _ghost_mutation_auth(headers, cid)
+            if auth_status:
+                return auth_status, {"Content-Type": "application/json"}, {"error": "ghost-write-not-allowed"}
+            acct.ghost_delete(cid, _info.get("profileId"))
             return 200, {"Content-Type": "application/json"}, {"data": []}
 
         # GET /content/ghost/<id> —— 取 metadata
@@ -2142,32 +2172,57 @@ def h_liveevents_config(path, query, body, headers):
     return 200, {"Content-Type": "application/json"}, payload
 
 
-def _weekly_opponent():
-    """本周的 Next Challenger —— 返回 `(对手标识, 他在本周赛道上的幽灵 contentId)`。
+def _weekly_valid_ghost(content_id):
+    """只有正 contentId 且 payload 头可读、含时间和帧的幽灵才可挑战。"""
+    try:
+        content_id = int(content_id)
+    except (TypeError, ValueError):
+        return False
+    if content_id <= 0:
+        return False
+    try:
+        blob = acct.ghost_payload(content_id)
+        if not blob:
+            return False
+        drive_time, _tag, frames = acct.ghost_probe(blob)
+        return bool(drive_time and int(drive_time) > 0 and frames and int(frames) > 0)
+    except Exception:
+        return False
 
-    ★ 为什么必须是 **pid** 而不是显示名（真机日志 2026-10-05 23:27 实证）：
-      客户端拿到 `find_opponent` 的 `"TangoPro"` 后立刻去查那个人的成绩
-      `GET /public/playerstats/v1/stats/track1041?players=TangoPro`；而服务端的榜行
-      是按 **profileId** 存的，用显示名永远查不到 ⇒ 客户端**死循环重试**
-      （同一秒里 `find_opponent` + `stats?players=TangoPro` + `ghost/0/payload` 各刷 ~30 次）。
-      pid 两边都对得上；显示名客户端会自己用 `/v1/profiles/<pid>` 解析。
 
-    ★ `replay_id` 必须是这个对手在**本周赛道**上的幽灵 contentId：客户端拿它去
-      `GET /public/userstorage/v2/content/ghost/<id>/payload`。回 0 就是 404 再加一轮
-      死循环（日志里 `ghost/0/payload -> 404` 与上面那对请求同步出现）。
-      pid→contentId 的映射由 `_opponent_entries()` 从内置幽灵库建出来（见那里的注释）。
-
-    榜上还没有别人（或那条赛道没有内置幽灵）时回落到原来的机器人名字 + 0。
-    """
-    board = "track%d" % _weekly_track_id()
+def _weekly_opponent_candidates(track=None):
+    """返回按优先级排列的 `(profile_id, contentId)` 可挑战对手。"""
+    track = _weekly_track_id() if track is None else int(track)
+    board = "track%d" % track
     rows, ghosts = _opponent_entries()
+    candidates = []
     for pid in OPPONENT_PIDS:
         rec = (rows.get(pid) or {}).get(board)
         cid = (ghosts.get(pid) or {}).get(board)
-        if rec and cid is not None:
-            return pid, int(cid)
-    name, _drive, _rec = _robot_opponent(_weekly_track_id())
-    return name, 0
+        if rec and _weekly_valid_ghost(cid):
+            candidates.append((pid, int(cid)))
+
+    # 上传幽灵不进入 `_opponent_entries` 的合成榜行；只有同赛道真实榜行
+    # 才能让 find -> stats -> payload 三步链对上。
+    try:
+        real_rows = _load_leaderboards().get(board) or {}
+        uploaded = {}
+        for pid, by_board in ghosts.items():
+            if pid in OPPONENT_PIDS or pid not in real_rows:
+                continue
+            cid = by_board.get(board)
+            if _weekly_valid_ghost(cid):
+                uploaded[str(pid)] = int(cid)
+        candidates.extend((pid, uploaded[pid]) for pid in sorted(uploaded))
+    except Exception as exc:
+        print("[weekly] 上传幽灵候选读取失败：%s" % exc, flush=True)
+    return candidates
+
+
+def _weekly_opponent():
+    """本周的 Next Challenger；没有完整链路时返回 `None`。"""
+    candidates = _weekly_opponent_candidates()
+    return candidates[0] if candidates else None
 
 
 # ------------------------------------------------- 本周榜单的"其他玩家"（合成行）
@@ -2316,7 +2371,13 @@ def h_liveevents_find_opponent(path, query, body, headers):
     ★ 两种"名字"的区别见 `_weekly_opponent()`：必须是 **pid**，且 `replay_id`
       必须是他在本周赛道上的**幽灵 contentId**，否则客户端会每秒刷三十次。
     """
-    player, replay_id = _weekly_opponent()
+    opponent = _weekly_opponent()
+    if opponent is None:
+        print("[liveevent] find_opponent -> no usable weekly opponent", flush=True)
+        return 503, {"Content-Type": "application/json"}, {
+            "error": "weekly-opponent-unavailable",
+        }
+    player, replay_id = opponent
     print("[liveevent] find_opponent -> %s (replay_id=%d)" % (player, replay_id), flush=True)
     return 200, {"Content-Type": "application/json"}, {
         "opponent": player,
@@ -2678,16 +2739,10 @@ def _track_bike_tier(track):
 
 
 def _weekly_track_health(track):
-    """赛道在服务器上有没有能用的数据 -> (能挑战的幽灵条数, 榜单真实行数)。
-
-    午夜杯的预检就靠这两个数：**没有幽灵**的赛道，玩家点「挑战」时服务端只能回
-    `replay_id = 0`，客户端会一直去要 `ghost/0/payload`（每秒几十次 404），
-    表现就是卡在「加入午夜杯」那一屏出不来。2026-10-06 用户把赛道换成 1258 就踩了这个。
-    """
+    """赛道在服务器上有没有能用的数据 -> (可挑战幽灵条数, 榜单真实行数)。"""
     board = "track%d" % track
     try:
-        _, gmap = _opponent_entries()
-        ghosts = sum(1 for m in gmap.values() if m.get(board) is not None)
+        ghosts = len(_weekly_opponent_candidates(track))
     except Exception as exc:
         print("[weekly] 幽灵库读取失败：%s" % exc, flush=True)
         ghosts = -1
@@ -2711,14 +2766,13 @@ def admin_weekly_status():
     warnings = []
     if ghosts == 0:
         warnings.append({
-            "cn": ("赛道 #%d 上一个幽灵都没有（内置和玩家上传的都没有）：玩家点「挑战」时服务端只能回"
-                   "幽灵编号 0，游戏会反复去要一个不存在的幽灵（每秒几十次 404），表现是卡在"
-                   "「加入午夜杯」进不去。先让玩家在这条赛道上跑一圈上传幽灵，或者把赛道换回 1041"
-                   "（它带一套内置幽灵）。" % track),
-            "en": ("Track #%d has no ghosts at all (neither built-in nor player-uploaded): the server can "
-                   "only return ghost id 0, so the client loops requesting a ghost that does not exist "
-                   "(dozens of 404s per second) and never gets past the Midnight Cup join screen. Have a "
-                   "player upload a ghost on that track first, or switch back to 1041." % track)})
+            "cn": ("赛道 #%d 没有可挑战的对手（需要内置或玩家上传的同赛道可读幽灵；上传身份还必须有"
+                   "同赛道真实榜行）。find_opponent 将明确失败，不会广告幽灵编号 0；请补齐榜行和可读幽灵，"
+                   "或者把赛道换回带内置幽灵的 1041。" % track),
+            "en": ("Track #%d has no usable weekly opponent (a built-in or player-uploaded readable ghost on "
+                   "this track is required, and an uploaded owner must also have a real leaderboard row on the "
+                   "same track). find_opponent will fail explicitly instead of advertising ghost id 0; add both "
+                   "pieces or switch back to 1041." % track)})
     elif board_rows == 0:
         warnings.append({
             "cn": ("赛道 #%d 的榜单上还没有真实成绩（只有陪跑对手）：玩家进去看到的榜是假的，"
