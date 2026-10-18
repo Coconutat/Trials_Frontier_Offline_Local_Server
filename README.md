@@ -16,6 +16,21 @@ The server can currently run directly on Windows 10/11. The client is limited to
 5. Support account registration and save-data management
 6. Support Midnight Circuit, Bunker, and leaderboards
   
+## Documentation and Server Features
+- [Server operations guide](server/OPERATIONS.md): newcomer instructions for Midnight Circuit and Bunker/PvP, including rewards, track selection, start/end windows, backups, rollback, and troubleshooting.
+- The embedded admin panel is available at `http://127.0.0.1:8123/__ui`; local endpoint help is at `http://127.0.0.1:8123/__help`.
+- The server stores accounts, saves, match state, and logs locally under `server/data`. Keep the admin port on a trusted LAN and back up data before changing live configuration.
+- Server responses and client display are separate contracts. A successful local HTTP response does not by itself prove that an Android client will show a map, banner, or entry point.
+
+## Run from Source
+The server has no third-party Python dependencies and requires Python 3.8 or newer:
+
+```powershell
+python server/tf_server.py --host 0.0.0.0 --port 8123
+```
+
+Then open the admin panel, register a game account, and point the Android client's `tf_server.txt` at the computer's LAN address and port. Stop the process with `Ctrl+C` when finished.
+
 ## Important Notes  
 Since this does not involve official servers, there is no official leaderboard data. This means your existing data cannot be carried over, and you will not be able to see information regarding other players from the official servers.  
 If you play with other players on a local server, their track records can be uploaded to the server and displayed.  
